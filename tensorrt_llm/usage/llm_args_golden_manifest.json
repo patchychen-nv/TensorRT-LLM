@@ -276,6 +276,15 @@
     },
     {
       "allowed_values": [
+        "dp",
+        "sp"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "dkv_config.attention_mode"
+    },
+    {
+      "allowed_values": [
         "auto",
         "float16",
         "bfloat16",
