@@ -989,6 +989,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Manager-owned helix decode-step counter; see
         # KVCacheManagerV2._set_helix_rank_fields.
         self.py_helix_decode_group_index = 0
+        # DKV: compute rank this request is assigned to (None when DKV is off).
+        # py_dkv_is_local caches (py_dkv_compute_rank == this rank). Default
+        # False is fail-safe: real requests and dummies both set it explicitly,
+        # so a request that reaches forward without being tagged is skipped
+        # (not computed) rather than forwarded on every rank.
+        self.py_dkv_compute_rank = None
+        self.py_dkv_is_local = False
         self.py_draft_logits = None
         self.py_target_probs = None
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
