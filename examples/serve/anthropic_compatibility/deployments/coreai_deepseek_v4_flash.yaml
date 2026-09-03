@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Flash on one 4-GPU node in the coreai cluster.
+#   ./serve.sh gateway --yaml deployments/coreai_deepseek_v4_flash.yaml --submit
+#   ./serve.sh submit --yaml deployments/coreai_deepseek_v4_flash.yaml --label bringup
+
+cluster_name: coreai
+repo_dir: /lustre/fsw/portfolios/coreai/users/serli/workspace/TensorRT-LLM
+
+model:
+  name: deepseek_v4_flash
+  path: /lustre/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/common/DeepSeek-V4-Flash-0731
+  tool_parser: deepseek_v4
+
+slurm:
+  account: coreai_comparch_trtllm
+  partition: batch
+  time: "4:00:00"
+  nodes: 1
+  gpus_per_node: 4
+  extra_args: []
+
+container:
+  image: /lustre/fsw/portfolios/coreai/users/serli/containers/sw-tensorrt-docker+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194.sqsh
+  # /lustre/fsw contains compatibility symlinks into /lustre/fs1. Mount both
+  # the symlink namespace and its project target so the paths above still
+  # resolve inside the container.
+  mounts:
+    - /lustre/fsw:/lustre/fsw
+    - /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm:/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm
+
+server:
+  config: server_configs/deepseek_v4_flash_agg_tep4.yaml
+  port: 8333
+  install_repo: true
+  numactl: ""
+  capture: true
+  extra_args: []
+  env: {}
+
+trace:
+  root: /lustre/fsw/portfolios/coreai/users/serli/claude-traces
+
+gateway:
+  port: 8333
+  account: coreai_comparch_trtllm
+  partition: cpu
+  qos: cpu-long
+  time: "7-00:00:00"
+  users: gateway_users.txt
+  # Submit the next 4-hour server job 45 minutes before the active one expires.
+  lead_time: 2700
+  # Deliberately unpinned: Slurm may choose any CPU node, so read gateway_url
+  # after each gateway submission instead of assuming the hostname is stable.
+  extra_args: ["--mem=32G"]

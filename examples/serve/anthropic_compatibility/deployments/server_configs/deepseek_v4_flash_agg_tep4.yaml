@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Flash on 4 GPUs as DEP4: attention data-parallel, experts
+# expert-parallel. Flash is 284B total / 13B active against Pro's 1.6T / 49B,
+# and its FP4-expert + FP8-dense weights are ~155 GiB, so TP4/EP4 leaves
+# roughly 39 GiB of weights per GB300 and the rest for KV cache. Attention
+# heads (64) and routed experts (256) both divide by 4.
+#
+# Differences from deepseek_v4_agg_tep8.yaml: the parallel sizes, the tokenizer
+# alias, and the indexer top-k. Everything else is carried over.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# Attention data-parallel: each rank owns its requests and its own KV cache
+# rather than every rank replicating one. max_batch_size and the graph batch
+# sizes below are therefore PER RANK -- the guides state it as
+# `concurrency = max_batch_size * num_gpus`. Note also that a step only uses
+# CUDA graphs when every rank is generation-only in that step
+# (cuda_graph_runner.py:302-309), so prefill traffic costs graph coverage.
+enable_attention_dp: true
+attention_dp_config:
+  # OFF, and deliberately so — this is the confirmed trigger of the SWA-scratch
+  # abort that killed this deployment three times (08-09 05:37 job 404771,
+  # 08-10 08:26 job 413294, 08-10 09:17 job 413934).
+  #
+  # _balance_adp_requests (py_executor.py:5142-5160) is reached only when this
+  # flag is set (guard at :5232). Its ELSE branch — taken whenever some rank has
+  # no pending context request, i.e. `all_ranks_have_ctx_requests` is False —
+  # unconditionally sets `balanced_context_requests = []` at :5155 and holds the
+  # request until `timeout_reached or not all_ranks_have_gen_requests`.
+  #
+  # By then the V2 scheduler has ALREADY grown that request's KV capacity
+  # (scheduler_v2.py:639 -> resize_context), and nothing reverts it: the skip
+  # paths call _revert_gen_alloc, which iterates only generation_requests, and
+  # _revert_ctx_alloc (py_executor.py:3325) is wired solely to the disagg
+  # deferral at :3439. history_length is advanced only by
+  # update_context_resources, which sees the emptied list. So capacity sits one
+  # chunk (8064 = floor((max_num_tokens 8192 - 1 generation token)/128)*128)
+  # ahead of history for the whole hold. It stays silent because the re-computed
+  # target is identical each iteration, so `capacity == self._capacity` and the
+  # guard at _kv_cache.py:684 skips the check. The moment the rank's own
+  # generation request finishes, the hold releases AND the token budget rises to
+  # 8192, so the chunk rounds up by exactly one 128-token block, capacity must
+  # change, and the assert fires with max_rewind_len == 0 (no speculative_config).
+  #
+  # Note false is also the library default (llm_args.py:1384); it was turned on
+  # by hand when this deployment moved to DEP4.
+  enable_balance: false
+  # Per-request prefix scoring rather than per-conversation pinning, for the
+  # reasons spelled out in glm5.2_agg_tep4.yaml: this deployment has far fewer
+  # sessions than ranks, so session-level affinity cannot fill four of them.
+  enable_kv_cache_aware_routing: true
+  kv_cache_routing_cold_start_warmup: true
+  kv_cache_routing_fair_share_multiplier: 1.5
+
+cuda_graph_config:
+  # Same shape as glm5.2_agg_tep4.yaml: dense at the low end, widening as the
+  # batch grows, reaching max_batch_size so a busy step never falls off the
+  # captured set. Measured on the GLM deployment, leaving the set cost 17.1ms
+  # -> 152ms in a single step; the mechanism is not model-specific.
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+  enable_padding: true
+
+# The 2026-07-31 Flash release renumbered the reasoning-effort ladder: the
+# prefix the earlier release reached through `max` is now `high`, and `max`
+# selects a stronger one. The plain `deepseek_v4` alias encodes the earlier
+# layout, so it would answer `high` with no prefix at all and cap `max` one
+# rung below what the client asked for.
+custom_tokenizer: deepseek_v4_20260731
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+  host_cache_size: 42949672960
+  # DeepseekV4CacheManager only accepts 128 or 256.
+  tokens_per_block: 128
+
+# Per rank, so 512 in flight across the four. Flash carries this far more
+# comfortably than GLM does: MLA compression plus fp8 puts a token at 3125
+# bytes against GLM's 50232, and 0.8 of free memory buys roughly 62M tokens per
+# rank. Even at 128 per rank that leaves ~486k tokens per sequence, so the
+# batch limit binds long before the cache does.
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # create_moe.py admits CUTEDSL for fp8 block scales or nvfp4; the FP4 experts
+  # here qualify. A backend the environment cannot serve falls back to
+  # CutlassFusedMoE with a warning rather than failing, so confirm in the
+  # server log which one actually loaded.
+  backend: CUTEDSL
+moe_expert_parallel_size: 4
+
+num_postprocess_workers: 8
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. The pull endpoint
+# /perf_metrics that these settings used to feed no longer exists; serve.sh
+# appends perf_metrics_output_dir per attempt, since only it knows the path.
+# perf_metrics_max_requests went with the endpoint -- retention is the file now.
+return_perf_metrics: true
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+sparse_attention_config:
+  algorithm: deepseek_v4
+  # Left unset on purpose so it tracks the checkpoint (Flash 512, Pro 1024).
+  # ModelConfig consults `model_fields_set` for this field, so omitting the
+  # line falls back to the checkpoint rather than to the 512 field default.
+  # index_topk:
+  enable_heuristic_topk: true
+stream_interval: 10
+tensor_parallel_size: 4
+trust_remote_code: true
+
+# No speculative_config: the 2026-07-31 Flash checkpoint carries DSpark
+# prediction heads (mtp.0/1/2 with main_proj / confidence_head / markov_head),
+# not the enorm / hnorm / e_proj / h_proj layout DeepseekV4MTP loads. Enabling
+# MTP passes the `ckpt_nextn > 0` assert and then fails on missing keys.

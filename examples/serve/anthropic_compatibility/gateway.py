@@ -2,44 +2,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Stable front door for the Anthropic-compatibility servers.
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+# A serving job lives for hours and lands on whatever node Slurm gives it, so
+# its URL changes every time it is rescheduled. Users need one address that
+# never changes. This gateway holds that address and forwards to whichever
+# backend is currently healthy, so `ANTHROPIC_BASE_URL` is written once and
+# never edited again.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Stable front door for the Anthropic-compatibility server.
-
-A serving job lives for hours and lands on whatever node the scheduler gives
-it, so its URL changes every time it is rescheduled. Agent CLIs need one
-address that never changes. This gateway holds that address and forwards to
-whichever backend is currently healthy, so `ANTHROPIC_BASE_URL` is written once
-and never edited again.
-
-    python3 gateway.py --fleet-dir /shared/fleet --users gateway_users.txt --no-relay
-
-Backends announce themselves by dropping one JSON file per job into
-`--fleet-dir` (see `discover` for the fields). Nothing else couples the gateway
-to the jobs: it never talks to the launcher on the request path, so an
-unhealthy or missing registry only costs routing, never correctness.
-
-Relay mode (`--yaml` without `--no-relay`) additionally submits the successor
-job before the current one hits its wall clock and reclaims the predecessor
-once the successor has proven itself. That half drives the serving jobs through
-a launcher script exposing `submit`, `restart` and `quit` subcommands, passed
-with `--serve-sh`. That script is not part of this example yet, so relay mode
-refuses to start without one rather than failing at the first handover.
-
-Standard library only, on purpose: the gateway has to outlive every serving
-job, so it runs outside the TRT-LLM container on whatever long-lived host is
-available. Requiring httpx or uvicorn there would mean a venv, which means
-outbound network -- one more thing that host has to provide.
-"""
+#   ./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml
+#
+# It starts idle and holds no GPUs. Two unauthenticated POST endpoints decide
+# whether a serving job exists at all, so the front door can stay up for a week
+# while the expensive half of the deployment comes and goes:
+#
+#   curl -XPOST http://<gateway>:8333/_gateway/start_server   # find GPUs, serve
+#   curl -XPOST http://<gateway>:8333/_gateway/stop_server    # give them back
+#
+# Between those two the gateway behaves exactly as before: it relays a
+# successor in before the wall clock and reclaims the predecessor. Outside
+# them it is a proxy for whatever it happens to find, and nothing more.
+#
+# Standard library only, on purpose: the gateway has to outlive every serving
+# job, so it runs outside the TRT-LLM container on whatever long-lived host is
+# available. Requiring httpx or uvicorn there would mean a venv, which means
+# outbound network -- one more thing that host has to provide.
 
 import argparse
 import asyncio
@@ -52,6 +39,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 
 LOG = logging.getLogger("gateway")
 
@@ -78,40 +66,53 @@ MAX_HEAD_BYTES = 64 * 1024
 RELAY_CHUNK = 64 * 1024
 PENDING_VISIBILITY_GRACE = 60
 
-# Identity used when a client sends no key at all. It is an ordinary allowlist
-# entry, not a bypass: keyless requests are refused unless this name is listed
-# in the users file, and the access log then attributes them all to one shared
-# identity.
-ANONYMOUS_USER = "anonymous"
+# The gateway now submits a serving job on its own from a cold start, so a
+# deployment sbatch refuses outright -- expired reservation, full account,
+# broken YAML -- would otherwise queue one every supervisor sweep for as long
+# as the gateway lives. Doubles per consecutive failure, up to ten minutes; any
+# backend coming up, or an explicit start_server, clears it.
+SUBMIT_BACKOFF_BASE = 30
+SUBMIT_BACKOFF_MAX = 600
+
+# `serve.sh quit` only touches a control file. The controller notices within two
+# seconds, TERMs the launcher, and cleanup_workers spends another five waiting
+# before it escalates -- so rc=0 says the request was filed, not that the GPUs
+# came back. stop_server watches Slurm for this long before it says "released",
+# because saying it wrongly is the one thing that endpoint must not do.
+RELEASE_VERIFY_SECONDS = 45
+RELEASE_POLL_INTERVAL = 3
+# States in which Slurm is still holding nodes for the job.
+HOLDING_STATES = {"RUNNING", "PENDING", "CONFIGURING", "SUSPENDED", "RESIZING",
+                  "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED", "SIGNALING",
+                  "STOPPED"}
+
+# Labels reach the filesystem: serve.sh builds the run directory name out of
+# one. The control endpoints are unauthenticated, so a caller-supplied label is
+# reduced to something that cannot escape the trace root.
+LABEL_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 # Anthropic-shaped so a client's error handling reports something meaningful
 # instead of a bare transport failure.
 ERROR_BODIES = {
-    401: (
-        "authentication_error",
-        "unknown api key; ask the gateway owner to add your username to the users file",
-    ),
+    401: ("authentication_error", "unknown api key; ask the gateway owner to "
+                                  "add your username to users.txt"),
     404: ("not_found_error", "no such gateway endpoint"),
+    405: ("invalid_request_error", "this endpoint only accepts POST"),
+    409: ("invalid_request_error", "this gateway runs with --no-relay, so it "
+                                   "does not start or stop serving jobs"),
     502: ("api_error", "backend refused the connection"),
-    503: (
-        "overloaded_error",
-        "no healthy backend right now; the serving job is rotating, retry shortly",
-    ),
+    503: ("overloaded_error", "no healthy backend right now; the serving job "
+                              "is rotating, retry shortly"),
 }
 
-ERROR_REASONS = {
-    401: "Unauthorized",
-    404: "Not Found",
-    502: "Bad Gateway",
-    503: "Service Unavailable",
-}
+REASONS = {200: "OK", 401: "Unauthorized", 404: "Not Found",
+           405: "Method Not Allowed", 409: "Conflict", 502: "Bad Gateway",
+           503: "Service Unavailable"}
 
-SSE_ROTATED = (
-    b"event: error\n"
-    b'data: {"type":"error","error":{"type":"overloaded_error",'
-    b'"message":"backend rotated mid-stream; the response is '
-    b'incomplete, please resend"}}\n\n'
-)
+SSE_ROTATED = (b'event: error\n'
+               b'data: {"type":"error","error":{"type":"overloaded_error",'
+               b'"message":"backend rotated mid-stream; the response is '
+               b'incomplete, please resend"}}\n\n')
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +144,7 @@ class Backend:
         self.end_time = finite_float(record.get("end_time"), "end_time")
         self.heartbeat = finite_float(record.get("heartbeat"), "heartbeat")
         self.healthy = False
-        self.timeouts = 0  # consecutive probe timeouts
+        self.timeouts = 0        # consecutive probe timeouts
         self.healthy_since = 0.0
         # Probing resolves the URL once; every request reuses host/port.
         match = re.match(r"^http://([^:/]+):(\d+)$", self.url)
@@ -167,7 +168,8 @@ class Backend:
         """
         self.state = record.get("state", self.state)
         self.heartbeat = finite_float(record.get("heartbeat"), "heartbeat")
-        self.end_time = finite_float(record.get("end_time") or self.end_time, "end_time")
+        self.end_time = finite_float(record.get("end_time") or self.end_time,
+                                     "end_time")
         self.run_dir = record.get("run_dir", self.run_dir)
         # Normalised the same way as in __init__, so a rewrite that differs
         # only by a trailing slash does not read as a move.
@@ -188,9 +190,9 @@ class Fleet:
 
     def __init__(self, args):
         self.args = args
-        self.backends = {}  # job_id -> Backend
-        self.active = None  # job_id currently taking new requests
-        self.draining = {}  # job_id -> reclaim deadline (unix ts)
+        self.backends = {}          # job_id -> Backend
+        self.active = None          # job_id currently taking new requests
+        self.draining = {}          # job_id -> reclaim deadline (unix ts)
         # A default dict on purpose. Requests outlive their backend's entry --
         # discovery can retire a job while its streams are still draining -- and
         # the release below runs in a finally that also closes the client
@@ -199,13 +201,76 @@ class Fleet:
         self.inflight = collections.defaultdict(int)
         self.users = set()
         self.users_mtime = 0.0
-        # (job_id, submitted_at), retained through registration until healthy.
+        # (job_id, since), retained through registration until healthy, plus
+        # whether it has been seen RUNNING yet -- the queue wait and the
+        # registration wait need separate clocks.
         self.pending = None
-        self.ever_active = False  # distinguish recovery from initial startup
-        # Replaced, but not yet cleared for reclaim: draining ends in a `quit`,
-        # so it waits until the successor has proven itself.
+        self.pending_running = False
+        # Replaced, but not yet cleared for reclaim: draining ends in
+        # `serve.sh quit`, so it waits until the successor has proven itself.
         self.superseded = set()
         self.started = time.time()
+
+        # Lifecycle is explicit. The gateway comes up idle and holds no GPUs
+        # until somebody POSTs /_gateway/start_server; stop_server hands them
+        # all back and leaves the gateway as the only thing running. Routing is
+        # deliberately NOT gated on this: a gateway restarted underneath a live
+        # serving job still forwards to it, it just does not relay or reclaim
+        # it until asked. So this says "who owns the job lifecycle", not "is
+        # anything being served" -- `active` already answers that.
+        self.desired = "stopped"
+        # The fleet directory is namespaced <trace_root>/_fleet/<cluster>_<model>,
+        # so its name is the deployment's. Reported in /_gateway/health purely
+        # so that `serve.sh gateway --stop` can check it is talking to the
+        # gateway it thinks it is before releasing anybody's GPUs.
+        self.name = os.path.basename(os.path.normpath(args.fleet_dir))
+        # Everything that submits or cancels a job holds this. Both the control
+        # endpoints and the supervisor do so across awaits, and interleaving
+        # them loses writes: two concurrent starts would each see no pending
+        # job and submit one.
+        self.control = asyncio.Lock()
+        # Job ids stop_server has released. `serve.sh quit` is asynchronous --
+        # the controller polls its control directory every two seconds and then
+        # takes the server down -- so these keep heartbeating for a while after
+        # being told to go. Without this they would win the next election and
+        # take traffic to a server that is shutting down. Entries for jobs that
+        # never registered are kept on purpose: that is exactly the job that
+        # might still be mid-registration when scancel reaches it.
+        self.stopping = set()
+        # Consecutive failures to get a serving job up, and the earliest time
+        # another attempt is worth making.
+        self.submit_failures = 0
+        self.retry_after = 0.0
+
+    def track_pending(self, job_id, now):
+        """Start the clock on a successor that is not serving yet."""
+        self.pending = (job_id, now)
+        self.pending_running = False
+
+    def forget_pending(self):
+        self.pending = None
+        self.pending_running = False
+
+    def live(self):
+        """Backends eligible for traffic and for relay.
+
+        Everything except what stop_server released. Those records outlive the
+        request to release them, and every decision here -- election, relay,
+        the cold-start submit -- would read them as a healthy serving job.
+        """
+        return {job_id: backend for job_id, backend in self.backends.items()
+                if job_id not in self.stopping}
+
+    def submit_failed(self, now):
+        """Record a failed attempt at a serving job; return the backoff."""
+        self.submit_failures += 1
+        delay = SUBMIT_BACKOFF_BASE * 2 ** min(self.submit_failures - 1, 5)
+        self.retry_after = now + min(SUBMIT_BACKOFF_MAX, delay)
+        return int(self.retry_after - now)
+
+    def submit_succeeded(self):
+        self.submit_failures = 0
+        self.retry_after = 0.0
 
     # -- users ------------------------------------------------------------
     def reload_users(self):
@@ -214,9 +279,8 @@ class Fleet:
             mtime = os.path.getmtime(path)
         except OSError:
             if self.users:
-                LOG.warning(
-                    "users file disappeared: %s (keeping %d entries)", path, len(self.users)
-                )
+                LOG.warning("users file disappeared: %s (keeping %d entries)",
+                            path, len(self.users))
             return
         if mtime == self.users_mtime:
             return
@@ -235,9 +299,9 @@ class Fleet:
     def discover(self):
         """Rebuild the backend table from the registration directory.
 
-        Each serving job owns exactly one file named after its scheduler job id,
-        so there is never more than one writer per file and the gateway never
-        has to coordinate with anybody. The union is just the directory listing.
+        Each serving job owns exactly one file named after its Slurm job id, so
+        there is never more than one writer per file and the gateway never has
+        to coordinate with anybody. The union is just the directory listing.
         """
         now = time.time()
         seen = set()
@@ -246,16 +310,16 @@ class Fleet:
                 with open(path) as handle:
                     record = json.load(handle)
             except (OSError, ValueError):
-                # Mid-rename or truncated. The writer replaces the file
-                # atomically, so the next sweep gets a whole one. Stay quiet:
-                # this is expected and would otherwise log on every sweep.
+                # Mid-rename, or truncated. The writer replaces the file
+                # atomically, so the next sweep gets a whole one.
                 continue
             # A registration has to be a JSON object. Valid JSON that is not one
             # (a bare array, string or number) would otherwise reach .get() and
             # raise AttributeError, which is not a coercion error and escapes
             # the guard below -- aborting the sweep before the retirement pass.
             if not isinstance(record, dict):
-                LOG.warning("ignoring %s: registration is not a JSON object", path)
+                LOG.warning("ignoring %s: registration is not a JSON object",
+                            path)
                 continue
             try:
                 job_id = str(record.get("job_id", ""))
@@ -287,18 +351,17 @@ class Fleet:
                     LOG.warning("ignoring %s: %s", path, exc)
                     continue
                 self.inflight.setdefault(job_id, 0)
-                LOG.info(
-                    "backend appeared: %s at %s (ends %s)",
-                    job_id,
-                    self.backends[job_id].url,
-                    fmt_time(self.backends[job_id].end_time),
-                )
+                LOG.info("backend appeared: %s at %s (ends %s)", job_id,
+                         self.backends[job_id].url,
+                         fmt_time(self.backends[job_id].end_time))
 
         for job_id in [j for j in self.backends if j not in seen]:
-            LOG.info("backend gone: %s (no heartbeat for %ds)", job_id, self.args.stale_after)
+            LOG.info("backend gone: %s (no heartbeat for %ds)", job_id,
+                     self.args.stale_after)
             self.backends.pop(job_id, None)
             self.draining.pop(job_id, None)
             self.superseded.discard(job_id)
+            self.stopping.discard(job_id)
             # Keep the counter while anything is still streaming off this
             # backend; a later sweep collects it once the count reaches zero.
             if not self.inflight.get(job_id):
@@ -320,11 +383,12 @@ class Fleet:
         orchestrating it: a freshly started job outlives the one it replaces,
         so the moment it passes /health it wins the election on its own.
         """
-        candidates = [j for j, b in self.backends.items() if b.healthy]
+        candidates = [j for j, b in self.live().items() if b.healthy]
         if self.pending and self.pending[0] in candidates:
             LOG.info("successor %s is healthy", self.pending[0])
-            self.pending = None
-        winner = max(candidates, key=lambda j: self.backends[j].end_time) if candidates else None
+            self.forget_pending()
+        winner = max(candidates,
+                     key=lambda j: self.backends[j].end_time) if candidates else None
         if winner == self.active:
             return
         previous = self.active
@@ -332,8 +396,15 @@ class Fleet:
         if winner is None:
             LOG.warning("no healthy backend; serving 503")
         else:
-            self.ever_active = True
-            LOG.info("active backend -> %s (%s)", winner, self.backends[winner].url)
+            # A backend just came up, so whatever made the last submit fail is
+            # not worth backing off from any more. On the edge and not on every
+            # sweep, on purpose: while a backend is already active and relay
+            # submits keep being refused, the backoff is the thing that should
+            # be slowing them down, and resetting it here every 5s would leave
+            # it with nothing to do on the one path that submits most often.
+            self.submit_succeeded()
+            LOG.info("active backend -> %s (%s)", winner,
+                     self.backends[winner].url)
             # Won the election back: whatever replaced it is gone or sicker, so
             # it is no longer a candidate for reclaim.
             self.superseded.discard(winner)
@@ -345,16 +416,15 @@ class Fleet:
         # older job after the active backend fails is reversible: the newer job
         # may merely be restarting and must remain eligible to win back routing.
         if winner is not None and previous and previous in self.backends:
-            if self.backends[winner].end_time > self.backends[previous].end_time:
+            if (self.backends[winner].end_time
+                    > self.backends[previous].end_time):
                 self.superseded.add(previous)
-                LOG.info("superseded %s; reclaim held until %s is stable", previous, winner)
+                LOG.info("superseded %s; reclaim held until %s is stable",
+                         previous, winner)
             else:
-                LOG.warning(
-                    "failed back from %s to older backend %s; keeping %s available for recovery",
-                    previous,
-                    winner,
-                    previous,
-                )
+                LOG.warning("failed back from %s to older backend %s; keeping "
+                            "%s available for recovery", previous, winner,
+                            previous)
 
 
 def fmt_time(ts):
@@ -415,26 +485,32 @@ def extract_key(headers):
 
 
 def build_response(status, reason, body, extra_headers=()):
-    head = [
-        "HTTP/1.1 %d %s" % (status, reason),
-        "Content-Type: application/json",
-        "Content-Length: %d" % len(body),
-        "Connection: close",
-    ]
+    head = ["HTTP/1.1 %d %s" % (status, reason),
+            "Content-Type: application/json",
+            "Content-Length: %d" % len(body),
+            "Connection: close"]
     head.extend(extra_headers)
     return ("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + body
 
 
-def error_response(status, retry_after=None):
-    kind, message = ERROR_BODIES[status]
-    body = json.dumps({"type": "error", "error": {"type": kind, "message": message}}).encode()
+def error_response(status, retry_after=None, message=None):
+    kind, default = ERROR_BODIES[status]
+    body = json.dumps({"type": "error",
+                       "error": {"type": kind,
+                                 "message": message or default}}).encode()
     extra = ["Retry-After: %d" % retry_after] if retry_after else []
-    return build_response(status, ERROR_REASONS[status], body, extra)
+    return build_response(status, REASONS[status], body, extra)
 
 
-def json_response(payload):
+def json_response(payload, status=200):
     body = json.dumps(payload, indent=2).encode()
-    return build_response(200, "OK", body)
+    return build_response(status, REASONS[status], body)
+
+
+def clean_label(label, fallback):
+    """Reduce a caller-supplied label to something safe in a path."""
+    label = LABEL_UNSAFE.sub("-", (label or "").strip())[:32].strip("-._")
+    return label or fallback
 
 
 def parse_response_head(head):
@@ -454,9 +530,11 @@ def parse_response_head(head):
 
 def rewrite_sse_head(status_line, headers):
     """Make downstream SSE framing independent from the upstream framing."""
-    owned = {"connection", "content-length", "keep-alive", "trailer", "transfer-encoding"}
+    owned = {"connection", "content-length", "keep-alive", "trailer",
+             "transfer-encoding"}
     lines = [status_line]
-    lines.extend("%s: %s" % (name, value) for name, value in headers if name.lower() not in owned)
+    lines.extend("%s: %s" % (name, value) for name, value in headers
+                 if name.lower() not in owned)
     lines.extend(("Transfer-Encoding: chunked", "Connection: close"))
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
@@ -494,7 +572,7 @@ class SseTracker:
             if newline < 0:
                 return
             line = bytes(self.buffer[:newline]).rstrip(b"\r")
-            del self.buffer[: newline + 1]
+            del self.buffer[:newline + 1]
             if not line:
                 if self.current_event == b"message_stop":
                     self.saw_stop = True
@@ -543,7 +621,7 @@ class BufferedUpstream:
             newline = self.buffer.find(b"\r\n")
             if newline >= 0:
                 line = bytes(self.buffer[:newline])
-                del self.buffer[: newline + 2]
+                del self.buffer[:newline + 2]
                 return line
             if len(self.buffer) > MAX_HEAD_BYTES:
                 raise ValueError("upstream framing line is too long")
@@ -618,7 +696,6 @@ async def relay_close_delimited_sse(source, writer, tracker):
 # Request path
 # ---------------------------------------------------------------------------
 class Gateway:
-    """Terminates client connections and forwards them to the active backend."""
 
     def __init__(self, fleet):
         self.fleet = fleet
@@ -631,25 +708,40 @@ class Gateway:
             if head is None:
                 return
             method, path, headers = parse_request_head(head)
-        # OSError, not just ConnectionError: reader.read raises other OSError
-        # subclasses (a socket timeout, for one). ConnectionError is itself an
-        # OSError subclass, so this only widens. Letting one escape means the
-        # task dies with an unretrieved exception and close(writer) never runs,
-        # leaking the connection.
-        except (ValueError, OSError) as exc:
+        except (ValueError, ConnectionError) as exc:
             LOG.debug("bad request from %s: %s", peer, exc)
             await close(writer)
             return
 
         if path.startswith("/_gateway/"):
-            await self.serve_introspection(path, headers, writer)
+            try:
+                await self.serve_introspection(method, path, headers, writer)
+            except Exception:
+                # These endpoints shell out to Slurm, so they have more ways to
+                # fail than the proxy path does. An escape here would reach
+                # asyncio's own handler, and the caller -- who has just asked
+                # for GPUs to be released -- would get an empty reply and read
+                # it as "the gateway is down".
+                LOG.exception("%s %s failed", method, path)
+                await respond(writer, error_response(
+                    502, message="the gateway failed while handling this "
+                                 "request; see its log"))
             return
 
-        key = extract_key(headers) or ANONYMOUS_USER
-        if key not in self.fleet.users:
-            LOG.info("401 %s %s user=%r", method, path, key)
-            await respond(writer, error_response(401))
-            return
+        key = extract_key(headers) or "kf-anonymous"
+        # Allowlist disabled on purpose. The check below rejected any key that
+        # was not a line in the users file, and an OpenAI-native client sends
+        # whatever OPENAI_API_KEY happens to be -- usually an sk-... string. It
+        # would be turned away here, by the gateway, so the request left no
+        # trace at all in the backend's server.log and looked like it had never
+        # been sent. `key` is still resolved above: the access line and the
+        # upstream user header keep attributing every request.
+        # Re-enable by uncommenting; the users file is still loaded and watched,
+        # and /_gateway/fleet still checks it.
+        # if key not in self.fleet.users:
+        #     LOG.info("401 %s %s user=%r", method, path, key)
+        #     await respond(writer, error_response(401))
+        #     return
 
         # Resolved once. The election loop may move `active` while this request
         # is in flight; everything below must keep talking about the same
@@ -659,8 +751,16 @@ class Gateway:
         job_id = self.fleet.active
         backend = self.fleet.backends.get(job_id) if job_id else None
         if backend is None:
-            LOG.info("503 %s %s user=%s (no backend)", method, path, key)
-            await respond(writer, error_response(503, retry_after=20))
+            # "Retry shortly" is the wrong advice when the gateway is idle by
+            # request: nothing is coming unless somebody asks for it. Say which
+            # of the two it is, in the body the client already prints.
+            stopped = self.fleet.desired == "stopped" and not self.fleet.live()
+            LOG.info("503 %s %s user=%s (%s)", method, path, key,
+                     "stopped" if stopped else "no backend")
+            message = ("no serving job is running; POST /_gateway/start_server "
+                       "to start one") if stopped else None
+            await respond(writer, error_response(503, retry_after=20,
+                                                 message=message))
             return
         self.fleet.inflight[job_id] += 1
         status = "-"
@@ -668,43 +768,46 @@ class Gateway:
         # bookkeeping trouble above can leak the connection.
         try:
             try:
-                status = await self.proxy(backend, method, path, headers, rest, reader, writer, key)
-            # ValueError covers an unusable upstream head: read_head raises it
-            # past MAX_HEAD_BYTES and parse_response_head on a malformed one.
-            # Both happen before anything is written downstream, so 502 is
-            # safe here -- without it the client just sees the socket close
-            # with no status at all. Framing failures after the head is out are
-            # caught in relay_response, which cannot use this path.
-            except (ConnectionError, OSError, ValueError) as exc:
+                status = await self.proxy(backend, method, path, headers, rest,
+                                          reader, writer, key)
+            except (ConnectionError, OSError) as exc:
                 LOG.warning("upstream %s failed: %s", backend.url, exc)
                 status = "502"
                 await respond(writer, error_response(502))
             finally:
                 self.fleet.inflight[job_id] -= 1
-                LOG.info(
-                    "%s %s %s user=%s backend=%s %.1fs",
-                    status,
-                    method,
-                    path,
-                    key,
-                    job_id,
-                    time.time() - started,
-                )
+                LOG.info("%s %s %s user=%s backend=%s %.1fs", status, method,
+                         path, key, job_id, time.time() - started)
         finally:
             await close(writer)
 
-    async def serve_introspection(self, path, headers, writer):
+    async def serve_introspection(self, method, path, headers, writer):
+        path, _, query = path.partition("?")
         if path == "/_gateway/health":
-            # Deliberately unauthenticated: whatever watches the gateway from
-            # outside has no reason to hold an allowlist entry, and the answer
-            # names no user and no request.
-            healthy = self.fleet.active is not None
-            payload = {
-                "status": "ok" if healthy else "no_backend",
-                "active": self.fleet.active,
-                "uptime_s": round(time.time() - self.fleet.started),
-            }
+            if self.fleet.active is not None:
+                # "ok" would be true and useless: a monitor keyed on it cannot
+                # tell a job this gateway is relaying from one it merely found,
+                # and the second kind goes down at its wall clock with no
+                # successor. Both are serving; only one has an owner.
+                status = ("ok" if self.fleet.desired == "running"
+                          else "unmanaged")
+            elif self.fleet.desired == "running":
+                status = "no_backend"
+            else:
+                # Not a fault. Nobody has asked for a serving job, so a monitor
+                # should not page on it -- which "no_backend" invites.
+                status = "stopped"
+            payload = {"status": status,
+                       "deployment": self.fleet.name,
+                       "active": self.fleet.active,
+                       "desired": self.fleet.desired,
+                       "pending": self.fleet.pending[0] if self.fleet.pending
+                                  else None,
+                       "uptime_s": round(time.time() - self.fleet.started)}
             await respond(writer, json_response(payload))
+            return
+        if path in ("/_gateway/start_server", "/_gateway/stop_server"):
+            await self.serve_control(method, path, query, writer)
             return
         if path == "/_gateway/fleet":
             if extract_key(headers) not in self.fleet.users:
@@ -712,13 +815,19 @@ class Gateway:
                 return
             now = time.time()
             payload = {
+                "deployment": self.fleet.name,
                 "active": self.fleet.active,
-                "pending_successor": self.fleet.pending[0] if self.fleet.pending else None,
+                "desired": self.fleet.desired,
+                "pending_successor": self.fleet.pending[0] if self.fleet.pending
+                                     else None,
+                "submit_failures": self.fleet.submit_failures,
+                "submit_retry_in_s": max(0, round(self.fleet.retry_after - now)),
                 "backends": {
                     job_id: {
                         "url": b.url,
                         "healthy": b.healthy,
-                        "healthy_for_s": round(now - b.healthy_since) if b.healthy_since else None,
+                        "healthy_for_s": round(now - b.healthy_since)
+                                         if b.healthy_since else None,
                         "probe_timeouts": b.timeouts,
                         "state": b.state,
                         "ends_at": fmt_time(b.end_time),
@@ -727,18 +836,50 @@ class Gateway:
                         "inflight": self.fleet.inflight.get(job_id, 0),
                         "superseded": job_id in self.fleet.superseded,
                         "draining": job_id in self.fleet.draining,
+                        "stopping": job_id in self.fleet.stopping,
                     }
                     for job_id, b in sorted(self.fleet.backends.items())
                 },
             }
             await respond(writer, json_response(payload))
             return
+        # A mistyped control path used to answer "backend refused the
+        # connection", which sends whoever typed it looking at the serving job.
         await respond(writer, error_response(404))
 
-    async def proxy(self, backend, method, path, headers, rest, reader, writer, user):
-        up_reader, up_writer = await asyncio.open_connection(backend.host, backend.port)
+    async def serve_control(self, method, path, query, writer):
+        """start_server / stop_server: who owns the serving job right now.
+
+        Unauthenticated, like /v1 -- see the note in `handle`. That makes the
+        method the only thing between a mistyped GET, a link preview or a
+        crawler and a released allocation, so anything but POST is refused
+        before it reaches Slurm.
+        """
+        if method != "POST":
+            LOG.info("405 %s %s", method, path)
+            await respond(writer, error_response(405))
+            return
+        if self.fleet.args.no_relay:
+            # --no-relay promises not to touch job lifecycles at all. Honouring
+            # half of that promise would be worse than refusing.
+            LOG.warning("409 %s: gateway runs with --no-relay", path)
+            await respond(writer, error_response(409))
+            return
+        if path.endswith("/start_server"):
+            label = urllib.parse.parse_qs(query).get("label", [""])[0]
+            status, payload = await start_server(self.fleet,
+                                                 clean_label(label, "start"))
+        else:
+            status, payload = await stop_server(self.fleet)
+        await respond(writer, json_response(payload, status))
+
+    async def proxy(self, backend, method, path, headers, rest, reader, writer,
+                    user):
+        up_reader, up_writer = await asyncio.open_connection(backend.host,
+                                                             backend.port)
         try:
-            up_writer.write(self.upstream_head(backend, method, path, headers, user))
+            up_writer.write(self.upstream_head(backend, method, path, headers,
+                                               user))
             if rest:
                 up_writer.write(rest)
             await up_writer.drain()
@@ -755,21 +896,13 @@ class Gateway:
             await close(up_writer)
 
     def upstream_head(self, backend, method, path, headers, user):
-        # The request line is forwarded verbatim, which is what keeps the
-        # gateway independent of the Anthropic surface the backend happens to
-        # register. /v1/messages, /v1/messages/count_tokens and every Message
-        # Batches route reach the backend without this file naming them, and a
-        # route added later needs no change here. The only paths the gateway
-        # claims for itself are under /_gateway/.
-        lines = [
-            "%s %s HTTP/1.1" % (method, path),
-            "Host: %s:%d" % (backend.host, backend.port),
-            # Close framing gives non-SSE responses an unambiguous EOF.
-            # SSE responses are decoded and reframed below.
-            "Connection: close",
-            "Accept-Encoding: identity",
-            "X-Gateway-User: %s" % user,
-        ]
+        lines = ["%s %s HTTP/1.1" % (method, path),
+                 "Host: %s:%d" % (backend.host, backend.port),
+                 # Close framing gives non-SSE responses an unambiguous EOF.
+                 # SSE responses are decoded and reframed below.
+                 "Connection: close",
+                 "Accept-Encoding: identity",
+                 "X-Gateway-User: %s" % user]
         for name, value in headers:
             if name.lower() in STRIP_REQUEST_HEADERS:
                 continue
@@ -788,12 +921,8 @@ class Gateway:
         content_type = header_value(headers, "content-type") or ""
         content_encoding = header_value(headers, "content-encoding") or ""
         transfer_encoding = header_value(headers, "transfer-encoding") or ""
-        encodings = [
-            value.strip().lower() for value in transfer_encoding.split(",") if value.strip()
-        ]
-        # Only SSE is reframed, and only SSE gets a terminal event appended.
-        # Batch results come back as application/x-ndjson and count_tokens as
-        # application/json, so both take the verbatim path below untouched.
+        encodings = [value.strip().lower()
+                     for value in transfer_encoding.split(",") if value.strip()]
         is_sse = "text/event-stream" in content_type.lower()
         supported_transfer = not encodings or encodings == ["chunked"]
 
@@ -801,7 +930,8 @@ class Gateway:
         # unencoded injected event into that stream. Accept-Encoding: identity
         # prevents content encoding for the normal server; retain raw relay as a
         # safe fallback for encoded bodies or unknown transfer codings.
-        if not is_sse or content_encoding.lower() not in ("", "identity") or not supported_transfer:
+        if (not is_sse or content_encoding.lower() not in ("", "identity")
+                or not supported_transfer):
             writer.write(head + b"\r\n\r\n" + rest)
             await writer.drain()
             while True:
@@ -815,39 +945,28 @@ class Gateway:
         await writer.drain()
         source = BufferedUpstream(up_reader, rest)
         tracker = SseTracker()
-        # The head is already on the wire, so a framing failure from here on
-        # cannot become a 502: writing error_response would put a second HTTP
-        # head inside a response the client is already reading. Degrade to the
-        # truncated-stream path instead and let the terminal-event injection
-        # below give the client a valid end to the stream.
-        try:
-            if "chunked" in encodings:
-                clean_end = await relay_chunked_sse(source, writer, tracker)
+        if "chunked" in encodings:
+            clean_end = await relay_chunked_sse(source, writer, tracker)
+        else:
+            content_length = header_value(headers, "content-length")
+            if content_length is None:
+                clean_end = await relay_close_delimited_sse(
+                    source, writer, tracker)
             else:
-                content_length = header_value(headers, "content-length")
-                if content_length is None:
-                    clean_end = await relay_close_delimited_sse(source, writer, tracker)
+                try:
+                    length = int(content_length)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    clean_end = False
                 else:
-                    try:
-                        length = int(content_length)
-                    except ValueError:
-                        length = -1
-                    if length < 0:
-                        clean_end = False
-                    else:
-                        clean_end = await relay_sized_sse(source, writer, tracker, length)
-        # The response head is already on the wire, so a failure from here on
-        # cannot become a 502 -- that would put a second HTTP head inside a
-        # body the client is reading. OSError covers an upstream that dies
-        # mid-stream, which is the common case during a handover. Both degrade
-        # to the truncated path so the terminal event below closes the stream.
-        except (ValueError, OSError) as exc:
-            LOG.warning("upstream framing failed mid-stream: %s", exc)
-            clean_end = False
+                    clean_end = await relay_sized_sse(source, writer, tracker,
+                                                      length)
 
         if not tracker.terminal:
             ending = "clean end" if clean_end else "truncated upstream framing"
-            LOG.warning("stream reached %s without message_stop or error; injecting error", ending)
+            LOG.warning("stream reached %s without message_stop or error; "
+                        "injecting error", ending)
             await emit_sse_payload(writer, tracker, SSE_ROTATED)
             status += "!"
         writer.write(b"0\r\n\r\n")
@@ -903,12 +1022,10 @@ async def probe(backend, timeout):
     writer = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(backend.host, backend.port), timeout
-        )
-        writer.write(
-            b"GET /health HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
-            % backend.host.encode("latin-1")
-        )
+            asyncio.open_connection(backend.host, backend.port), timeout)
+        writer.write(b"GET /health HTTP/1.1\r\nHost: %s\r\n"
+                     b"Connection: close\r\n\r\n"
+                     % backend.host.encode("latin-1"))
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout)
         return "ok" if b" 200 " in line else "dead"
@@ -931,27 +1048,21 @@ def apply_probe(backend, result, unhealthy_after):
         return
     if result == "dead":
         if backend.healthy:
-            LOG.warning("backend %s unreachable; dropping it now", backend.job_id)
+            LOG.warning("backend %s unreachable; dropping it now",
+                        backend.job_id)
         backend.timeouts = 0
         backend.healthy = False
         backend.healthy_since = 0.0
         return
     backend.timeouts += 1
     if backend.healthy and backend.timeouts >= unhealthy_after:
-        LOG.warning(
-            "backend %s timed out %d times in a row; marking unhealthy",
-            backend.job_id,
-            backend.timeouts,
-        )
+        LOG.warning("backend %s timed out %d times in a row; marking unhealthy",
+                    backend.job_id, backend.timeouts)
         backend.healthy = False
         backend.healthy_since = 0.0
     elif backend.healthy:
-        LOG.info(
-            "backend %s health probe timed out (%d/%d)",
-            backend.job_id,
-            backend.timeouts,
-            unhealthy_after,
-        )
+        LOG.info("backend %s health probe timed out (%d/%d)", backend.job_id,
+                 backend.timeouts, unhealthy_after)
 
 
 async def discovery_loop(fleet):
@@ -971,8 +1082,7 @@ async def health_loop(fleet):
             if backends:
                 results = await asyncio.gather(
                     *[probe(b, fleet.args.probe_timeout) for b in backends],
-                    return_exceptions=True,
-                )
+                    return_exceptions=True)
                 for backend, result in zip(backends, results):
                     if not isinstance(result, str):
                         result = "timeout"
@@ -984,12 +1094,22 @@ async def health_loop(fleet):
 
 
 async def run_serve_sh(fleet, *serve_args):
-    proc = await asyncio.create_subprocess_exec(
-        fleet.args.serve_sh,
-        *serve_args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+    """Run serve.sh. Returns (None, message) if it could not be run at all.
+
+    Guarded the same way run_slurm_command is, and for a sharper reason now
+    that release_job calls this from a request handler: an unguarded exec
+    failure -- serve.sh moved, a transient EAGAIN -- would escape through
+    stop_server, leave the client with an empty reply, and strand every job it
+    had already marked as being torn down. Every caller compares against 0, so
+    None fails closed.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            fleet.args.serve_sh, *serve_args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    except OSError as exc:
+        LOG.error("cannot run %s: %s", fleet.args.serve_sh, exc)
+        return None, str(exc)
     out, _ = await proc.communicate()
     return proc.returncode, out.decode(errors="replace").strip()
 
@@ -997,8 +1117,8 @@ async def run_serve_sh(fleet, *serve_args):
 async def run_slurm_command(*command):
     try:
         proc = await asyncio.create_subprocess_exec(
-            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-        )
+            *command, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT)
     except OSError as exc:
         LOG.error("cannot run %s: %s", command[0], exc)
         return None, ""
@@ -1008,7 +1128,8 @@ async def run_slurm_command(*command):
 
 async def slurm_job_status(job_id):
     """Return (state, reason), ("GONE", ""), or None on query failure."""
-    code, out = await run_slurm_command("squeue", "-h", "-j", job_id, "-o", "%T|%r")
+    code, out = await run_slurm_command("squeue", "-h", "-j", job_id, "-o",
+                                        "%T|%r")
     if code is not None and code != 0 and "invalid job id" in out.lower():
         return "GONE", ""
     if code is None or code != 0:
@@ -1021,14 +1142,215 @@ async def slurm_job_status(job_id):
 
 
 async def submit_successor(fleet, now, label):
-    code, out = await run_serve_sh(fleet, "submit", "--yaml", fleet.args.yaml, "--label", label)
+    code, out = await run_serve_sh(fleet, "submit", "--yaml", fleet.args.yaml,
+                                   "--label", label)
     match = re.search(r"Submitted batch job (\d+)", out)
     if code == 0 and match:
-        fleet.pending = (match.group(1), now)
+        fleet.track_pending(match.group(1), now)
+        fleet.submit_succeeded()
         LOG.info("successor submitted: job %s", match.group(1))
         return True
-    LOG.error("submit failed (rc=%d): %s", code, out)
+    LOG.error("submit failed (rc=%s, attempt %d): %s; next attempt in %ds",
+              code, fleet.submit_failures + 1, out, fleet.submit_failed(now))
     return False
+
+
+async def wait_for_release(job_id, timeout):
+    """Watch Slurm until the job stops holding nodes. None if it cannot tell."""
+    deadline = time.time() + timeout
+    while True:
+        status = await slurm_job_status(job_id)
+        if status is None:
+            return None
+        if status[0] not in HOLDING_STATES:
+            return True
+        if time.time() >= deadline:
+            return False
+        await asyncio.sleep(RELEASE_POLL_INTERVAL)
+
+
+async def release_job(fleet, job_id, run_dir):
+    """Stop one serving job. Returns "released", "held" or "failed".
+
+    `quit` is the clean path: the controller stops the server, writes a final
+    state and exits, which under sbatch ends the job and returns the nodes. It
+    needs a live control directory, so a job that never got that far, or whose
+    controller is already gone, falls back to scancel.
+
+    A filed `quit` is not a released allocation, so this waits for Slurm to
+    agree. What it will not do is escalate a `quit` that worked into a scancel:
+    a controller started by hand inside somebody's `salloc` exits exactly as
+    asked and leaves the allocation behind, because the allocation is that
+    person's shell. Reporting "held" sends the operator to `scancel` with the
+    job id; guessing would take their session down with the server.
+    """
+    if run_dir:
+        code, out = await run_serve_sh(fleet, "quit", run_dir)
+        if code == 0:
+            released = await wait_for_release(job_id,
+                                              fleet.args.release_timeout)
+            if released:
+                LOG.info("released %s via quit (%s)", job_id, run_dir)
+                return "released"
+            if released is None:
+                LOG.warning("quit %s was filed but squeue would not confirm "
+                            "the release; treating it as done", job_id)
+                return "released"
+            LOG.warning("%s stopped serving but still holds its allocation "
+                        "%ds later; leaving it to be cancelled by hand",
+                        job_id, fleet.args.release_timeout)
+            return "held"
+        LOG.warning("quit %s failed (rc=%s): %s; falling back to scancel",
+                    job_id, code, out)
+    code, out = await run_slurm_command("scancel", job_id)
+    if code == 0:
+        LOG.info("released %s via scancel", job_id)
+        return "released"
+    LOG.error("scancel %s failed (rc=%s): %s", job_id, code, out)
+    return "failed"
+
+
+async def start_server(fleet, label):
+    """Hand the job lifecycle to the supervisor and get a serving job coming.
+
+    Idempotent on purpose: this is what a person retries when they are not sure
+    whether the first call landed. A serving job that already exists is adopted
+    rather than duplicated -- including one somebody submitted by hand, and
+    including the one still loading weights from the previous call.
+    """
+    async with fleet.control:
+        was = fleet.desired
+        fleet.desired = "running"
+        # An explicit start is also an explicit "try again now": whoever asked
+        # has usually just fixed whatever sbatch was refusing.
+        fleet.submit_succeeded()
+
+        live = fleet.live()
+        if live or fleet.pending:
+            # Name the job this actually adopts: the one still loading if there
+            # is one, else the one taking traffic, else the one that will win
+            # the next election.
+            if fleet.pending:
+                job_id = fleet.pending[0]
+            elif fleet.active in live:
+                job_id = fleet.active
+            else:
+                job_id = max(live, key=lambda j: live[j].end_time)
+            LOG.info("start_server: adopting job %s (was %s)", job_id, was)
+            return 200, {
+                "action": "adopted",
+                "desired": "running",
+                "job_id": job_id,
+                "active": fleet.active,
+                "message": "a serving job is already present; the gateway now "
+                           "relays and reclaims it",
+            }
+
+        LOG.info("start_server: submitting a serving job (was %s)", was)
+        if await submit_successor(fleet, time.time(), label):
+            return 200, {
+                "action": "submitted",
+                "desired": "running",
+                "job_id": fleet.pending[0],
+                "active": None,
+                "message": "queued; poll /_gateway/health until status is ok. "
+                           "It waits for nodes and then loads weights, so "
+                           "minutes to hours depending on the queue",
+            }
+        # The supervisor keeps trying on its own, so this is a report, not a
+        # dead end -- but a script that fired it should be able to tell.
+        return 503, {
+            "action": "submit_failed",
+            "desired": "running",
+            "job_id": None,
+            "active": None,
+            "message": "sbatch refused the job; the gateway will retry in %ds. "
+                       "Its log has the sbatch output"
+                       % max(0, round(fleet.retry_after - time.time())),
+        }
+
+
+async def stop_server(fleet):
+    """Release every serving job and leave the gateway as the only process."""
+    async with fleet.control:
+        was = fleet.desired
+        fleet.desired = "stopped"
+        fleet.submit_succeeded()
+
+        targets = []
+        # A submitted job that has not registered yet has no run directory to
+        # drive, so scancel is the only handle on it.
+        if fleet.pending:
+            job_id = fleet.pending[0]
+            if job_id not in fleet.backends:
+                targets.append((job_id, ""))
+            fleet.forget_pending()
+        for job_id, backend in sorted(fleet.backends.items()):
+            targets.append((job_id, backend.run_dir))
+
+        # Every bit of state below is settled before the first await, so that
+        # the discovery and health loops -- which run between those awaits and
+        # would otherwise re-elect a backend that is on its way out -- see a
+        # consistent picture from the moment this call starts tearing down.
+        inflight = sum(fleet.inflight.get(job_id, 0) for job_id, _ in targets)
+        fleet.stopping.update(job_id for job_id, _ in targets)
+        fleet.draining.clear()
+        fleet.superseded.clear()
+        if fleet.active in fleet.stopping:
+            # Stop routing first. These servers are about to go down mid-stream
+            # and a clean 503 is a better answer than a truncated response.
+            fleet.active = None
+
+        # Concurrently, because each one waits on Slurm for up to
+        # RELEASE_VERIFY_SECONDS and a deployment with several backends would
+        # otherwise outlast the caller's HTTP timeout.
+        outcomes = await asyncio.gather(
+            *[release_job(fleet, job_id, run_dir) for job_id, run_dir in targets],
+            return_exceptions=True)
+
+        released, held, failed = [], [], []
+        for (job_id, _), outcome in zip(targets, outcomes):
+            if isinstance(outcome, BaseException):
+                LOG.error("releasing %s raised: %r", job_id, outcome)
+                outcome = "failed"
+            {"released": released, "held": held}.get(outcome, failed).append(job_id)
+
+        # A job nothing could be done to is still serving, so put it back in
+        # rotation rather than leaving it latched out: `stopping` means "on its
+        # way out", and this one is not. Otherwise it would be unroutable for
+        # the rest of its wall clock AND invisible to the next start_server,
+        # which would then submit a second allocation alongside it.
+        for job_id in failed:
+            fleet.stopping.discard(job_id)
+        if fleet.active is None:
+            fleet.elect()
+
+        LOG.info("stop_server: released %s (was %s, interrupted %d request(s))"
+                 "%s%s", ", ".join(released) or "nothing", was, inflight,
+                 "; STILL ALLOCATED: %s" % ", ".join(held) if held else "",
+                 "; FAILED on %s" % ", ".join(failed) if failed else "")
+
+        if failed:
+            # The one thing this endpoint must not do is leave a GPU job nobody
+            # knows about, so name it.
+            message = ("could not stop %s; check it with squeue and scancel it "
+                       "by hand" % ", ".join(failed))
+        elif held:
+            # Normal for a controller started by hand inside an salloc: it did
+            # what it was told, and the allocation is not its to give back.
+            message = ("stopped, but %s still holds its allocation -- scancel "
+                       "it if you want the nodes back" % ", ".join(held))
+        else:
+            message = "POST /_gateway/start_server to bring a serving job back"
+        return (502 if failed else 200), {
+            "action": "stopped",
+            "desired": "stopped",
+            "released": released,
+            "still_allocated": held,
+            "failed": failed,
+            "interrupted_requests": inflight,
+            "message": message,
+        }
 
 
 async def supervise_pending(fleet, now):
@@ -1038,21 +1360,24 @@ async def supervise_pending(fleet, now):
     job_id, submitted_at = fleet.pending
     backend = fleet.backends.get(job_id)
     if backend is not None:
-        failed_attempt = " exited with status " in backend.state or backend.state.startswith(
-            "stopped;"
-        )
+        failed_attempt = (" exited with status " in backend.state
+                          or backend.state.startswith("stopped;"))
         if not backend.healthy and failed_attempt:
-            LOG.warning("successor %s failed to start; restarting its retained allocation", job_id)
+            LOG.warning("successor %s failed to start; restarting its retained "
+                        "allocation", job_id)
             code, out = await run_serve_sh(fleet, "restart", backend.run_dir)
             if code == 0:
-                fleet.pending = (job_id, now)
+                fleet.track_pending(job_id, now)
             else:
-                LOG.error("restart %s failed (rc=%d): %s", job_id, code, out)
-                cancel_code, cancel_out = await run_slurm_command("scancel", job_id)
+                LOG.error("restart %s failed (rc=%s): %s; retrying in %ds",
+                          job_id, code, out, fleet.submit_failed(now))
+                cancel_code, cancel_out = await run_slurm_command(
+                    "scancel", job_id)
                 if cancel_code == 0:
-                    fleet.pending = None
+                    fleet.forget_pending()
                 else:
-                    LOG.error("scancel %s failed (rc=%s): %s", job_id, cancel_code, cancel_out)
+                    LOG.error("scancel %s failed (rc=%s): %s", job_id,
+                              cancel_code, cancel_out)
         return
 
     # sbatch can take a moment to publish a new job into squeue. Do not mistake
@@ -1064,17 +1389,19 @@ async def supervise_pending(fleet, now):
         return
     state, reason = status
     terminal = {
-        "BOOT_FAIL",
-        "CANCELLED",
-        "DEADLINE",
-        "FAILED",
-        "NODE_FAIL",
-        "OUT_OF_MEMORY",
-        "TIMEOUT",
+        "BOOT_FAIL", "CANCELLED", "DEADLINE", "FAILED", "NODE_FAIL",
+        "OUT_OF_MEMORY", "TIMEOUT"
     }
     if state == "GONE" or state in terminal:
-        LOG.warning("successor %s is no longer runnable (%s); retrying", job_id, state)
-        fleet.pending = None
+        # `pending` is cleared the moment a successor passes /health, so
+        # reaching a terminal state while still pending means it never served.
+        # Counted like a refused sbatch: a node that boot-fails in seconds
+        # would otherwise be resubmitted every sweep forever. Any backend
+        # coming up clears the count, so a cluster that fails intermittently
+        # never accumulates one.
+        LOG.warning("successor %s is no longer runnable (%s); retrying in %ds",
+                    job_id, state, fleet.submit_failed(now))
+        fleet.forget_pending()
         return
 
     # Slurm reports RUNNING as soon as it hands the node over, which is before
@@ -1087,25 +1414,38 @@ async def supervise_pending(fleet, now):
     # it with PrologEpilogTimeout and fails the job into a terminal state the
     # branch above already handles.
     if state == "RUNNING" and "prolog" in reason.lower():
-        LOG.info("successor %s is still in prolog; deferring its failure check", job_id)
+        LOG.info("successor %s is still in prolog; deferring its failure check",
+                 job_id)
         fleet.pending = (job_id, now)
         return
 
-    # A RUNNING job reaches its serving command and registers before it starts
-    # loading the model. If it remains invisible here, the launcher failed
-    # before that point. Held jobs cannot make progress either. Cancel before
-    # retrying so a delayed job cannot later appear as a duplicate successor.
+    # Slurm reports RUNNING the moment the batch script starts, and serve.sh
+    # needs another 10-20s to validate the allocation and write its first fleet
+    # record. Measuring that gap from submit time hides it entirely while the
+    # queue is short and makes it certain once the queue wait passes the grace
+    # period -- which is exactly the cold start start_server now performs. A
+    # job that queued for twenty minutes would be scancelled seconds after
+    # Slurm handed the nodes over, and the retry would queue behind everyone
+    # else and meet the same fate. Give the transition its own grace period.
+    if state == "RUNNING" and not fleet.pending_running:
+        LOG.info("successor %s started; %ds to register before it counts as a "
+                 "launcher failure", job_id, PENDING_VISIBILITY_GRACE)
+        fleet.pending = (job_id, now)
+        fleet.pending_running = True
+        return
+
+    # A RUNNING job reaches cmd_run and registers before it starts loading the
+    # model. If it remains invisible here, the launcher failed before that
+    # point. Held jobs cannot make progress either. Cancel before retrying so a
+    # delayed job cannot later appear as a duplicate successor.
     should_cancel = state == "RUNNING" or "held" in reason.lower()
     if should_cancel:
-        LOG.warning(
-            "successor %s is %s without registering (%s); cancelling and retrying",
-            job_id,
-            state,
-            reason or "no reason",
-        )
+        LOG.warning("successor %s is %s without registering (%s); cancelling "
+                    "and retrying in %ds", job_id, state, reason or "no reason",
+                    fleet.submit_failed(now))
         code, out = await run_slurm_command("scancel", job_id)
         if code == 0:
-            fleet.pending = None
+            fleet.forget_pending()
         else:
             LOG.error("scancel %s failed (rc=%s): %s", job_id, code, out)
 
@@ -1113,39 +1453,69 @@ async def supervise_pending(fleet, now):
 async def supervisor_loop(fleet):
     while True:
         try:
-            await supervise(fleet)
+            # Under the same lock as start_server and stop_server, and the
+            # state is read inside it: a stop landing halfway through a sweep
+            # must not have its teardown followed by that sweep's submit.
+            async with fleet.control:
+                if fleet.desired == "running":
+                    await supervise(fleet)
+                elif fleet.active is not None:
+                    # Serving a job this gateway did not start and will not
+                    # relay. Repeated every sweep on purpose: the consequence
+                    # arrives hours later, at that job's wall clock, and by
+                    # then this log is the only thing that saw it coming.
+                    LOG.warning("backend %s is serving but unmanaged: no "
+                                "successor will be submitted before it ends. "
+                                "POST /_gateway/start_server to adopt it",
+                                fleet.active)
         except Exception:
             LOG.exception("supervisor failed")
         await asyncio.sleep(fleet.args.supervisor_interval)
 
 
 async def supervise(fleet):
+    """One sweep of job lifecycle. Only ever reached while `desired` is running."""
     now = time.time()
     await supervise_pending(fleet, now)
 
+    # Jobs stop_server released are excluded from every decision below: they
+    # keep heartbeating on their way out, and each one of these would otherwise
+    # read them as a serving job that needs relaying or reclaiming.
+    live = fleet.live()
+
     # Relay: submit the next job early enough that it finishes loading weights
     # before this one hits the wall clock.
-    backend = fleet.backends.get(fleet.active) if fleet.active else None
+    backend = live.get(fleet.active) if fleet.active else None
     if backend is not None and not fleet.args.no_relay:
         remaining = backend.end_time - now
         # A submitted/loading successor is represented by `pending`. An older
         # job that took traffic and then failed remains discoverable so it can
         # recover, but must not block a replacement successor forever.
         successors = [
-            j for j, candidate in fleet.backends.items() if j != fleet.active and candidate.healthy
+            j for j, candidate in live.items()
+            if j != fleet.active and candidate.healthy
         ]
         if backend.end_time <= 0:
             # Registration could not determine the wall clock. Routing still
             # works; relaying on `0 - now` would read as "already expired" and
             # submit a job every single sweep.
-            LOG.warning("backend %s has no end time; relay disabled for it", fleet.active)
-        elif remaining < fleet.args.lead_time and not successors and not fleet.pending:
-            LOG.info("%s ends in %ds; submitting successor", fleet.active, int(remaining))
+            LOG.warning("backend %s has no end time; relay disabled for it",
+                        fleet.active)
+        elif (remaining < fleet.args.lead_time and not successors
+              and not fleet.pending and now >= fleet.retry_after):
+            LOG.info("%s ends in %ds; submitting successor",
+                     fleet.active, int(remaining))
             await submit_successor(fleet, now, "relay")
-    elif not fleet.args.no_relay and fleet.ever_active and not fleet.backends and not fleet.pending:
-        # Recovery cannot depend on a live active backend: a cancelled pending
-        # job may disappear just as its predecessor reaches the wall clock.
-        LOG.warning("fleet lost every backend; submitting recovery successor")
+    elif (not fleet.args.no_relay and not live and not fleet.pending
+          and now >= fleet.retry_after):
+        # Somebody asked for a serving job and there is none. Either
+        # start_server's own submit failed, or the fleet was lost afterwards --
+        # recovery and cold start want the same thing, and neither can depend
+        # on a live active backend, because a cancelled pending job may vanish
+        # just as its predecessor reaches the wall clock. What used to gate
+        # this is now `desired`, which the supervisor loop checks before
+        # calling in here.
+        LOG.warning("no serving job is up; submitting one")
         await submit_successor(fleet, now, "recovery")
 
     # Promote superseded backends to draining, but only once the successor has
@@ -1168,14 +1538,9 @@ async def supervise(fleet):
                     continue
                 deadline = backend.end_time - 60
                 fleet.draining[job_id] = deadline
-                LOG.info(
-                    "draining %s (%s stable %ds, inflight=%d, reclaim by %s)",
-                    job_id,
-                    fleet.active,
-                    int(stable_for),
-                    fleet.inflight.get(job_id, 0),
-                    fmt_time(deadline),
-                )
+                LOG.info("draining %s (%s stable %ds, inflight=%d, reclaim "
+                         "by %s)", job_id, fleet.active, int(stable_for),
+                         fleet.inflight.get(job_id, 0), fmt_time(deadline))
 
     # Reclaim: the drained job is already past being useful, and its allocation
     # is worth releasing a little early. Skipped under --no-relay, which
@@ -1202,8 +1567,17 @@ async def supervise(fleet):
         why = "drained" if not inflight else "deadline"
         LOG.info("reclaiming %s (%s, inflight=%d)", job_id, why, inflight)
         code, out = await run_serve_sh(fleet, "quit", backend.run_dir)
-        if code != 0:
-            LOG.error("quit %s failed (rc=%d): %s", job_id, code, out)
+        if code == 0:
+            # Same reason stop_server does it: the controller polls its control
+            # directory every two seconds, so this job answers /health for a
+            # moment longer. Without this it is still a candidate, and a
+            # successor that fails inside that window hands routing straight
+            # back to the job that was just told to exit. Only on success --
+            # a quit that never landed must stay routable, because that job is
+            # still serving.
+            fleet.stopping.add(job_id)
+        else:
+            LOG.error("quit %s failed (rc=%s): %s", job_id, code, out)
         fleet.draining.pop(job_id, None)
 
 
@@ -1212,69 +1586,48 @@ async def supervise(fleet):
 # ---------------------------------------------------------------------------
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="stable front door for the Anthropic-compatibility server"
-    )
-    parser.add_argument(
-        "--fleet-dir", required=True, help="directory the serving jobs register into"
-    )
-    parser.add_argument("--users", required=True, help="allowlist, one username per line")
-    parser.add_argument("--yaml", default="", help="deployment YAML the supervisor resubmits")
-    parser.add_argument(
-        "--serve-sh",
-        default="",
-        help="launcher script exposing submit/restart/quit (defaults to serve.sh next to this file)",
-    )
+        description="stable front door for the Anthropic-compatibility servers")
+    parser.add_argument("--fleet-dir", required=True,
+                        help="directory the serving jobs register into")
+    parser.add_argument("--users", required=True,
+                        help="allowlist, one username per line")
+    parser.add_argument("--yaml", default="",
+                        help="deployment YAML the supervisor resubmits")
+    parser.add_argument("--serve-sh", default="",
+                        help="path to serve.sh (defaults next to this file)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8333)
-    parser.add_argument(
-        "--lead-time",
-        type=int,
-        default=2700,
-        help="seconds before the wall clock to submit the successor (default 45min)",
-    )
-    parser.add_argument(
-        "--stale-after",
-        type=int,
-        default=30,
-        help="drop a backend after this long without a heartbeat",
-    )
+    parser.add_argument("--lead-time", type=int, default=2700,
+                        help="seconds before the wall clock to submit the "
+                             "successor (default 45min)")
+    parser.add_argument("--stale-after", type=int, default=30,
+                        help="drop a backend after this long without a "
+                             "heartbeat")
     parser.add_argument("--discover-interval", type=float, default=5.0)
     parser.add_argument("--health-interval", type=float, default=5.0)
     parser.add_argument("--supervisor-interval", type=float, default=30.0)
     parser.add_argument("--probe-timeout", type=float, default=3.0)
-    parser.add_argument(
-        "--unhealthy-after",
-        type=int,
-        default=20,
-        help="consecutive probe timeouts before a backend is taken out of rotation; a refused "
-        "connection is acted on immediately regardless",
-    )
-    parser.add_argument(
-        "--promote-after",
-        type=float,
-        default=180.0,
-        help="seconds a successor must stay healthy before its predecessor may be reclaimed",
-    )
-    parser.add_argument(
-        "--no-relay",
-        action="store_true",
-        help="proxy only; never submit a successor and never reclaim a drained job",
-    )
+    parser.add_argument("--unhealthy-after", type=int, default=20,
+                        help="consecutive probe timeouts before a backend is "
+                             "taken out of rotation; a refused connection is "
+                             "acted on immediately regardless")
+    parser.add_argument("--release-timeout", type=float,
+                        default=RELEASE_VERIFY_SECONDS,
+                        help="how long stop_server waits for Slurm to confirm "
+                             "a job has given its nodes back before reporting "
+                             "it as still allocated")
+    parser.add_argument("--promote-after", type=float, default=180.0,
+                        help="seconds a successor must stay healthy before its "
+                             "predecessor may be reclaimed")
+    parser.add_argument("--no-relay", action="store_true",
+                        help="proxy only; never submit a successor and never "
+                             "reclaim a drained job")
     args = parser.parse_args(argv)
     if not args.serve_sh:
-        args.serve_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.sh")
-    if not args.no_relay:
-        if not args.yaml:
-            parser.error("--yaml is required unless --no-relay is given")
-        # Relay drives job lifecycles through the launcher script. That script
-        # does not ship with this example, so refuse at startup rather than
-        # discovering it hours later at the first handover, which is exactly
-        # when there is no time to recover.
-        if not os.path.isfile(args.serve_sh):
-            parser.error(
-                "launcher script %s does not exist; pass --serve-sh or run with --no-relay"
-                % args.serve_sh
-            )
+        args.serve_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "serve.sh")
+    if not args.no_relay and not args.yaml:
+        parser.error("--yaml is required unless --no-relay is given")
     return args
 
 
@@ -1282,29 +1635,35 @@ async def main_async(args):
     fleet = Fleet(args)
     os.makedirs(args.fleet_dir, exist_ok=True)
     fleet.reload_users()
-    if not fleet.users:
-        LOG.warning("users file %s is empty; every request will get 401", args.users)
+    # Says it once per start, where an operator will see it: the source comment
+    # in Gateway.handle is not somewhere anyone looks before restarting this.
+    LOG.warning("user allowlist is DISABLED (%s is loaded but not enforced); "
+                "every caller on this network can use this gateway", args.users)
     fleet.discover()
 
     gateway = Gateway(fleet)
     server = await asyncio.start_server(gateway.handle, args.host, args.port)
     LOG.info("listening on %s:%d", args.host, args.port)
     LOG.info("fleet dir: %s", args.fleet_dir)
-    LOG.info(
-        "relay: %s",
-        "off" if args.no_relay else "lead time %ds from %s" % (args.lead_time, args.yaml),
-    )
+    LOG.info("relay: %s", "off" if args.no_relay
+             else "lead time %ds from %s" % (args.lead_time, args.yaml))
+    if args.no_relay:
+        LOG.info("job control: off; start_server and stop_server answer 409")
+    else:
+        LOG.info("job control: idle. No serving job is submitted until "
+                 "POST /_gateway/start_server; stop_server releases them all")
 
     async with server:
-        await asyncio.gather(discovery_loop(fleet), health_loop(fleet), supervisor_loop(fleet))
+        await asyncio.gather(discovery_loop(fleet),
+                             health_loop(fleet),
+                             supervisor_loop(fleet))
 
 
 def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+        datefmt="%H:%M:%S")
     args = parse_args(sys.argv[1:])
     try:
         asyncio.run(main_async(args))

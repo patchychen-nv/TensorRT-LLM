@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.2-NVFP4 GENERATION worker for 1P1D disaggregated serving: 4 GPUs as
+# DEP4. Paired with glm5.2_ctx_tep4.yaml.
+#
+# This is glm5.2_agg_tep4.yaml plus the cache transceiver, the perf-metrics
+# collection, and the two decode settings the reference recipes turn on
+# (use_low_precision_moe_combine, stream_interval 20). Everything else --
+# tokens_per_block 64, index_topk 2048, CUTEDSL, the attention-DP block, the
+# CUDA-graph ladder -- is unchanged from what the aggregated deployment runs.
+#
+# `--tool_parser glm47` is passed on the command line by serve.sh and belongs
+# on THIS worker only: the proxy drives the context worker with stream=False
+# and discards its text, so a parser there would only see truncated output.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+enable_attention_dp: true
+
+# Must match the context worker exactly -- backend and buffer both.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_transfer_timeout_ms: 600000
+  max_tokens_in_buffer: 8192
+
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+  enable_padding: true
+
+# No disable_overlap_scheduler here, unlike the context worker and unlike the
+# aggregated config: overlap hides host work behind decode steps, and decode is
+# all this worker does.
+enable_autotuner: false
+disable_overlap_scheduler: false
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: false
+  # Higher than the context worker's 0.5 and than the aggregated 0.8: this
+  # cache is held for the whole decode. GLM spends 50232 bytes per token, so
+  # 0.85 of ~176 GiB is roughly 3.2M tokens per rank.
+  free_gpu_memory_fraction: 0.85
+  tokens_per_block: 64
+
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 128
+max_seq_len: 1048576
+
+moe_config:
+  # TRTLLM, matching the context worker and the Pro deployment -- see the longer
+  # note in glm5.2_ctx_tep4.yaml. CUTEDSL should suit an nvfp4 checkpoint, but it
+  # is unproven on this model and its failure mode is a silent per-layer
+  # fallback, so it is an experiment to run deliberately rather than a default.
+  backend: TRTLLM
+  # Added from the reference recipes, which set it on every decode worker.
+  use_low_precision_moe_combine: true
+moe_expert_parallel_size: 4
+
+num_postprocess_workers: 8
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. The pull endpoint
+# /perf_metrics that these settings used to feed no longer exists; serve.sh
+# appends perf_metrics_output_dir per attempt, since only it knows the path.
+# perf_metrics_max_requests went with the endpoint -- retention is the file now.
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+reasoning_parser: deepseek-r1
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+sparse_attention_config:
+  # The discriminator, and not optional: sparse_attention_config is a tagged
+  # union keyed on `algorithm`, so a block without it fails TorchLlmArgs
+  # validation outright -- "Unable to extract tag using discriminator
+  # 'algorithm'" -- and the generation worker dies before it loads a single
+  # weight (job 623663). dsa is the tag this model resolves to: model_config.py
+  # rebuilds the field as DeepSeekSparseAttentionConfig for
+  # GlmMoeDsaForCausalLM, which declares algorithm: Literal["dsa"].
+  #
+  # That rebuild happens AFTER validation, which is why it cannot rescue a
+  # missing tag -- and it reads the two settings below off the validated object
+  # rather than discarding them, so they are live: index_topk is honoured
+  # because model_fields_set records it as explicitly set, and
+  # enable_heuristic_topk is taken verbatim. Drop the whole block and both fall
+  # back to the checkpoint, with enable_heuristic_topk defaulting to false.
+  algorithm: dsa
+  enable_heuristic_topk: true
+  index_topk: 2048
+# 20 rather than the aggregated 10, following the reference recipes.
+stream_interval: 20
+tensor_parallel_size: 4
+trust_remote_code: true

@@ -130,6 +130,10 @@ def make_args():
         promote_after=180,
         serve_sh="/unused/serve.sh",
         yaml="/unused/deployment.yaml",
+        # Fleet names the deployment after this directory and reports it from
+        # /_gateway/health, so the namespace has to carry it even though no
+        # test here reads or writes the directory itself.
+        fleet_dir="/unused/_fleet/test_deployment",
     )
 
 

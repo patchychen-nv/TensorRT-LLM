@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Pro on computelab (umbriel B200, 8 GPU/node). TP8 lands on one node.
+#   ./serve.sh submit --yaml deployments/computelab_deepseek_v4.yaml --label bringup
+
+cluster_name: computelab
+repo_dir: /home/scratch.serli_gpu/workspace/TensorRT-LLM
+
+model:
+  # Must be one of the names serve.sh recognises; see KNOWN_MODELS in serve.sh.
+  # With cluster_name it names the Slurm job, the container, and the trace dir.
+  name: deepseek_v4
+  # The basename also becomes the pkill pattern, since that is what shows up on
+  # the trtllm-serve command line.
+  path: /home/scratch.trt_llm_data/llm-models/DeepSeek-V4-Pro
+  tool_parser: deepseek_v4
+
+slurm:
+  account: mlpinf
+  partition: b200@cr+mp-1000W/umbriel-b200@ts4/8gpu-224cpu-2048gb
+  reservation: RES--OWN--COM-3781--mlpinf-a01r
+  qos: reservation
+  time: "10:00:00"
+  nodes: 1
+  gpus_per_node: 8
+  extra_args: []
+
+container:
+  image: /home/scratch.serli_gpu/workspace/containers/tensorrt-llm-pytorch-26.05-py3-x86_64-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194.sqsh
+  mounts:
+    - /home/scratch.serli_gpu:/home/scratch.serli_gpu
+    - /home/scratch.trt_llm_data:/home/scratch.trt_llm_data
+    - /raid:/raid
+
+server:
+  # trtllm-serve --config; relative paths resolve against this file's directory.
+  config: server_configs/deepseek_v4_agg_tep8.yaml
+  port: 8333
+  install_repo: true
+  numactl: "0,1"
+  extra_args: []
+  env: {}
+
+trace:
+  root: /home/scratch.serli_gpu/workspace/claude-traces
+
+# See computelab_glm5.2.yaml for what each field does.
+gateway:
+  port: 8333
+  partition: "-/lego-c2@qs/0gpu-144cpu-480gb"
+  time: "7-00:00:00"
+  users: gateway_users.txt
+  lead_time: 2700
+  # A different node from the GLM gateway. They would fit on one -- 4 cores and
+  # ~13 GB each against 144 and 490 -- but then a single node failure takes both
+  # models' front doors down at once, and the partition has eight of these.
+  extra_args: ["--nodelist=lego-c2-qs-36"]
