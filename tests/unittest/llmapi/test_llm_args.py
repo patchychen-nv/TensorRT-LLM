@@ -42,7 +42,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
-                                          DFlashDecodingConfig,
+                                          DFlashDecodingConfig, DkvConfig,
                                           DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
@@ -4793,3 +4793,58 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.cpu_only
+class TestDkvConfig:
+    """validate_dkv accepts the 'auto' sentinels that are the field defaults."""
+
+    @staticmethod
+    def _dkv_args(**kwargs) -> TorchLlmArgs:
+        return TorchLlmArgs(model="/tmp/dummy_model",
+                            enable_attention_dp=True,
+                            disable_overlap_scheduler=True,
+                            dkv_config=DkvConfig(),
+                            **kwargs)
+
+    @pytest.mark.parametrize("setting", ["auto", True])
+    def test_kv_cache_manager_resolves_to_v2(self, setting) -> None:
+        args = self._dkv_args(kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=setting))
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+        # Without DKV, 'auto' with no model preference resolves to V1; under
+        # DKV the model-load resolution must keep V2.
+        assert _resolve_kv_cache_manager_v2_auto(args) is True
+
+    def test_default_kv_cache_config_survives_model_defaults(self) -> None:
+        args = self._dkv_args()
+        apply_model_defaults_to_llm_args(
+            args, {"kv_cache_config": {
+                "tokens_per_block": 64
+            }})
+        assert args.kv_cache_config.tokens_per_block == 64
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_explicit_v1_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="KV cache manager V2"):
+            self._dkv_args(kv_cache_config=KvCacheConfig(
+                use_kv_cache_manager_v2=False))
+
+    @pytest.mark.parametrize("runtime", ["PYTHON", "auto"])
+    def test_python_or_auto_transceiver_is_accepted(self, runtime) -> None:
+        args = self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime=runtime))
+        assert args.cache_transceiver_config.transceiver_runtime == runtime
+
+    @pytest.mark.parametrize("runtime", ["CPP", None])
+    def test_cpp_transceiver_is_rejected(self, runtime) -> None:
+        with pytest.raises(ValueError, match="Python cache transceiver"):
+            self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime=runtime))
+
+    def test_transceiver_without_backend_is_not_checked(self) -> None:
+        # No backend means no transceiver is created, so the runtime is moot.
+        args = self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+            transceiver_runtime="CPP"))
+        assert args.cache_transceiver_config.backend is None

@@ -55,7 +55,8 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
 from ..disaggregation.base.transfer import get_unique_rid
-from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
+from ..disaggregation.kv_cache_transceiver import (BindKvCacheTransceiver,
+                                                   KvCacheTransceiver)
 from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
@@ -990,6 +991,8 @@ class PyExecutor:
         if kv_cache_transceiver is not None:
             self.hang_detector.register_status_provider(
                 kv_cache_transceiver.get_status_dump)
+        if self.dkv_enabled:
+            self._validate_dkv_runtime()
         cache_transceiver_config = getattr(self.llm_args,
                                            "cache_transceiver_config", None)
         max_tokens_in_buffer = getattr(cache_transceiver_config,
@@ -5671,6 +5674,25 @@ class PyExecutor:
             if not request.check_token_id_range(
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
+
+    def _validate_dkv_runtime(self) -> None:
+        """Check the DKV requirements that are only known once built.
+
+        ``TorchLlmArgs.validate_dkv`` accepts ``transceiver_runtime='auto'``,
+        which is resolved while the model loads, and some model families pick
+        their KV cache manager without consulting ``use_kv_cache_manager_v2``.
+        Every rank holds the same configuration, so all ranks raise together.
+        """
+        if not self._is_kv_manager_v2:
+            raise ValueError(
+                "dkv_config requires KVCacheManagerV2, but this model uses "
+                f"{type(self.kv_cache_manager).__name__}.")
+        if isinstance(self.kv_cache_transceiver, BindKvCacheTransceiver):
+            raise ValueError(
+                "dkv_config requires the Python cache transceiver, but "
+                "transceiver_runtime resolved to the C++ transceiver. Set "
+                "cache_transceiver_config.transceiver_runtime='PYTHON' with "
+                "backend='NIXL'.")
 
     def _warn_if_kv_block_budget_unchecked(self) -> None:
         """Warn when beam search runs against a pool no admission check covers.

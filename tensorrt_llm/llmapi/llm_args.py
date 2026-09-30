@@ -6454,10 +6454,14 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.dkv_config.attention_mode == "dp" and not self.enable_attention_dp:
             raise ValueError("dkv_config with attention_mode='dp' requires "
                              "enable_attention_dp=True")
-        if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
+        if self.kv_cache_config.use_kv_cache_manager_v2 is False:
             raise ValueError(
-                "dkv_config requires kv_cache_config.use_kv_cache_manager_v2=True"
-            )
+                "dkv_config requires the KV cache manager V2: set "
+                "kv_cache_config.use_kv_cache_manager_v2 to True or 'auto'")
+        if self.kv_cache_config.use_kv_cache_manager_v2 == "auto":
+            # DKV runs only on the V2 manager. Resolve the sentinel here so the
+            # per-model preference applied at model load cannot pick V1.
+            self.kv_cache_config.use_kv_cache_manager_v2 = True
         if not self.kv_cache_config.enable_block_reuse:
             raise ValueError(
                 "dkv_config requires kv_cache_config.enable_block_reuse=True "
@@ -6474,11 +6478,16 @@ class TorchLlmArgs(BaseLlmArgs):
             raise NotImplementedError(
                 "dkv_config: the overlap scheduler is not supported yet, "
                 "set disable_overlap_scheduler=True")
-        if self.cache_transceiver_config is not None and \
-                self.cache_transceiver_config.transceiver_runtime != "PYTHON":
+        transceiver_config = self.cache_transceiver_config
+        # A transceiver is created only when a backend is set. None selects the
+        # C++ transceiver; 'auto' is checked again once the executor exists.
+        if (transceiver_config is not None
+                and transceiver_config.backend is not None
+                and transceiver_config.transceiver_runtime in (None, "CPP")):
             raise ValueError(
-                "dkv_config only supports the V2 cache transceiver: set "
-                "cache_transceiver_config.transceiver_runtime='PYTHON'")
+                "dkv_config only supports the Python cache transceiver: set "
+                "cache_transceiver_config.transceiver_runtime to 'PYTHON' or "
+                "'auto'")
         return self
 
     @model_validator(mode="after")

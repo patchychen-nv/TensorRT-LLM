@@ -21,7 +21,11 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    BindKvCacheTransceiver,
+    GenTransferStatus,
+    KvCacheTransceiver,
+)
 from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
 )
@@ -3148,3 +3152,28 @@ def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
         assert py_result.generation_logits is None
         py_result.append_generation_logits(first_logits + 10)  # the next decode step lands
         assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
+
+
+class TestDkvRuntimeValidation:
+    """PyExecutor rejects DKV on a KV manager or transceiver it cannot drive."""
+
+    @staticmethod
+    def _make_executor(is_kv_manager_v2, kv_cache_transceiver):
+        executor = PyExecutor.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = is_kv_manager_v2
+        executor.kv_cache_manager = Mock()
+        executor.kv_cache_transceiver = kv_cache_transceiver
+        return executor
+
+    @pytest.mark.parametrize("transceiver", [None, Mock(spec=KvCacheTransceiver)])
+    def test_accepts_v2_manager(self, transceiver):
+        self._make_executor(True, transceiver)._validate_dkv_runtime()
+
+    def test_rejects_v1_manager(self):
+        with pytest.raises(ValueError, match="requires KVCacheManagerV2"):
+            self._make_executor(False, None)._validate_dkv_runtime()
+
+    def test_rejects_cpp_transceiver(self):
+        executor = self._make_executor(True, Mock(spec=BindKvCacheTransceiver))
+        with pytest.raises(ValueError, match="Python cache transceiver"):
+            executor._validate_dkv_runtime()
