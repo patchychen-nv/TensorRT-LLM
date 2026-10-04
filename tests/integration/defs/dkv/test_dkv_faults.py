@@ -29,9 +29,14 @@ def test_dkv_aggregate_sampler_failure_and_cancel(
         # named by DKV_FAULT_TRACE_DIR.
         if not os.environ.get("DKV_FAULT_TRACE_DIR"):
             pytest.skip("MPI-launched ranks need the fault probe installed by the job")
+        traces = Path(os.environ["DKV_FAULT_TRACE_DIR"])
+        # The probe keeps writing to this directory, so an earlier test of the job leaves its
+        # traces and handshakes in it.
+        for leftover in traces.iterdir():
+            leftover.unlink()
         for key, value in dkv_worker_env().items():
             monkeypatch.setenv(key, value)
-        result = run_aggregate_faults(model, os.environ["DKV_FAULT_TRACE_DIR"], group_size)
+        result = run_aggregate_faults(model, str(traces), group_size)
     else:
         result = run_fault_gate_in_fresh_process(model, tmp_path / "faults", group_size)
     assert result["status"] == "passed"
