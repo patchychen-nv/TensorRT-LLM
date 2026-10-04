@@ -7,12 +7,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-import torch
 
 from tensorrt_llm import SamplingParams
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 from tensorrt_llm.scheduling_params import SchedulingParams
 
-from .dkv_models import MODEL_IDS, MODELS, DkvModel, PromptTokenizer, make_dkv_llm
+from .dkv_models import (
+    MODEL_IDS,
+    MODELS,
+    DkvModel,
+    PromptTokenizer,
+    available_gpus,
+    dkv_worker_env,
+    make_dkv_llm,
+)
 from .dkv_precision import build_burst_prompts
 from .dkv_stats import latest_free_pages_by_rank
 
@@ -39,12 +47,23 @@ _BURSTS = (
     _Burst("g2"),
     # Four ranks: every replica runs the lifecycle of the whole group's requests.
     _Burst("g4", group_size=4),
+    # Eight ranks, which take two four-GPU nodes: each synchronization point crosses the nodes.
+    _Burst("g8", group_size=8),
     # Prompts longer than the per-iteration token budget, so their context is chunked.
     _Burst("chunked-g2", chunked=True, max_num_tokens=512, lengths=(700, 1100, 1400)),
     # A pool that holds about one and a half prompts: started contexts block each other, and the
     # scheduler has to release one of them and restart it.
     _Burst(
         "pressure-g2",
+        chunked=True,
+        max_num_tokens=512,
+        lengths=(700, 1100, 1400),
+        kv_tokens=2100,
+    ),
+    # The same starved pool under eight replicas.
+    _Burst(
+        "pressure-g8",
+        group_size=8,
         chunked=True,
         max_num_tokens=512,
         lengths=(700, 1100, 1400),
@@ -59,6 +78,10 @@ def _context_rows(rows: list[dict]) -> list[dict]:
     return [
         row for row in rows if row.get("inflightBatchingStats", {}).get("numContextRequests", 0) > 0
     ]
+
+
+def _context_tokens(rows: list[dict]) -> int:
+    return sum(row["inflightBatchingStats"]["numCtxTokens"] for row in _context_rows(rows))
 
 
 def _collect(llm, rows: list[dict], *, until, timeout: float = 30.0) -> None:
@@ -103,14 +126,14 @@ def _probe_free_pages(llm, prompt: list[int], sampling, group_size: int, seen: l
 def test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing(
     monkeypatch, capfd, model: DkvModel, burst: _Burst
 ) -> None:
-    if torch.cuda.device_count() < burst.group_size:
+    if available_gpus() < burst.group_size:
         pytest.skip(f"The {burst.pytest_id} burst needs {burst.group_size} GPUs")
     if not Path(model.path()).is_dir():
         pytest.skip(f"{model.pytest_id} checkpoint is not available at {model.path()}")
-    monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
-    monkeypatch.setenv("TRTLLM_DKV_DUAL_LEDGER", "1")
-    # Each rank's own pool snapshot rides on the iteration stats; kvCacheStats is rank 0's copy.
-    monkeypatch.setenv("TRTLLM_DKV_MEASUREMENT", "1")
+    # The LLM also hands these to ranks that MPI launched; setting them here is what puts them
+    # back after the test.
+    for key, value in dkv_worker_env(measurement=True).items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setenv("TLLM_LOG_LEVEL", "WARNING")
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
     tokenizer = PromptTokenizer(model.path())
@@ -129,6 +152,7 @@ def test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing(
         max_num_tokens=burst.max_num_tokens,
         max_seq_len=burst.max_seq_len,
         kv_cache={"max_tokens": burst.kv_tokens or 65536},
+        env_overrides=dkv_worker_env(measurement=True),
     ) as llm:
         # The idle pools after one probe per rank are the state every replica must return to. The
         # startup row and the first iteration both carry iteration number 0, so the startup rows
@@ -162,7 +186,14 @@ def test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing(
             )
             assert counted == len(prompts), "A replicated request was counted more than once"
         else:
-            rows.extend(llm.get_stats(timeout=2))
+            # A request that restarts its context computes its prompt tokens again.
+            expected_tokens = sum(len(prompt) for prompt in prompts)
+            _collect(llm, rows, until=lambda rows: _context_tokens(rows) >= expected_tokens)
+            rows.extend(llm.get_stats(timeout=1))
+            if burst.kv_tokens is not None and model.stalls_under_pressure:
+                assert _context_tokens(rows) > expected_tokens, (
+                    "The undersized pool never forced a context restart"
+                )
         served = {row["attentionDpRank"] for row in _context_rows(rows)}
         assert served == set(range(burst.group_size)), f"Only ranks {sorted(served)} served work"
 
@@ -171,3 +202,9 @@ def test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing(
         assert free == baseline, (
             f"KV pages leaked after the burst: baseline {baseline}, free {free}"
         )
+
+    # Ranks that were launched through MPI log into their own processes, so only a run that spawned
+    # its workers can read their logs here.
+    if get_mpi_world_size() == 1:
+        captured = capfd.readouterr()
+        assert "DKV invariant violation" not in captured.out + captured.err

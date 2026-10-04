@@ -477,7 +477,7 @@ def test_empty_batch_does_not_rewind_asynchronous_or_unstarted_work(dual_ledger,
     assert ("free", 0) not in manager.trace
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 @pytest.mark.parametrize("chunked", [False, True])
 def test_replica_replay_matches_independent_adp_views(dual_ledger, group_size, chunked) -> None:
     specs = [(index, index % group_size, 64 + (index % 3) * 64) for index in range(group_size * 4)]

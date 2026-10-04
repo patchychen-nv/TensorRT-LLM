@@ -108,8 +108,9 @@ def test_completion_replicates_state_and_reason_without_tokens(reason, context_o
     assert [len(trace) for trace in group.traces] == [1, 1]
 
 
-def test_intermediate_chunks_and_idle_dummy_stay_unchanged_across_rounds() -> None:
-    group = LockstepTpGroup(3)
+@pytest.mark.parametrize("group_size", [3, 8])
+def test_intermediate_chunks_and_idle_dummy_stay_unchanged_across_rounds(group_size: int) -> None:
+    group = LockstepTpGroup(group_size)
 
     def run_rank(dist):
         request = _request(7, 0, dist.tp_rank)
@@ -135,16 +136,18 @@ def test_intermediate_chunks_and_idle_dummy_stay_unchanged_across_rounds() -> No
                 assert request.finish_reasons == [FinishReason.LENGTH]
         return request.get_num_tokens(0)
 
-    assert group.run(run_rank) == [9, 8, 8]
-    assert [len(trace) for trace in group.traces] == [4, 4, 4]
+    assert group.run(run_rank) == [9] + [8] * (group_size - 1)
+    assert [len(trace) for trace in group.traces] == [4] * group_size
 
 
-def test_all_compute_ranks_publish_their_own_completions() -> None:
-    group = LockstepTpGroup(3)
+@pytest.mark.parametrize("group_size", [3, 8])
+def test_all_compute_ranks_publish_their_own_completions(group_size: int) -> None:
+    group = LockstepTpGroup(group_size)
+    kinds = [FinishReason.END_ID, FinishReason.LENGTH, FinishReason.STOP_WORDS]
+    reasons = [kinds[rank % len(kinds)] for rank in range(group_size)]
 
     def run_rank(dist):
         requests = [_request(7 + rank, rank, dist.tp_rank) for rank in range(group.size)]
-        reasons = [FinishReason.END_ID, FinishReason.LENGTH, FinishReason.STOP_WORDS]
         for request in requests:
             _advance_context(request)
             if request.py_dkv_is_local:
@@ -155,6 +158,7 @@ def test_all_compute_ranks_publish_their_own_completions() -> None:
         assert all(request.is_finished for request in requests)
 
     group.run(run_rank)
+    assert [len(trace) for trace in group.traces] == [1] * group_size
 
 
 @pytest.mark.parametrize(
@@ -260,8 +264,11 @@ def test_sampler_error_preserves_healthy_completions(partially_finished: bool) -
     assert [len(trace) for trace in group.traces] == [1, 1]
 
 
-def test_sampler_errors_keep_rank_and_event_order_with_overlapping_failure_sets() -> None:
-    group = LockstepTpGroup(3)
+@pytest.mark.parametrize("group_size", [3, 8])
+def test_sampler_errors_keep_rank_and_event_order_with_overlapping_failure_sets(
+    group_size: int,
+) -> None:
+    group = LockstepTpGroup(group_size)
 
     def run_rank(dist):
         requests = [_request(7 + rank, rank, dist.tp_rank) for rank in range(group.size)]
@@ -275,13 +282,12 @@ def test_sampler_errors_keep_rank_and_event_order_with_overlapping_failure_sets(
         assert all(request.state == LlmRequestState.GENERATION_IN_PROGRESS for request in requests)
         return result
 
-    expected = (
-        DkvSamplerError("rank 0 first", (7,)),
-        DkvSamplerError("rank 1 first", (8,)),
-        DkvSamplerError("rank 1 second", (8,)),
-        DkvSamplerError("rank 2 first", (9,)),
-    )
-    assert group.run(run_rank) == [expected] * group.size
+    expected = []
+    for rank in range(group_size):
+        expected.append(DkvSamplerError(f"rank {rank} first", (7 + rank,)))
+        if rank == 1:
+            expected.append(DkvSamplerError("rank 1 second", (8,)))
+    assert group.run(run_rank) == [tuple(expected)] * group.size
 
 
 def test_sampler_error_on_intermediate_chunk_needs_no_completion() -> None:
@@ -398,9 +404,13 @@ def test_global_batch_digest_covers_identity_owner_position_and_order_but_not_du
     assert digest_global_batch([])[0] == 0
 
 
+@pytest.mark.parametrize("group_size", [3, 8])
 @pytest.mark.parametrize("divergence", ["missing", "position", "owner", "order"])
-def test_diverged_global_batch_is_reported_by_every_rank_in_one_exchange(divergence: str) -> None:
-    group = LockstepTpGroup(3)
+def test_diverged_global_batch_is_reported_by_every_rank_in_one_exchange(
+    divergence: str, group_size: int
+) -> None:
+    group = LockstepTpGroup(group_size)
+    last = group_size - 1
 
     def run_rank(dist):
         requests = [_request(7, 0, dist.tp_rank), _request(8, 1, dist.tp_rank)]
@@ -408,24 +418,25 @@ def test_diverged_global_batch_is_reported_by_every_rank_in_one_exchange(diverge
             _advance_context(request, 2)
         local_requests = [request for request in requests if request.py_dkv_is_local]
         global_requests = list(requests)
-        if dist.tp_rank == 2:
+        if dist.tp_rank == last:
             if divergence == "missing":
                 global_requests = requests[:1]
             elif divergence == "position":
                 _advance_context(requests[0], 2)
             elif divergence == "owner":
-                requests[0].py_dkv_compute_rank = 2
+                requests[0].py_dkv_compute_rank = last
             else:
                 global_requests.reverse()
         with pytest.raises(
-            RuntimeError, match="rank 2: global batch differs from rank 0"
+            RuntimeError, match=f"rank {last}: global batch differs from rank 0"
         ) as caught:
             sync_dkv_sample_results(dist, global_requests, local_requests)
-        assert "rank 1: global batch differs" not in str(caught.value)
+        for other in range(1, last):
+            assert f"rank {other}: global batch differs" not in str(caught.value)
         return str(caught.value).count("global batch differs")
 
-    assert group.run(run_rank) == [1, 1, 1]
-    assert [len(trace) for trace in group.traces] == [1, 1, 1]
+    assert group.run(run_rank) == [1] * group_size
+    assert [len(trace) for trace in group.traces] == [1] * group_size
 
 
 @pytest.mark.parametrize("digest", [(1,), (1, 2, 3), "digest", (True, 1), (-1, 1), [1, 2], None])

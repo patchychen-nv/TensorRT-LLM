@@ -12,27 +12,49 @@ import torch
 from tensorrt_llm import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
-from .dkv_models import MODEL_IDS, MODELS, PRECISION_MODELS, DkvModel, PromptTokenizer, make_dkv_llm
+from .dkv_models import (
+    MODEL_IDS,
+    MODELS,
+    PRECISION_MODELS,
+    DkvModel,
+    PromptTokenizer,
+    available_gpus,
+    dkv_worker_env,
+    make_dkv_llm,
+)
 from .dkv_precision import (
-    PRECISION_PLACEMENT,
     PrecisionRun,
     assert_known_answers,
     assess_prompt_separation,
     build_precision_prompts,
     compare_precision_runs,
+    precision_placement,
     validate_precision_inputs,
 )
 from .dkv_stats import pool_free_pages
 
+# The attention-DP group sizes the gates run at; eight ranks take two four-GPU nodes.
+_GROUP_SIZES = (2, 8)
+_GROUP_IDS = [f"g{size}" for size in _GROUP_SIZES]
 
-def _llm(model: DkvModel, *, dkv_enabled: bool, logits: bool):
+
+def _llm(
+    model: DkvModel,
+    *,
+    dkv_enabled: bool,
+    logits: bool,
+    group_size: int = 2,
+    measurement: bool = False,
+):
     validate_precision_inputs(enable_block_reuse=False, tokens_per_block=model.tokens_per_block)
     return make_dkv_llm(
         model.path(),
         dkv=dkv_enabled,
         tokens_per_block=model.tokens_per_block,
         moe_config=model.moe_config(),
+        group_size=group_size,
         gather_logits=logits,
+        env_overrides=dkv_worker_env(measurement=measurement),
     )
 
 
@@ -59,7 +81,9 @@ def _drain_stats(llm, stats: list[dict], expected_contexts: int) -> None:
     pytest.fail(f"Iteration stats did not account for {expected_contexts} sequential requests")
 
 
-def _assert_replicas_agree_on_free_pages(stats: list[dict], *, expected_iterations: int) -> None:
+def _assert_replicas_agree_on_free_pages(
+    stats: list[dict], *, expected_iterations: int, group_size: int
+) -> None:
     """Compare each rank's own free pages, which the kvCacheStats of an attention-DP row cannot."""
     by_iteration: dict[int, dict[int, int]] = defaultdict(dict)
     for row in stats:
@@ -67,7 +91,9 @@ def _assert_replicas_agree_on_free_pages(stats: list[dict], *, expected_iteratio
         if snapshot is not None:
             by_iteration[row["iter"]][snapshot["rank"]] = pool_free_pages(snapshot)
     group = {rank for free in by_iteration.values() for rank in free}
-    assert group == {0, 1}, f"Per-rank KV snapshots were exported for ranks {sorted(group)}"
+    assert group == set(range(group_size)), (
+        f"Per-rank KV snapshots were exported for ranks {sorted(group)}"
+    )
     complete = {iteration: free for iteration, free in by_iteration.items() if set(free) == group}
     assert len(complete) >= expected_iterations, (
         f"Only {len(complete)} of {expected_iterations} iterations reported every rank's pools"
@@ -78,14 +104,17 @@ def _assert_replicas_agree_on_free_pages(stats: list[dict], *, expected_iteratio
         )
 
 
-def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000) -> dict:
+def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000, group_size: int = 2) -> dict:
     """Exercise one real prefill per iteration and verify pages return after every request."""
     if iterations < 1000:
         raise ValueError("The aggregate lifetime gate requires at least 1000 forward iterations")
     sampling = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
     stats: list[dict] = []
     request_ids: set[int] = set()
-    with _llm(model, dkv_enabled=True, logits=False) as llm:
+    # Per-rank pool snapshots let the soak compare the replicas' own free pages.
+    with _llm(
+        model, dkv_enabled=True, logits=False, group_size=group_size, measurement=True
+    ) as llm:
         initial_stats = llm.get_stats(timeout=5)
         initial_free_pages = [
             row["kvCacheStats"]["freeNumBlocks"] for row in initial_stats if "kvCacheStats" in row
@@ -95,7 +124,7 @@ def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000) -> dict:
         for index in range(iterations + 1):
             # Four consecutive requests on one rank exercise a resident idle-rank dummy.
             placement = SchedulingParams(
-                attention_dp_rank=(index // 4) % 2, attention_dp_relax=False
+                attention_dp_rank=(index // 4) % group_size, attention_dp_relax=False
             )
             output = llm.generate(
                 [1] + [42 + index % 64] * 255,
@@ -117,7 +146,7 @@ def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000) -> dict:
         by_iteration[row["iter"]].append(row)
     assert len(by_iteration) == iterations + 1
     assert all(len(rows) == 1 for rows in by_iteration.values())
-    assert {row["attentionDpRank"] for row in context_rows} == {0, 1}
+    assert {row["attentionDpRank"] for row in context_rows} == set(range(group_size))
     assert all(row["inflightBatchingStats"]["numContextRequests"] == 1 for row in context_rows)
     assert all(row["inflightBatchingStats"]["numCtxTokens"] == 256 for row in context_rows)
     free_pages = [row["kvCacheStats"]["freeNumBlocks"] for row in context_rows]
@@ -125,7 +154,9 @@ def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000) -> dict:
     assert all(free == baseline for free in free_pages), (
         f"KV pages did not return to baseline {baseline}: {free_pages}"
     )
-    _assert_replicas_agree_on_free_pages(stats, expected_iterations=iterations + 1)
+    _assert_replicas_agree_on_free_pages(
+        stats, expected_iterations=iterations + 1, group_size=group_size
+    )
     return {
         "requests": len(request_ids),
         "forward_iterations": len(by_iteration),
@@ -136,7 +167,12 @@ def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000) -> dict:
 
 
 def run_precision_passes(
-    model: DkvModel, *, dkv_enabled: bool, prompts: list[list[int]], passes: int
+    model: DkvModel,
+    *,
+    dkv_enabled: bool,
+    prompts: list[list[int]],
+    passes: int,
+    group_size: int = 2,
 ) -> list[PrecisionRun]:
     """Run the pinned prompts one at a time, ``passes`` times in one executor.
 
@@ -146,8 +182,9 @@ def run_precision_passes(
     sampling = SamplingParams(
         max_tokens=1, temperature=0, ignore_eos=True, return_generation_logits=True
     )
+    placement = precision_placement(group_size)
     runs: list[PrecisionRun] = []
-    with _llm(model, dkv_enabled=dkv_enabled, logits=True) as llm:
+    with _llm(model, dkv_enabled=dkv_enabled, logits=True, group_size=group_size) as llm:
         for _ in range(passes):
             tokens: list[list[int]] = []
             logits: list[torch.Tensor] = []
@@ -156,7 +193,7 @@ def run_precision_passes(
                     prompt,
                     sampling_params=sampling,
                     scheduling_params=SchedulingParams(
-                        attention_dp_rank=PRECISION_PLACEMENT[index], attention_dp_relax=False
+                        attention_dp_rank=placement[index], attention_dp_relax=False
                     ),
                     use_tqdm=False,
                 )
@@ -179,8 +216,10 @@ def run_precision_passes(
 def dkv_gate_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     if torch.cuda.device_count() < 2:
         pytest.skip("DKV aggregate gates require two GPUs")
-    monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
-    monkeypatch.setenv("TRTLLM_DKV_DUAL_LEDGER", "1")
+    # The LLM also hands these to ranks that MPI launched; setting them here is what puts them
+    # back after the test.
+    for key, value in dkv_worker_env().items():
+        monkeypatch.setenv(key, value)
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
 
 
@@ -189,15 +228,22 @@ def _require_checkpoint(model: DkvModel) -> None:
         pytest.skip(f"{model.pytest_id} checkpoint is not available at {model.path()}")
 
 
+def _require_group(group_size: int) -> None:
+    if available_gpus() < group_size:
+        pytest.skip(f"A group of {group_size} ranks needs {group_size} GPUs")
+
+
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("group_size", _GROUP_SIZES, ids=_GROUP_IDS)
 @pytest.mark.parametrize("model", MODELS, ids=MODEL_IDS)
 def test_dkv_aggregate_1000_steps(
-    dkv_gate_environment, monkeypatch, capfd, model: DkvModel
+    dkv_gate_environment, monkeypatch, capfd, model: DkvModel, group_size: int
 ) -> None:
     _require_checkpoint(model)
-    # Per-rank pool snapshots let the soak compare the replicas' own free pages.
-    monkeypatch.setenv("TRTLLM_DKV_MEASUREMENT", "1")
-    result = run_aggregate_soak(model)
+    _require_group(group_size)
+    for key, value in dkv_worker_env(measurement=True).items():
+        monkeypatch.setenv(key, value)
+    result = run_aggregate_soak(model, group_size=group_size)
     assert result["forward_iterations"] >= 1000
     captured = capfd.readouterr()
     logs = captured.out + captured.err
@@ -207,19 +253,25 @@ def test_dkv_aggregate_1000_steps(
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("group_size", _GROUP_SIZES, ids=_GROUP_IDS)
 @pytest.mark.parametrize("model", PRECISION_MODELS, ids=[m.pytest_id for m in PRECISION_MODELS])
-def test_dkv_sequential_precision(dkv_gate_environment, model: DkvModel) -> None:
+def test_dkv_sequential_precision(dkv_gate_environment, model: DkvModel, group_size: int) -> None:
     """DKV must match the ADP control on prompts that tell a wrong KV from a right one.
 
-    The prompts are real text of different lengths spread over both ranks, plus four sentences with
+    The prompts are real text of different lengths spread over the ranks, plus four sentences with
     known answers. The ADP control must itself answer them, and different prompts must be far enough
     apart that a request reading another request's KV could not pass.
     """
     _require_checkpoint(model)
+    _require_group(group_size)
     tokenizer = PromptTokenizer(model.path())
     prompts, answers = build_precision_prompts(tokenizer.encode, model.tokens_per_block)
-    control, replay = run_precision_passes(model, dkv_enabled=False, prompts=prompts, passes=2)
-    (dkv,) = run_precision_passes(model, dkv_enabled=True, prompts=prompts, passes=1)
+    control, replay = run_precision_passes(
+        model, dkv_enabled=False, prompts=prompts, passes=2, group_size=group_size
+    )
+    (dkv,) = run_precision_passes(
+        model, dkv_enabled=True, prompts=prompts, passes=1, group_size=group_size
+    )
 
     policy = model.precision
     result = compare_precision_runs(control, replay, dkv, policy)

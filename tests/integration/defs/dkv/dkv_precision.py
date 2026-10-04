@@ -214,6 +214,23 @@ def _paired_tv_summary(control: PrecisionRun, replay: PrecisionRun, dkv: Precisi
     }
 
 
+def _compared_request(runs: Sequence[PrecisionRun], index: int) -> tuple[int, torch.Tensor, bool]:
+    """How many positions of one request the runs can be compared on, and what they saw there.
+
+    Returns the compared length, the smallest top-two gap any run saw at each compared position,
+    and whether the runs ended the compared positions on different tokens.
+    """
+    tokens = [run["tokens"][index] for run in runs]
+    length = _comparable_length(*tokens)
+    margins = (
+        torch.stack([top_two_margins(run["logits"][index][:length]) for run in runs])
+        .min(dim=0)
+        .values
+    )
+    flipped = len({sequence[length - 1] for sequence in tokens}) > 1
+    return length, margins, flipped
+
+
 def _compare_noisy(
     control: PrecisionRun, replay: PrecisionRun, dkv: PrecisionRun, policy: PrecisionPolicy
 ) -> dict:
@@ -226,15 +243,7 @@ def _compare_noisy(
     decisive_positions = 0
     decisive_prompts = 0
     for index in range(len(control["logits"])):
-        tokens = [run["tokens"][index] for run in runs]
-        length = _comparable_length(*tokens)
-        # The smallest top-two gap any run saw at each compared position.
-        margins = (
-            torch.stack([top_two_margins(run["logits"][index][:length]) for run in runs])
-            .min(dim=0)
-            .values
-        )
-        flipped = len({sequence[length - 1] for sequence in tokens}) > 1
+        length, margins, flipped = _compared_request(runs, index)
         assert not flipped or margins[-1] < policy.min_margin, (
             f"Prompt {index} has a decisive top-two margin at position {length - 1} but generated "
             "different tokens"
@@ -293,6 +302,45 @@ def compare_precision_runs(
         "rtol": 0 if bitwise_control else policy.rtol,
         "mean_adp_self_tv": _paired_tv_summary(control, replay, dkv)["mean_adp_self_tv"],
     }
+
+
+def failing_requests(
+    control: PrecisionRun,
+    replay: PrecisionRun,
+    dkv: PrecisionRun,
+    policy: PrecisionPolicy = EXACT_POLICY,
+) -> list[int]:
+    """Indices of the requests whose DKV result breaks the policy on its own.
+
+    ``compare_precision_runs`` judges the whole set and stops at the first violation. This names
+    every request that violates a per-request rule, so a test that corrupts one request can show
+    that the gate objects to that request and to no other. The rules that only hold for the set as
+    a whole, such as the mean extra distance, stay with ``compare_precision_runs``.
+    """
+    bitwise_control = validate_adp_control(control, replay, policy)
+    _validate_run(dkv, "DKV")
+    _validate_matching_logits(control, dkv, "ADP/DKV")
+    failing = []
+    if policy.noisy:
+        extra_tv = _paired_tv_summary(control, replay, dkv)["extra_tv_by_prompt"]
+        for index in range(len(control["logits"])):
+            _, margins, flipped = _compared_request((control, replay, dkv), index)
+            decisive_flip = flipped and margins[-1] >= policy.min_margin
+            if decisive_flip or extra_tv[index] > policy.max_prompt_extra_tv:
+                failing.append(index)
+        return failing
+    for index in range(len(control["logits"])):
+        first, second, actual = (run["logits"][index] for run in (control, replay, dkv))
+        if bitwise_control:
+            same_logits = torch.equal(first, actual)
+        else:
+            same_logits = all(
+                torch.allclose(reference, actual, atol=policy.atol, rtol=policy.rtol)
+                for reference in (first, second)
+            )
+        if control["tokens"][index] != dkv["tokens"][index] or not same_logits:
+            failing.append(index)
+    return failing
 
 
 # Real English paragraphs and code of different lengths and styles. Distinct, natural prompts keep
@@ -358,6 +406,17 @@ _PARAGRAPH_LENGTHS = (40, 72, 100, 130, 192, 256, 320, 384, 56, 160)
 # Ranks of the 14 prompts (ten paragraphs, then the four known answers): runs of consecutive
 # requests on one rank alternate with single requests, so both ranks idle and work in turn.
 PRECISION_PLACEMENT = (0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1)
+
+
+def precision_placement(group_size: int) -> tuple[int, ...]:
+    """Rank of each of the 14 prompts in a group of ``group_size`` ranks.
+
+    Two ranks take the pattern above; a larger group takes the prompts round-robin, so every rank
+    computes at least one of them.
+    """
+    if group_size == 2:
+        return PRECISION_PLACEMENT
+    return tuple(index % group_size for index in range(len(PRECISION_PLACEMENT)))
 
 
 def build_precision_prompts(

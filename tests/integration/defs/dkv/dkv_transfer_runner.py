@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import pickle
+import shlex
 import signal
 import subprocess
 import sys
@@ -21,6 +22,7 @@ if __package__:
         NOISY_POLICY,
         PrecisionPolicy,
         compare_precision_runs,
+        failing_requests,
         validate_adp_control,
         validate_precision_inputs,
     )
@@ -31,6 +33,7 @@ else:
         NOISY_POLICY,
         PrecisionPolicy,
         compare_precision_runs,
+        failing_requests,
         validate_adp_control,
         validate_precision_inputs,
     )
@@ -63,9 +66,21 @@ def _save_message(path: Path, message) -> None:
     temporary.replace(path)
 
 
+def _save_text(path: Path, text: str) -> None:
+    """Write a file so that a process polling for it never sees it half written."""
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(text)
+    temporary.replace(path)
+
+
 def _load_message(path: Path):
     with path.open("rb") as stream:
         return pickle.load(stream)
+
+
+def _group_size(options: dict, *, context: bool) -> int:
+    """Ranks of the context (attention-DP) group or of the generation group."""
+    return options.get("ctx_group_size", 2) if context else options.get("gen_group_size", 2)
 
 
 def _llm(options: dict, *, context: bool):
@@ -82,6 +97,7 @@ def _llm(options: dict, *, context: bool):
             backend=options["moe_backend"],
             disable_finalize_fusion=options["disable_finalize_fusion"],
         ),
+        group_size=_group_size(options, context=context),
         attention_dp=context,
         gather_logits=True,
         enable_iter_perf_stats=False,
@@ -151,6 +167,7 @@ def _context_worker(options: dict, directory: Path) -> None:
     timeout_ids = []
 
     prompts = options["prompts"] or _repeated_token_prompts()
+    group_size = _group_size(options, context=True)
     with _llm(options, context=True) as llm:
         _wait(directory / "generation-ready", timeout=1200)
 
@@ -166,7 +183,7 @@ def _context_worker(options: dict, directory: Path) -> None:
 
         def wait_for_free(request_id):
             if options["dkv"]:
-                for rank in range(2):
+                for rank in range(group_size):
                     _wait(traces / f"freed-{request_id}-{rank}")
 
         def complete(prompt, rank):
@@ -188,9 +205,9 @@ def _context_worker(options: dict, directory: Path) -> None:
             generation_index += 1
 
         for index, prompt in enumerate(prompts[:-_TAIL_REQUESTS]):
-            complete(prompt, index % 2)
+            complete(prompt, index % group_size)
 
-        if options["dkv"]:
+        if options["dkv"] and options.get("injections", True):
             # The context reply is deliberately delivered without forwarding its KV metadata.
             timed_out = submit([1] + [29002] * 255, 0).result(timeout=120)
             timeout_id = timed_out.disaggregated_params.ctx_request_id
@@ -226,9 +243,10 @@ def _context_worker(options: dict, directory: Path) -> None:
 
 
 def validate_transfer_traces(directory: Path) -> dict:
-    """Require one physical sender, two lifecycle replicas, and synchronized leak-free cleanup."""
+    """Require one physical sender, a lifecycle replica per rank, and synchronized leak-free cleanup."""
     expected = json.loads((directory / "context-result.json").read_text())
     options = json.loads((directory / "options.json").read_text())
+    group_size = _group_size(options, context=True)
     events = [
         json.loads(line)
         for path in sorted((directory / "traces").glob("rank-*.jsonl"))
@@ -250,8 +268,9 @@ def validate_transfer_traces(directory: Path) -> dict:
         }
     }
     baselines = by_kind["baseline"]
-    assert len(baselines) == 2 and {row["rank"] for row in baselines} == {0, 1}
-    assert baselines[0]["free_pages"] == baselines[1]["free_pages"]
+    assert len(baselines) == group_size
+    assert {row["rank"] for row in baselines} == set(range(group_size))
+    assert all(row["free_pages"] == baselines[0]["free_pages"] for row in baselines)
     baseline = baselines[0]
     expected_ids = set(expected["context_ids"])
     # Every prompt completes through generation; the timeout and the cancellation add one each.
@@ -260,7 +279,7 @@ def validate_transfer_traces(directory: Path) -> dict:
     assert len(expected["timeout_ids"]) == 2
     assert len(expected_ids) == prompt_count + len(expected["timeout_ids"])
     for kind in ("release_index", "start", "commit", "free"):
-        for rank in range(2):
+        for rank in range(group_size):
             counts = Counter(row["request_id"] for row in by_kind[kind] if row["rank"] == rank)
             assert counts == Counter({request_id: 1 for request_id in expected_ids}), (
                 kind,
@@ -292,7 +311,7 @@ def validate_transfer_traces(directory: Path) -> dict:
         assert all(row["outcome"] == outcome for row in commits)
         if outcome == "timed_out":
             assert observed["elapsed_ms"] >= options["transfer_timeout_ms"]
-        for rank in range(2):
+        for rank in range(group_size):
             local = [
                 row for row in events if row.get("request_id") == request_id and row["rank"] == rank
             ]
@@ -321,7 +340,8 @@ def validate_transfer_traces(directory: Path) -> dict:
                     assert any(free < initial for free, initial in zip(current, total, strict=True))
     cancel_id = expected["timeout_ids"][-1]
     attempts = [row for row in by_kind["cancel_attempt"] if row["request_id"] == cancel_id]
-    assert len(attempts) == 2 and {row["rank"] for row in attempts} == {0, 1}
+    assert len(attempts) == group_size
+    assert {row["rank"] for row in attempts} == set(range(group_size))
     assert all(not row["accepted"] for row in attempts), "In-flight public abort freed a KV replica"
     return {
         "status": "passed",
@@ -338,10 +358,12 @@ def validate_transfer_traces(directory: Path) -> dict:
     }
 
 
-def _run_pair(options: dict, directory: Path) -> None:
+def _prepare_pair(options: dict, directory: Path) -> None:
+    """Write the options of one run and the sitecustomize hook that its context workers load.
+
+    The options come last: other processes of a multi-node run wait for them.
+    """
     directory.mkdir(parents=True)
-    options_path = directory / "options.json"
-    options_path.write_text(json.dumps(options))
     hook = directory / "hook"
     hook.mkdir()
     (hook / "sitecustomize.py").write_text(
@@ -349,33 +371,61 @@ def _run_pair(options: dict, directory: Path) -> None:
         "if os.environ.get('DKV_TRANSFER_TRACE_DIR'):\n"
         "    from dkv_transfer_probe import install_import_hook\n"
         "    install_import_hook(os.environ['DKV_TRANSFER_TRACE_DIR'])\n"
+        "if os.environ.get('DKV_KV_MUTATION'):\n"
+        "    from dkv_mutation_probe import install_mutation_hook\n"
+        "    install_mutation_hook(os.environ['DKV_KV_MUTATION'])\n"
     )
+    _save_text(directory / "options.json", json.dumps(options))
+
+
+def _role_env(role: str, options: dict, directory: Path) -> dict[str, str]:
+    """The variables a role's processes need on top of the inherited environment."""
+    env = {
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+        "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": os.pathsep.join(
+            [str(directory / "hook"), str(Path(__file__).parent), os.environ.get("PYTHONPATH", "")]
+        ),
+        "TRTLLM_DKV_DEBUG": "1",
+    }
+    if role == "context" and options["dkv"]:
+        env["DKV_TRANSFER_TRACE_DIR"] = str(directory / "traces")
+        if options.get("mutation"):
+            env["DKV_KV_MUTATION"] = json.dumps(options["mutation"])
+    return env
+
+
+def _run_pair(options: dict, directory: Path) -> None:
+    _prepare_pair(options, directory)
+    options_path = directory / "options.json"
+    ctx_size = _group_size(options, context=True)
+    gen_size = _group_size(options, context=False)
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3").split(",")
-    if len(visible) < 4:
-        raise RuntimeError("DKV context TP2 + generation TP2 requires four visible GPUs")
+    if len(visible) < ctx_size + gen_size:
+        raise RuntimeError(
+            f"DKV context TP{ctx_size} + generation TP{gen_size} requires "
+            f"{ctx_size + gen_size} visible GPUs"
+        )
     processes = []
     logs = []
     try:
-        for role, devices in (("generation", visible[2:4]), ("context", visible[:2])):
+        for role, devices in (
+            ("generation", visible[ctx_size : ctx_size + gen_size]),
+            ("context", visible[:ctx_size]),
+        ):
             env = {
                 key: value
                 for key, value in os.environ.items()
                 if not key.startswith(("SLURM_", "PMI_", "PMIX_", "OMPI_"))
             }
             env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
-            env["OMPI_ALLOW_RUN_AS_ROOT"] = "1"
-            env["OMPI_ALLOW_RUN_AS_ROOT_CONFIRM"] = "1"
-            env["PYTHONDONTWRITEBYTECODE"] = "1"
-            env["PYTHONPATH"] = os.pathsep.join(
-                [str(hook), str(Path(__file__).parent), env.get("PYTHONPATH", "")]
-            )
-            env["TRTLLM_DKV_DEBUG"] = "1"
             env["UCX_MM_ERROR_HANDLING"] = "y"
             env["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
             env.pop("TLLM_WORKER_USE_SINGLE_PROCESS", None)
             env.pop("DKV_TRANSFER_TRACE_DIR", None)
-            if role == "context" and options["dkv"]:
-                env["DKV_TRANSFER_TRACE_DIR"] = str(directory / "traces")
+            env.pop("DKV_KV_MUTATION", None)
+            env.update(_role_env(role, options, directory))
             log = (directory / f"{role}.log").open("w")
             logs.append(log)
             processes.append(
@@ -431,51 +481,47 @@ def _run_pair(options: dict, directory: Path) -> None:
             log.close()
 
 
-def run_transfer_gate(
+def _transfer_options(
     model: str,
-    work_dir: str,
     *,
-    mode: str = "precision",
-    moe_backend: str = "CUTLASS",
-    disable_finalize_fusion: bool = False,
-    tokens_per_block: int = 32,
-    transfer_timeout_ms: int = 15000,
-    policy: PrecisionPolicy = EXACT_POLICY,
-    prompts: list[list[int]] | None = None,
+    moe_backend: str,
+    disable_finalize_fusion: bool,
+    tokens_per_block: int,
+    transfer_timeout_ms: int,
+    prompts: list[list[int]] | None,
+    ctx_group_size: int = 2,
+    gen_group_size: int = 2,
 ) -> dict:
-    """Run real NIXL transfers; precision requires an independently repeated ADP control.
-
-    ``prompts`` replaces the default repeated-token requests; the last two run after the timeout
-    and cancellation injections. ``policy`` decides how closely DKV must match the ADP control.
-    """
-    import torch
-
-    directory = Path(work_dir).resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    options = {
+    return {
         "model": model,
         "moe_backend": moe_backend,
         "disable_finalize_fusion": disable_finalize_fusion,
         "tokens_per_block": tokens_per_block,
         "transfer_timeout_ms": transfer_timeout_ms,
         "prompts": prompts,
+        "ctx_group_size": ctx_group_size,
+        "gen_group_size": gen_group_size,
     }
-    runs = [("adp-control", False), ("adp-replay", False)] if mode == "precision" else []
-    runs.append(("dkv", True))
-    for name, enabled in runs:
-        if enabled and mode == "precision":
-            validate_adp_control(
-                torch.load(directory / "adp-control" / "outputs.pt", weights_only=True),
-                torch.load(directory / "adp-replay" / "outputs.pt", weights_only=True),
-                policy,
-            )
-        _run_pair({**options, "dkv": enabled}, directory / name)
+
+
+def _load_outputs(directory: Path, name: str) -> dict:
+    import torch
+
+    return torch.load(directory / name / "outputs.pt", weights_only=True)
+
+
+def judge_transfer_gate(directory: Path, *, mode: str, policy: PrecisionPolicy) -> dict:
+    """Judge the finished runs of a work directory.
+
+    The lifecycle traces are checked and, for precision, DKV is compared with the two ADP runs.
+    """
     summary = {"lifecycle": validate_transfer_traces(directory / "dkv"), "precision": "not_run"}
     if mode == "precision":
         control, replay, actual = [
-            torch.load(directory / name / "outputs.pt", weights_only=True) for name, _ in runs
+            _load_outputs(directory, name) for name in ("adp-control", "adp-replay", "dkv")
         ]
-        expected = len(prompts or _repeated_token_prompts())
+        options = json.loads((directory / "dkv" / "options.json").read_text())
+        expected = len(options["prompts"] or _repeated_token_prompts())
         assert len(control["logits"]) == len(replay["logits"]) == len(actual["logits"]) == expected
         comparison = compare_precision_runs(control, replay, actual, policy)
         summary["precision"] = {
@@ -488,6 +534,166 @@ def run_transfer_gate(
     return summary
 
 
+def run_transfer_gate(
+    model: str,
+    work_dir: str,
+    *,
+    mode: str = "precision",
+    moe_backend: str = "CUTLASS",
+    disable_finalize_fusion: bool = False,
+    tokens_per_block: int = 32,
+    transfer_timeout_ms: int = 15000,
+    policy: PrecisionPolicy = EXACT_POLICY,
+    prompts: list[list[int]] | None = None,
+    ctx_group_size: int = 2,
+    gen_group_size: int = 2,
+) -> dict:
+    """Run real NIXL transfers; precision requires an independently repeated ADP control.
+
+    ``prompts`` replaces the default repeated-token requests; the last two run after the timeout
+    and cancellation injections. ``policy`` decides how closely DKV must match the ADP control.
+    """
+    directory = Path(work_dir).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    options = _transfer_options(
+        model,
+        moe_backend=moe_backend,
+        disable_finalize_fusion=disable_finalize_fusion,
+        tokens_per_block=tokens_per_block,
+        transfer_timeout_ms=transfer_timeout_ms,
+        prompts=prompts,
+        ctx_group_size=ctx_group_size,
+        gen_group_size=gen_group_size,
+    )
+    runs = [("adp-control", False), ("adp-replay", False)] if mode == "precision" else []
+    runs.append(("dkv", True))
+    for name, enabled in runs:
+        if enabled and mode == "precision":
+            validate_adp_control(
+                _load_outputs(directory, "adp-control"),
+                _load_outputs(directory, "adp-replay"),
+                policy,
+            )
+        _run_pair({**options, "dkv": enabled}, directory / name)
+    return judge_transfer_gate(directory, mode=mode, policy=policy)
+
+
+def _mutation_spec(
+    prompts: list[list[int]], target_index: int, spec: dict, record_dir: Path
+) -> dict:
+    """The complete spec for ``dkv_mutation_probe``: ``spec`` aimed at one prompt by its length."""
+    lengths = [len(prompt) for prompt in prompts]
+    if lengths.count(lengths[target_index]) != 1:
+        raise ValueError("The corrupted prompt must be the only one of its length")
+    return {**spec, "prompt_len": lengths[target_index], "record_dir": str(record_dir)}
+
+
+def _mutation_records(run_directory: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for path in sorted((run_directory / "mutations").glob("mutations-*.jsonl"))
+        for line in path.read_text().splitlines()
+        if line
+    ]
+
+
+def judge_mutation(directory: Path, name: str, policy: PrecisionPolicy) -> dict:
+    """What the precision gate says about the mutated run ``name`` of a work directory.
+
+    ``gate_error`` is the gate's failure message, or None when the gate accepted the run;
+    ``failing_requests`` lists the requests that break the policy on their own; ``records`` are the
+    corruptions the context workers applied.
+    """
+    control = _load_outputs(directory, "adp-control")
+    replay = _load_outputs(directory, "adp-replay")
+    mutated = _load_outputs(directory, name)
+    try:
+        compare_precision_runs(control, replay, mutated, policy)
+    except AssertionError as error:
+        gate_error = str(error)
+    else:
+        gate_error = None
+    return {
+        "gate_error": gate_error,
+        "failing_requests": failing_requests(control, replay, mutated, policy),
+        "records": _mutation_records(directory / name),
+    }
+
+
+def run_transfer_mutations(
+    model: str,
+    work_dir: str,
+    mutations: dict[str, dict],
+    *,
+    prompts: list[list[int]],
+    target_index: int,
+    moe_backend: str = "CUTLASS",
+    disable_finalize_fusion: bool = False,
+    tokens_per_block: int = 32,
+    transfer_timeout_ms: int = 30000,
+    policy: PrecisionPolicy = EXACT_POLICY,
+) -> dict[str, dict]:
+    """Corrupt the KV of one prompt on its way to generation and judge what the gate makes of it.
+
+    The ADP control runs twice, then each entry of ``mutations`` (run name -> ``kind`` and optional
+    ``fraction`` for ``dkv_mutation_probe``) runs the DKV context worker with the KV of
+    ``prompts[target_index]`` corrupted. The mutated runs skip the timeout and cancellation
+    injections, because they test the precision gate and not the lifecycle. Returns ``judge_mutation``
+    for every run name.
+    """
+    directory = Path(work_dir).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    options = {
+        **_transfer_options(
+            model,
+            moe_backend=moe_backend,
+            disable_finalize_fusion=disable_finalize_fusion,
+            tokens_per_block=tokens_per_block,
+            transfer_timeout_ms=transfer_timeout_ms,
+            prompts=prompts,
+        ),
+        "injections": False,
+    }
+    for name in ("adp-control", "adp-replay"):
+        _run_pair({**options, "dkv": False}, directory / name)
+    validate_adp_control(
+        _load_outputs(directory, "adp-control"), _load_outputs(directory, "adp-replay"), policy
+    )
+    judgments = {}
+    for name, spec in mutations.items():
+        mutation = _mutation_spec(prompts, target_index, spec, directory / name / "mutations")
+        _run_pair({**options, "dkv": True, "mutation": mutation}, directory / name)
+        judgments[name] = judge_mutation(directory, name, policy)
+    (directory / "mutation-result.json").write_text(
+        json.dumps({"target_index": target_index, "runs": judgments}, indent=2)
+    )
+    return judgments
+
+
+def _natural_prompts(model: str, tokens_per_block: int) -> list[list[int]]:
+    if __package__:
+        from .dkv_models import PromptTokenizer
+        from .dkv_precision import build_precision_prompts
+    else:
+        from dkv_models import PromptTokenizer
+        from dkv_precision import build_precision_prompts
+
+    prompts, _ = build_precision_prompts(PromptTokenizer(model).encode, tokens_per_block)
+    return prompts
+
+
+def _parse_mutations(items: list[str]) -> dict[str, dict]:
+    """Run name -> spec for ``KIND[:FRACTION]`` command-line items."""
+    mutations = {}
+    for item in items:
+        kind, _, fraction = item.partition(":")
+        mutations[item.replace(":", "-")] = {
+            "kind": kind,
+            "fraction": float(fraction) if fraction else 1.0,
+        }
+    return mutations
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model")
@@ -497,6 +703,10 @@ def main() -> None:
     parser.add_argument("--disable-finalize-fusion", action="store_true")
     parser.add_argument("--tokens-per-block", type=int, default=32)
     parser.add_argument("--transfer-timeout-ms", type=int, default=15000)
+    parser.add_argument("--ctx-group-size", type=int, default=2, help="ranks of the context group")
+    parser.add_argument(
+        "--gen-group-size", type=int, default=2, help="ranks of the generation group"
+    )
     parser.add_argument(
         "--policy",
         choices=("exact", "noisy"),
@@ -508,44 +718,126 @@ def main() -> None:
         action="store_true",
         help="use the discriminating text prompts instead of repeated tokens",
     )
+    parser.add_argument(
+        "--mutate",
+        action="append",
+        metavar="KIND[:FRACTION]",
+        help="corrupt the KV of one prompt (zero or foreign, optionally only a leading fraction of "
+        "its regions) and report what the gate makes of it; repeat for several runs. Needs "
+        "--natural-prompts",
+    )
+    parser.add_argument(
+        "--mutation-target",
+        type=int,
+        default=3,
+        help="index of the prompt whose KV --mutate corrupts",
+    )
+    # The context and generation groups of a multi-node run are started by the job, one launch per
+    # group and phase. WORK_DIR is the run's directory for --prepare-phase, --judge and
+    # --judge-mutation, and the phase's own directory for --role and --role-env.
+    parser.add_argument(
+        "--prepare-phase",
+        metavar="NAME",
+        help="write the options and the hook of the phase WORK_DIR/NAME and exit",
+    )
+    parser.add_argument("--dkv", action="store_true", help="--prepare-phase: a DKV context group")
+    parser.add_argument(
+        "--role-env",
+        choices=("context", "generation"),
+        help="print the export lines that role needs in the phase directory WORK_DIR and exit",
+    )
+    parser.add_argument(
+        "--judge", action="store_true", help="judge the finished phases in WORK_DIR and exit"
+    )
+    parser.add_argument(
+        "--judge-mutation",
+        action="append",
+        metavar="NAME",
+        help="judge the finished mutated phase WORK_DIR/NAME and exit",
+    )
     parser.add_argument("--role", choices=("context", "generation"))
     parser.add_argument("--options")
     args = parser.parse_args()
+    work_dir = Path(args.work_dir)
+    policy = NOISY_POLICY if args.policy == "noisy" else EXACT_POLICY
     if args.role:
-        options = json.loads(Path(args.options).read_text())
         worker = _context_worker if args.role == "context" else _generation_worker
-        worker(options, Path(args.work_dir))
-    else:
-        if not args.model:
-            parser.error("--model is required for a gate run")
-        prompts = None
-        if args.natural_prompts:
-            if __package__:
-                from .dkv_models import PromptTokenizer
-                from .dkv_precision import build_precision_prompts
-            else:
-                from dkv_models import PromptTokenizer
-                from dkv_precision import build_precision_prompts
-
-            prompts, _ = build_precision_prompts(
-                PromptTokenizer(args.model).encode, args.tokens_per_block
+        worker(json.loads(Path(args.options).read_text()), work_dir)
+        return
+    if args.role_env:
+        options = json.loads((work_dir / "options.json").read_text())
+        for key, value in _role_env(args.role_env, options, work_dir).items():
+            print(f"export {key}={shlex.quote(value)}")
+        return
+    if args.judge:
+        print(json.dumps(judge_transfer_gate(work_dir, mode=args.mode, policy=policy), indent=2))
+        return
+    if args.judge_mutation:
+        judgments = {name: judge_mutation(work_dir, name, policy) for name in args.judge_mutation}
+        print(json.dumps(judgments, indent=2))
+        return
+    if not args.model:
+        parser.error("--model is required for a gate run")
+    prompts = _natural_prompts(args.model, args.tokens_per_block) if args.natural_prompts else None
+    if args.mutate and prompts is None:
+        parser.error("--mutate needs --natural-prompts")
+    if args.prepare_phase:
+        options = {
+            **_transfer_options(
+                args.model,
+                moe_backend=args.moe_backend,
+                disable_finalize_fusion=args.disable_finalize_fusion,
+                tokens_per_block=args.tokens_per_block,
+                transfer_timeout_ms=args.transfer_timeout_ms,
+                prompts=prompts,
+                ctx_group_size=args.ctx_group_size,
+                gen_group_size=args.gen_group_size,
+            ),
+            "dkv": args.dkv,
+        }
+        if args.mutate:
+            if len(args.mutate) != 1:
+                parser.error("a prepared phase takes one --mutate")
+            (spec,) = _parse_mutations(args.mutate).values()
+            options["mutation"] = _mutation_spec(
+                prompts, args.mutation_target, spec, work_dir / args.prepare_phase / "mutations"
             )
-        print(
-            json.dumps(
-                run_transfer_gate(
-                    args.model,
-                    args.work_dir,
-                    mode=args.mode,
-                    moe_backend=args.moe_backend,
-                    disable_finalize_fusion=args.disable_finalize_fusion,
-                    tokens_per_block=args.tokens_per_block,
-                    transfer_timeout_ms=args.transfer_timeout_ms,
-                    policy=NOISY_POLICY if args.policy == "noisy" else EXACT_POLICY,
-                    prompts=prompts,
-                ),
-                indent=2,
-            )
+            options["injections"] = False
+        _prepare_pair(options, work_dir / args.prepare_phase)
+        return
+    if args.mutate:
+        judgments = run_transfer_mutations(
+            args.model,
+            args.work_dir,
+            _parse_mutations(args.mutate),
+            prompts=prompts,
+            target_index=args.mutation_target,
+            moe_backend=args.moe_backend,
+            disable_finalize_fusion=args.disable_finalize_fusion,
+            tokens_per_block=args.tokens_per_block,
+            transfer_timeout_ms=args.transfer_timeout_ms,
+            policy=policy,
         )
+        print(json.dumps(judgments, indent=2))
+        return
+    print(
+        json.dumps(
+            run_transfer_gate(
+                args.model,
+                args.work_dir,
+                mode=args.mode,
+                moe_backend=args.moe_backend,
+                disable_finalize_fusion=args.disable_finalize_fusion,
+                tokens_per_block=args.tokens_per_block,
+                transfer_timeout_ms=args.transfer_timeout_ms,
+                policy=policy,
+                prompts=prompts,
+                ctx_group_size=args.ctx_group_size,
+                gen_group_size=args.gen_group_size,
+            ),
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

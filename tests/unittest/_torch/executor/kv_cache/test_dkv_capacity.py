@@ -63,7 +63,7 @@ def _manager(group_size: int | None) -> KVCacheManagerV2:
     return manager
 
 
-@pytest.mark.parametrize("group_size", [None, 2, 4])
+@pytest.mark.parametrize("group_size", [None, 2, 4, 8])
 @pytest.mark.parametrize("is_disagg", [False, True])
 @pytest.mark.parametrize("guard", [None, 0])
 def test_sequence_capacity_reserves_global_admission_and_dummies(
@@ -86,7 +86,7 @@ def test_non_dkv_overlap_retains_extra_sequence_leases() -> None:
     assert manager._get_sequence_capacities(1, False) == (4, 5)
 
 
-@pytest.mark.parametrize("group_size", [None, 2, 4])
+@pytest.mark.parametrize("group_size", [None, 2, 4, 8])
 def test_global_typical_context_keeps_local_startup_feasibility(group_size: int | None) -> None:
     manager = _manager(group_size)
     manager.num_extra_kv_tokens = 0
@@ -111,7 +111,7 @@ def test_global_typical_context_keeps_local_startup_feasibility(group_size: int 
     assert config.constraints[-1].kv_caches[0].history_length == 0
 
 
-@pytest.mark.parametrize("group_size", [None, 2, 4])
+@pytest.mark.parametrize("group_size", [None, 2, 4, 8])
 @pytest.mark.parametrize("tokens", [1, 100, 300, 1000])
 def test_swa_quota_accounts_for_global_context_tokens_and_round_trips(
     group_size: int | None, tokens: int
@@ -128,7 +128,7 @@ def test_swa_quota_accounts_for_global_context_tokens_and_round_trips(
     assert manager.max_batch_size == 2
 
 
-@pytest.mark.parametrize("group_size", [None, 2, 4])
+@pytest.mark.parametrize("group_size", [None, 2, 4, 8])
 @pytest.mark.parametrize("tokens", [1, 1024, 4096, 16384])
 @pytest.mark.parametrize("context_limit", [None, 1024])
 def test_v4_quota_round_trip_preserves_local_forward_capacity(

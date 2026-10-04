@@ -30,6 +30,10 @@ class DkvModel:
     # Host cache bytes per rank that hold every block the host-tier test spills: 96 prompts of three
     # blocks, several times over.
     host_cache_bytes: int = 2 << 30
+    # Whether the pressure bursts are known to make the scheduler release and restart a context.
+    # They shrink the pool to 2100 tokens: an uncompressed KV cache is exhausted by that, but
+    # DeepSeek-V4's compressed one is not, and its pool never drops below a fixed minimum.
+    stalls_under_pressure: bool = False
 
     def path(self) -> str:
         """Resolve the checkpoint: an explicit environment override, else the models root."""
@@ -51,7 +55,9 @@ class DkvModel:
 
 
 # Llama does not run its MLP as attention-DP expects, so TinyLlama stays out of the numerical gate.
-TINY_LLAMA = DkvModel("tiny-llama", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0", 32)
+TINY_LLAMA = DkvModel(
+    "tiny-llama", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0", 32, stalls_under_pressure=True
+)
 # The CUTLASS MoE backend with the finalize fusion off is the deterministic configuration.
 DEEPSEEK_V3_LITE = DkvModel(
     "deepseek-v3-lite",
@@ -75,6 +81,29 @@ DEEPSEEK_V4 = DkvModel(
 MODELS = (TINY_LLAMA, DEEPSEEK_V3_LITE, DEEPSEEK_V4)
 MODEL_IDS = [model.pytest_id for model in MODELS]
 PRECISION_MODELS = [model for model in MODELS if model.precision is not None]
+
+
+def dkv_worker_env(*, measurement: bool = False) -> dict[str, str]:
+    """The DKV switches a test turns on, as ``env_overrides`` for the LLM.
+
+    Ranks that were launched through MPI do not see the environment a test sets, so the LLM carries
+    these to every worker.
+    """
+    env = {"TRTLLM_DKV_DEBUG": "1", "TRTLLM_DKV_DUAL_LEDGER": "1"}
+    if measurement:
+        # Each rank's own pool snapshot rides on the iteration stats.
+        env["TRTLLM_DKV_MEASUREMENT"] = "1"
+    return env
+
+
+def available_gpus() -> int:
+    """GPUs a test may use: this node's, or the whole job's when ranks were launched with MPI."""
+    import torch
+
+    from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
+
+    world_size = get_mpi_world_size()
+    return world_size if world_size > 1 else torch.cuda.device_count()
 
 
 class PromptTokenizer:

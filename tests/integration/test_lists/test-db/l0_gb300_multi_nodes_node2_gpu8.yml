@@ -17,3 +17,15 @@ l0_gb300_multi_nodes_node2_gpu8:
   # Kimi K3 GSM8K accuracy plus an acceptance-length gate on the TEP8 DSpark
   # recipe. Measured 25m45s on 2x4 GB300.
   - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8 TIMEOUT (60)
+  # DKV replicated lifecycle across eight ranks: every synchronization point crosses the two
+  # nodes. The ranks are launched through trtllm-llmapi-launch, so the tests hand their DKV
+  # switches to every worker through the LLM's env_overrides. Entries must be exact node ids.
+  - dkv/test_dkv_concurrency.py::test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing[tiny-llama-g8] TIMEOUT (20)
+  - dkv/test_dkv_concurrency.py::test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing[tiny-llama-pressure-g8] TIMEOUT (20)
+  - dkv/test_dkv_concurrency.py::test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing[deepseek-v3-lite-g8] TIMEOUT (40)
+  - dkv/test_dkv_concurrency.py::test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing[deepseek-v4-g8] TIMEOUT (60)
+  - dkv/test_dkv_gate.py::test_dkv_aggregate_1000_steps[tiny-llama-g8] TIMEOUT (30)
+  - dkv/test_dkv_gate.py::test_dkv_aggregate_1000_steps[deepseek-v3-lite-g8] TIMEOUT (60)
+  - dkv/test_dkv_gate.py::test_dkv_aggregate_1000_steps[deepseek-v4-g8] TIMEOUT (90)
+  - dkv/test_dkv_gate.py::test_dkv_sequential_precision[deepseek-v3-lite-g8] TIMEOUT (60)
+  - dkv/test_dkv_gate.py::test_dkv_sequential_precision[deepseek-v4-g8] TIMEOUT (120)

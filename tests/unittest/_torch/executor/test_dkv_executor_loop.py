@@ -47,7 +47,7 @@ def _phases(run: RankRun) -> dict[int, list[str]]:
     return by_iteration
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_every_iteration_enters_the_same_phases_in_the_documented_order(group_size: int) -> None:
     arrivals = _arrivals(group_size, (2, 1, 0, 3, 2))
     runs = run_loop(group_size, LoopScript(arrivals, batch_size=2, max_num_tokens=16))
@@ -64,7 +64,7 @@ def test_every_iteration_enters_the_same_phases_in_the_documented_order(group_si
     )
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_forward_batches_hold_only_owned_requests_or_the_resident_dummy(group_size: int) -> None:
     arrivals = _arrivals(group_size, (2, 1, 0, 3, 2))
     owners = {request_id: owner for batch in arrivals for request_id, owner, _ in batch}
@@ -79,7 +79,7 @@ def test_forward_batches_hold_only_owned_requests_or_the_resident_dummy(group_si
             assert real or value == [(dummy_id, True)], (iteration, value)
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_each_request_is_answered_once_by_its_owner_and_pages_return(group_size: int) -> None:
     arrivals = _arrivals(group_size, (2, 1, 0, 3, 2))
     owners = {request_id: owner for batch in arrivals for request_id, owner, _ in batch}
@@ -95,7 +95,7 @@ def test_each_request_is_answered_once_by_its_owner_and_pages_return(group_size:
     assert sorted(runs[0].pages.freed) == sorted(owners)
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_healthy_collectives_per_iteration_do_not_exceed_the_adp_baseline(group_size: int) -> None:
     arrivals = _arrivals(group_size, (2, 1, 0, 3, 2))
     runs = run_loop(group_size, LoopScript(arrivals, batch_size=2, max_num_tokens=16))
@@ -182,7 +182,7 @@ def test_capacity_digest_catches_diverged_kv_state_even_without_debug() -> None:
         run_loop(2, LoopScript(arrivals, max_num_tokens=16, debug=False, leak=(1, 1)))
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_a_kv_stall_is_recovered_in_lockstep_and_every_request_still_completes(
     group_size: int,
 ) -> None:

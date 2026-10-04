@@ -189,7 +189,7 @@ def test_only_local_requests_receive_sequence_slots_and_remote_free_is_harmless(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("batch_size", [1, 2, 8])
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_slot_pool_reserves_one_local_dummy_and_fits_global_kv_admission(
     batch_size: int, group_size: int
 ) -> None:

@@ -29,7 +29,7 @@ def _iterations(run: RankRun, name: str) -> dict[int, int]:
     return {value: iteration for iteration, event, value in run.events if event == name}
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_only_the_owner_sends_and_polls_while_every_rank_starts_the_transfer(
     group_size: int,
 ) -> None:
@@ -43,7 +43,7 @@ def test_only_the_owner_sends_and_polls_while_every_rank_starts_the_transfer(
         assert sorted(run.pages.released_index_slots) == ids
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_pages_are_released_in_the_same_iteration_on_every_rank_after_completion(
     group_size: int,
 ) -> None:
@@ -61,7 +61,7 @@ def test_pages_are_released_in_the_same_iteration_on_every_rank_after_completion
     assert all(run.final_pages == run.initial_pages for run in runs)
 
 
-@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
 def test_one_reply_per_context_request_comes_from_its_owner(group_size: int) -> None:
     owners = [1, 0, 1]
     runs = run_loop(group_size, _script(group_size, owners, transfer_done_iteration=2))

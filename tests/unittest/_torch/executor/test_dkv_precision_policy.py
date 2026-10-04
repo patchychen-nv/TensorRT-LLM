@@ -363,6 +363,66 @@ def test_exact_policy_still_rejects_noise_that_a_noisy_policy_accepts() -> None:
         _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.EXACT_POLICY)
 
 
+def test_failing_requests_names_none_for_a_dkv_run_inside_the_noise() -> None:
+    control, replay, dkv = _noisy_runs()
+    assert _POLICY.failing_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == []
+
+
+def test_failing_requests_names_the_request_that_read_another_requests_kv() -> None:
+    control, replay, dkv = _noisy_runs()
+    dkv["logits"][3] = control["logits"][5].clone()
+    dkv["tokens"][3] = control["tokens"][5]
+    assert _POLICY.failing_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == [3]
+    with pytest.raises(AssertionError):
+        _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+
+
+def test_failing_requests_names_a_request_that_only_moved_probability_mass() -> None:
+    control, replay, dkv = _noisy_runs(noise=0.05)
+    shifted = dkv["logits"][2].clone()
+    runner_up = int(shifted.topk(2).indices[0, 1])
+    shifted[0, runner_up] = shifted[0, int(dkv["tokens"][2][0])] - 0.01
+    dkv["logits"][2] = shifted
+    assert _POLICY.failing_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == [2]
+
+
+def test_failing_requests_names_every_corrupted_request() -> None:
+    control, replay, dkv = _noisy_runs()
+    for victim, source in ((1, 4), (8, 9)):
+        dkv["logits"][victim] = control["logits"][source].clone()
+        dkv["tokens"][victim] = control["tokens"][source]
+    assert _POLICY.failing_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == [1, 8]
+
+
+def test_failing_requests_ignores_a_flip_inside_the_top_two_margin() -> None:
+    control, replay, dkv = _continuation_runs()
+    for run, winner in ((control, 0), (replay, 1), (dkv, 0)):
+        _make_near_tie(run, prompt=2, position=1, winner=winner)
+    assert _POLICY.failing_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == []
+
+
+def test_failing_requests_under_the_exact_policy_sees_the_smallest_difference() -> None:
+    control = _noisy_run(_base_logits(), 0.0, 1)
+    replay, dkv = copy.deepcopy(control), copy.deepcopy(control)
+    assert _POLICY.failing_requests(control, replay, dkv) == []
+    dkv["logits"][6][0, 0] += 1e-5
+    assert _POLICY.failing_requests(control, replay, dkv) == [6]
+    dkv["tokens"][9] = [(dkv["tokens"][9][0] + 1) % _VOCABULARY]
+    assert _POLICY.failing_requests(control, replay, dkv) == [6, 9]
+
+
+def test_failing_requests_under_the_exact_policy_uses_the_tolerance_for_a_tolerated_control() -> (
+    None
+):
+    control = _noisy_run(_base_logits(), 0.0, 1)
+    replay, dkv = copy.deepcopy(control), copy.deepcopy(control)
+    replay["logits"][4][0, 0] += 0.005
+    dkv["logits"][4][0, 0] += 0.004
+    assert _POLICY.failing_requests(control, replay, dkv) == []
+    dkv["logits"][4][0, 0] += 0.05
+    assert _POLICY.failing_requests(control, replay, dkv) == [4]
+
+
 def test_prompt_separation_rejects_prompts_with_similar_distributions() -> None:
     similar = {
         "tokens": [[0]] * 6,
@@ -397,6 +457,17 @@ def test_prompt_set_is_discriminating_and_has_no_shared_leading_block(
     # Both ranks see consecutive requests as well as alternation.
     assert any(a == b for a, b in zip(_POLICY.PRECISION_PLACEMENT, _POLICY.PRECISION_PLACEMENT[1:]))
     assert any(a != b for a, b in zip(_POLICY.PRECISION_PLACEMENT, _POLICY.PRECISION_PLACEMENT[1:]))
+
+
+@pytest.mark.parametrize("group_size", [3, 4, 8])
+def test_precision_placement_covers_every_rank_of_a_larger_group(group_size: int) -> None:
+    placement = _POLICY.precision_placement(group_size)
+    assert len(placement) == len(_POLICY.PRECISION_PLACEMENT)
+    assert set(placement) == set(range(group_size))
+
+
+def test_precision_placement_keeps_the_two_rank_pattern() -> None:
+    assert _POLICY.precision_placement(2) is _POLICY.PRECISION_PLACEMENT
 
 
 def test_burst_prompts_have_the_requested_lengths_and_unique_leading_blocks() -> None:

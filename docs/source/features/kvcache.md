@@ -481,6 +481,11 @@ A host cache that is too small drops the offloaded blocks, so size
 `host_cache_size` for the replicated working set of one rank. State whether
 measurements include host-resident blocks.
 
+The integration tests run groups of two, four and eight ranks. Eight ranks take two
+four-GPU nodes started with `trtllm-llmapi-launch`: ranks started that way do not see
+the environment a test sets, so the tests hand the DKV switches to every worker through
+the LLM's `env_overrides`.
+
 **Reuse and metrics.** Keep reuse disabled for numerical comparisons. Remote
 replicas hold matching KV metadata but do not receive the computed KV tensors;
 a remote prefix hit can therefore read invalid data, and the executor logs a
@@ -499,7 +504,7 @@ requests pinned across ranks or under concurrent load.
 
 Numerical gates run sequential, rank-pinned requests with reuse disabled and
 compare complete generation logits. The prompt set is 14 real texts of different
-lengths spread over both ranks, including four sentences with known answers; a
+lengths spread over the ranks of the group, including four sentences with known answers; a
 control that cannot answer them, or prompts whose distributions are not far
 apart relative to the model's run-to-run noise, fail the gate because they could
 not tell a request that read another request's KV from a correct one. They

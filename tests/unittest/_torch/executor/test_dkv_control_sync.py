@@ -138,6 +138,74 @@ def test_pending_response_and_fatal_events_are_combined_in_rank_order() -> None:
     assert [len(trace) for trace in group.traces] == [1, 1, 1]
 
 
+def test_transfer_events_of_eight_ranks_are_sorted_by_request_id() -> None:
+    group = LockstepTpGroup(8)
+    request_ids = (41, 7, 23, 3, 88, 12, 60, 31)
+    events = tuple(DkvTransferEvent(request_ids[rank], rank, "completed") for rank in range(8))
+    results = group.run(
+        lambda dist: sync_dkv_control(dist, _payload(transfer_events=(events[dist.tp_rank],)))
+    )
+    ordered = tuple(sorted(events, key=lambda event: event.request_id))
+    assert results == [DkvControlResult((), False, ordered)] * 8
+    assert [len(trace) for trace in group.traces] == [1] * 8
+
+
+def test_fatal_events_and_pending_responses_of_eight_ranks_reach_every_rank_in_rank_order() -> None:
+    group = LockstepTpGroup(8)
+
+    def run_rank(dist):
+        messages = (f"failure on {dist.tp_rank}",) if dist.tp_rank in (3, 7) else ()
+        return sync_dkv_control(
+            dist, _payload(fatal_messages=messages, has_pending_responses=dist.tp_rank == 5)
+        )
+
+    expected = DkvControlResult(("rank 3: failure on 3", "rank 7: failure on 7"), True)
+    assert group.run(run_rank) == [expected] * 8
+    assert [len(trace) for trace in group.traces] == [1] * 8
+
+
+@pytest.mark.parametrize(
+    "diverging",
+    [(7,), (1, 6), (1, 2, 3, 4, 5, 6, 7)],
+    ids=["last-rank", "two-ranks", "all-but-rank-0"],
+)
+def test_every_diverging_rank_of_eight_is_named_on_every_rank(diverging) -> None:
+    group = LockstepTpGroup(8)
+
+    def run_rank(dist):
+        payload = _payload()
+        if dist.tp_rank in diverging:
+            payload = replace(payload, digest=replace(payload.digest, active_request_count=3))
+        with pytest.raises(RuntimeError, match="capacity digest differs") as caught:
+            sync_dkv_control(dist, payload)
+        return str(caught.value)
+
+    errors = group.run(run_rank)
+    assert len(set(errors)) == 1
+    for rank in range(1, 8):
+        named = f"rank {rank}: capacity digest differs from rank 0" in errors[0]
+        assert named == (rank in diverging), (rank, errors[0])
+    assert [len(trace) for trace in group.traces] == [1] * 8
+
+
+def test_a_diverging_rank_zero_makes_every_other_rank_of_eight_differ_from_it() -> None:
+    group = LockstepTpGroup(8)
+
+    def run_rank(dist):
+        payload = _payload()
+        if dist.tp_rank == 0:
+            payload = replace(payload, digest=replace(payload.digest, index_mapper_used=4))
+        with pytest.raises(RuntimeError, match="capacity digest differs") as caught:
+            sync_dkv_control(dist, payload)
+        return str(caught.value)
+
+    errors = group.run(run_rank)
+    assert len(set(errors)) == 1
+    assert all(
+        f"rank {rank}: capacity digest differs from rank 0" in errors[0] for rank in range(1, 8)
+    )
+
+
 @pytest.mark.parametrize(
     "changes",
     [
