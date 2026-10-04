@@ -44,11 +44,15 @@ def _wait_snapshots(directory: Path, counts: list[int]) -> list[dict]:
 
 
 def _worker(options: dict, directory: Path) -> None:
-    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm import SamplingParams
     from tensorrt_llm._torch.pyexecutor.dkv_metrics import build_dkv_measurement_report
-    from tensorrt_llm.llmapi import KvCacheConfig
-    from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, DkvConfig, MoeConfig
+    from tensorrt_llm.llmapi.llm_args import MoeConfig
     from tensorrt_llm.scheduling_params import SchedulingParams
+
+    if __package__:
+        from .dkv_models import make_dkv_llm
+    else:
+        from dkv_models import make_dkv_llm
 
     block = options["tokens_per_block"]
     snapshots_dir = directory / "traces"
@@ -59,34 +63,20 @@ def _worker(options: dict, directory: Path) -> None:
     request_ids = set()
     sampling = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
 
-    with LLM(
-        model=options["model"],
-        tensor_parallel_size=2,
-        moe_expert_parallel_size=2,
-        enable_attention_dp=True,
-        disable_overlap_scheduler=True,
-        enable_chunked_prefill=False,
-        enable_autotuner=False,
-        cuda_graph_config=None,
-        max_batch_size=2,
+    with make_dkv_llm(
+        options["model"],
+        dkv=options["dkv"],
+        tokens_per_block=block,
+        moe_config=MoeConfig(backend=options["moe_backend"]),
+        reuse=True,
+        # Measurement counts hits, so partial-block matches stay enabled; no output is validated.
+        kv_cache={
+            "enable_partial_reuse": True,
+            "event_buffer_max_size": 32768,
+            "max_tokens": options["cache_blocks"] * block,
+        },
         max_num_tokens=4 * block,
         max_seq_len=4 * block,
-        num_postprocess_workers=0,
-        enable_iter_perf_stats=True,
-        dkv_config=DkvConfig() if options["dkv"] else None,
-        moe_config=MoeConfig(backend=options["moe_backend"]),
-        kv_cache_config=KvCacheConfig(
-            use_kv_cache_manager_v2=True,
-            enable_block_reuse=True,
-            enable_swa_scratch_reuse=False,
-            block_reuse_config=BlockReuseConfig(policy="per_request"),
-            event_buffer_max_size=32768,
-            free_gpu_memory_fraction=0.5,
-            max_tokens=options["cache_blocks"] * block,
-            host_cache_size=0,
-            iteration_stats_interval=1,
-            tokens_per_block=block,
-        ),
     ) as llm:
         _wait_snapshots(snapshots_dir, counts)
 

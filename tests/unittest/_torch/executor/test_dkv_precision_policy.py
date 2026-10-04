@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Option B precision must reject shared reusable prefixes and invalid numerical controls."""
+"""DKV precision must reject shared reusable prefixes and invalid numerical controls."""
 
 import copy
 import importlib.util
@@ -41,7 +41,25 @@ def test_reuse_on_accepts_only_sub_block_shared_prefixes() -> None:
     _POLICY.validate_precision_inputs(
         enable_block_reuse=True,
         tokens_per_block=4,
+        enable_partial_reuse=False,
         prompts=[[1, 2, 3, 4, 5], [1, 2, 3, 9, 5], [1, 2, 3], [1, 2, 3]],
+    )
+
+
+@pytest.mark.parametrize("partial", [None, True, 0])
+def test_reuse_on_requires_partial_reuse_to_be_explicitly_off(partial: object) -> None:
+    with pytest.raises(ValueError, match="enable_partial_reuse=False"):
+        _POLICY.validate_precision_inputs(
+            enable_block_reuse=True,
+            tokens_per_block=4,
+            enable_partial_reuse=partial,
+            prompts=[[1, 2, 3, 4], [5, 6, 7, 8]],
+        )
+
+
+def test_partial_reuse_is_irrelevant_when_reuse_is_off() -> None:
+    _POLICY.validate_precision_inputs(
+        enable_block_reuse=False, tokens_per_block=4, enable_partial_reuse=True
     )
 
 
@@ -58,7 +76,10 @@ def test_reuse_on_accepts_only_sub_block_shared_prefixes() -> None:
 def test_reuse_on_rejects_shared_full_blocks(prompts: list[list[int]]) -> None:
     with pytest.raises(ValueError, match="share at least 4 prefix tokens"):
         _POLICY.validate_precision_inputs(
-            enable_block_reuse=True, tokens_per_block=4, prompts=prompts
+            enable_block_reuse=True,
+            tokens_per_block=4,
+            enable_partial_reuse=False,
+            prompts=prompts,
         )
 
 
@@ -66,7 +87,10 @@ def test_reuse_on_rejects_shared_full_blocks(prompts: list[list[int]]) -> None:
 def test_reuse_on_rejects_missing_prompt_evidence(prompts: list[list[int]] | None) -> None:
     with pytest.raises(ValueError, match="prompt"):
         _POLICY.validate_precision_inputs(
-            enable_block_reuse=True, tokens_per_block=4, prompts=prompts
+            enable_block_reuse=True,
+            tokens_per_block=4,
+            enable_partial_reuse=False,
+            prompts=prompts,
         )
 
 
@@ -172,3 +196,141 @@ def test_empty_runs_are_not_precision_evidence() -> None:
         _POLICY.compare_precision_runs(
             {"tokens": [], "logits": []}, {"tokens": [], "logits": []}, {"tokens": [], "logits": []}
         )
+
+
+_PROMPTS = 12
+_VOCABULARY = 64
+
+
+def _base_logits(seed: int = 0) -> torch.Tensor:
+    """Independent sharp distributions per prompt, standing in for distinct natural prompts."""
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randn(_PROMPTS, _VOCABULARY, generator=generator) * 5
+
+
+def _noisy_run(base: torch.Tensor, noise: float, seed: int) -> dict:
+    generator = torch.Generator().manual_seed(seed)
+    logits = base + noise * torch.randn(base.shape, generator=generator)
+    return {
+        "tokens": [[int(row.argmax())] for row in logits],
+        "logits": [row.unsqueeze(0) for row in logits],
+    }
+
+
+def _noisy_runs(noise: float = 0.1) -> tuple[dict, dict, dict]:
+    base = _base_logits()
+    return _noisy_run(base, noise, 1), _noisy_run(base, noise, 2), _noisy_run(base, noise, 3)
+
+
+def test_noisy_policy_accepts_dkv_inside_the_adp_noise() -> None:
+    control, replay, dkv = _noisy_runs()
+    result = _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+    assert result["comparison"] == "noise_envelope"
+    assert result["decisive_prompts"] >= _PROMPTS // 2
+    assert 0 < result["mean_adp_self_tv"] < 0.2
+    assert result["mean_extra_tv"] < _POLICY.NOISY_POLICY.max_mean_extra_tv
+    separation = _POLICY.assess_prompt_separation(
+        control, result["mean_adp_self_tv"], _POLICY.NOISY_POLICY
+    )
+    assert separation["p10_prompt_separation"] >= separation["required_separation"]
+
+
+def test_noisy_policy_rejects_a_request_that_read_another_requests_kv() -> None:
+    control, replay, dkv = _noisy_runs()
+    dkv["logits"][3] = control["logits"][5].clone()
+    dkv["tokens"][3] = control["tokens"][5]
+    with pytest.raises(AssertionError, match="decisive top-two margin|differs from ADP"):
+        _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+
+
+def test_noisy_policy_rejects_extra_distance_even_without_a_token_flip() -> None:
+    control, replay, dkv = _noisy_runs(noise=0.05)
+    # Keep the argmax but move most of the probability mass elsewhere.
+    shifted = dkv["logits"][2].clone()
+    runner_up = int(shifted.topk(2).indices[0, 1])
+    shifted[0, runner_up] = shifted[0, int(dkv["tokens"][2][0])] - 0.01
+    dkv["logits"][2] = shifted
+    with pytest.raises(AssertionError, match="differs from ADP"):
+        _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+
+
+def test_noisy_policy_tolerates_a_token_flip_inside_the_top_two_margin() -> None:
+    control, replay, dkv = _noisy_runs(noise=0.05)
+    for run, winner in ((control, 0), (replay, 1), (dkv, 0)):
+        logits = run["logits"][4].clone()
+        top = logits.max()
+        logits[0, :2] = torch.tensor([top + 0.05 * (winner == 0), top + 0.05 * (winner == 1)])
+        run["logits"][4] = logits
+        run["tokens"][4] = [winner]
+    result = _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+    assert result["decisive_prompts"] <= _PROMPTS - 1
+
+
+def test_noisy_policy_needs_enough_decisive_prompts_to_compare_tokens() -> None:
+    base = torch.zeros(_PROMPTS, _VOCABULARY)
+    base[:, 0] = 0.1
+    runs = [_noisy_run(base, 0.01, seed) for seed in (1, 2, 3)]
+    with pytest.raises(AssertionError, match="cannot compare tokens"):
+        _POLICY.compare_precision_runs(*runs, _POLICY.NOISY_POLICY)
+
+
+def test_noisy_policy_rejects_an_adp_control_that_is_too_noisy() -> None:
+    control, replay, dkv = _noisy_runs(noise=6.0)
+    with pytest.raises(AssertionError, match="ADP control is noisier"):
+        _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+
+
+def test_exact_policy_still_rejects_noise_that_a_noisy_policy_accepts() -> None:
+    control, replay, dkv = _noisy_runs(noise=0.3)
+    with pytest.raises(AssertionError):
+        _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.EXACT_POLICY)
+
+
+def test_prompt_separation_rejects_prompts_with_similar_distributions() -> None:
+    similar = {
+        "tokens": [[0]] * 6,
+        "logits": [torch.tensor([[3.0, 0.0, 0.0]]) + 0.01 * index for index in range(6)],
+    }
+    with pytest.raises(AssertionError, match="not separable"):
+        _POLICY.assess_prompt_separation(similar, 0.0, _POLICY.EXACT_POLICY)
+
+
+def test_prompt_separation_scales_with_the_noise() -> None:
+    control, _, _ = _noisy_runs()
+    _POLICY.assess_prompt_separation(control, 0.05, _POLICY.NOISY_POLICY)
+    with pytest.raises(AssertionError, match="not separable"):
+        _POLICY.assess_prompt_separation(control, 0.5, _POLICY.NOISY_POLICY)
+
+
+def _word_encode(text: str, special: bool = False) -> list[int]:
+    ids = [sum(map(ord, word)) % 50021 + 1 for word in text.split()]
+    return [0, *ids] if special else ids
+
+
+@pytest.mark.parametrize("tokens_per_block", [32, 128])
+def test_prompt_set_is_discriminating_and_has_no_shared_leading_block(
+    tokens_per_block: int,
+) -> None:
+    prompts, answers = _POLICY.build_precision_prompts(_word_encode, tokens_per_block)
+    assert len(prompts) == len(_POLICY.PRECISION_PLACEMENT) == 14
+    assert [len(prompt) for prompt in prompts[:10]] == list(_POLICY._PARAGRAPH_LENGTHS)
+    assert len({tuple(prompt[:tokens_per_block]) for prompt in prompts}) == len(prompts)
+    assert [index for index, _ in answers] == [10, 11, 12, 13]
+    assert {0, 1} == set(_POLICY.PRECISION_PLACEMENT)
+    # Both ranks see consecutive requests as well as alternation.
+    assert any(a == b for a, b in zip(_POLICY.PRECISION_PLACEMENT, _POLICY.PRECISION_PLACEMENT[1:]))
+    assert any(a != b for a, b in zip(_POLICY.PRECISION_PLACEMENT, _POLICY.PRECISION_PLACEMENT[1:]))
+
+
+def test_known_answers_detect_a_degraded_control() -> None:
+    answers = [(0, ("paris",)), (1, ("four", "4"))]
+    words = {1: " Paris", 2: " four", 3: " cheese"}
+
+    def decode(ids: list[int]) -> str:
+        return words[ids[0]]
+
+    run = {"tokens": [[1], [2]], "logits": []}
+    _POLICY.assert_known_answers(run, answers, decode, "ADP control")
+    run["tokens"][1] = [3]
+    with pytest.raises(AssertionError, match="ADP control answered 'cheese' for prompt 1"):
+        _POLICY.assert_known_answers(run, answers, decode, "ADP control")

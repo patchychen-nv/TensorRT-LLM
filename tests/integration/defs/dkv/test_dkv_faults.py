@@ -13,11 +13,10 @@ import torch
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.pyexecutor.llm_request import FinishReason
-from tensorrt_llm.llmapi.llm_args import MoeConfig
 from tensorrt_llm.scheduling_params import SchedulingParams
 
 from .dkv_fault_probe import FAULT_MESSAGE, FAULT_TOKEN
-from .test_dkv_gate import _llm
+from .dkv_models import MODEL_IDS, MODELS, DkvModel, make_dkv_llm
 
 
 def _wait(path: Path) -> None:
@@ -37,23 +36,16 @@ def _events(trace_dir: Path) -> list[dict]:
     ]
 
 
-def run_aggregate_faults(
-    model_path: str,
-    trace_dir: str,
-    *,
-    moe_config: MoeConfig | None = None,
-    tokens_per_block: int = 32,
-) -> dict:
+def run_aggregate_faults(model: DkvModel, trace_dir: str) -> dict:
     """Require actual cancellation, one owner error, symmetric frees and subsequent inference."""
     traces = Path(trace_dir)
     sampling = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
     pinned = SchedulingParams(attention_dp_rank=1, attention_dp_relax=False)
-    with _llm(
-        model_path,
-        dkv_enabled=True,
-        logits=False,
-        moe_config=moe_config,
-        tokens_per_block=tokens_per_block,
+    with make_dkv_llm(
+        model.path(),
+        dkv=True,
+        tokens_per_block=model.tokens_per_block,
+        moe_config=model.moe_config(),
     ) as llm:
         try:
             for rank in range(2):
@@ -149,11 +141,14 @@ def run_aggregate_faults(
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_dkv_aggregate_sampler_failure_and_cancel(monkeypatch, tmp_path: Path) -> None:
-    from ..conftest import llm_models_root
-
+@pytest.mark.parametrize("model", MODELS, ids=MODEL_IDS)
+def test_dkv_aggregate_sampler_failure_and_cancel(
+    monkeypatch, tmp_path: Path, model: DkvModel
+) -> None:
     if torch.cuda.device_count() < 2:
         pytest.skip("DKV aggregate fault gate requires two GPUs")
+    if not Path(model.path()).is_dir():
+        pytest.skip(f"{model.pytest_id} checkpoint is not available at {model.path()}")
     hook = tmp_path / "worker-hook"
     hook.mkdir()
     traces = tmp_path / "traces"
@@ -170,6 +165,4 @@ def test_dkv_aggregate_sampler_failure_and_cancel(monkeypatch, tmp_path: Path) -
     monkeypatch.setenv("DKV_FAULT_TRACE_DIR", str(traces))
     monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
-    run_aggregate_faults(
-        str(Path(llm_models_root()) / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"), str(traces)
-    )
+    run_aggregate_faults(model, str(traces))

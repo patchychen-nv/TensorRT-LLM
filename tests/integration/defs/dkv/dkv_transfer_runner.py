@@ -15,12 +15,14 @@ from collections import Counter
 from pathlib import Path
 
 if __package__:
+    from .dkv_models import make_dkv_llm
     from .dkv_precision import (
         compare_precision_runs,
         validate_adp_control,
         validate_precision_inputs,
     )
 else:
+    from dkv_models import make_dkv_llm
     from dkv_precision import (
         compare_precision_runs,
         validate_adp_control,
@@ -49,52 +51,25 @@ def _load_message(path: Path):
 
 
 def _llm(options: dict, *, context: bool):
-    from tensorrt_llm import LLM
-    from tensorrt_llm.llmapi import KvCacheConfig
-    from tensorrt_llm.llmapi.llm_args import (
-        BlockReuseConfig,
-        CacheTransceiverConfig,
-        DkvConfig,
-        MoeConfig,
-    )
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, MoeConfig
 
-    kv_cache_config = KvCacheConfig(
-        use_kv_cache_manager_v2=True,
-        enable_block_reuse=False,
-        enable_swa_scratch_reuse=False,
-        block_reuse_config=BlockReuseConfig(policy="per_request"),
-        free_gpu_memory_fraction=0.5,
-        max_tokens=4096,
-        host_cache_size=0,
-        tokens_per_block=options["tokens_per_block"],
-    )
     validate_precision_inputs(
-        enable_block_reuse=kv_cache_config.enable_block_reuse,
-        tokens_per_block=kv_cache_config.tokens_per_block,
+        enable_block_reuse=False, tokens_per_block=options["tokens_per_block"]
     )
-    return LLM(
-        model=options["model"],
-        tensor_parallel_size=2,
-        moe_expert_parallel_size=2,
-        enable_attention_dp=context,
-        disable_overlap_scheduler=True,
-        enable_chunked_prefill=False,
-        enable_autotuner=False,
-        cuda_graph_config=None,
-        max_batch_size=2,
-        max_num_tokens=512,
-        max_seq_len=512,
-        num_postprocess_workers=0,
-        gather_generation_logits=True,
-        dkv_config=DkvConfig() if context and options["dkv"] else None,
+    return make_dkv_llm(
+        options["model"],
+        dkv=context and options["dkv"],
+        tokens_per_block=options["tokens_per_block"],
         moe_config=MoeConfig(backend=options["moe_backend"]),
+        attention_dp=context,
+        gather_logits=True,
+        enable_iter_perf_stats=False,
         cache_transceiver_config=CacheTransceiverConfig(
             backend="NIXL",
             transceiver_runtime="PYTHON",
             kv_transfer_timeout_ms=options["transfer_timeout_ms"],
             kv_transfer_sender_future_timeout_ms=100,
         ),
-        kv_cache_config=kv_cache_config,
     )
 
 

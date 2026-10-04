@@ -1,17 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Exercise replicated admission with real attention-DP workers."""
+
+from pathlib import Path
 
 import pytest
 import torch
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, DkvConfig
+from tensorrt_llm import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
-from ..conftest import llm_models_root
+from .dkv_models import MODEL_IDS, MODELS, DkvModel, make_dkv_llm
+
+# A DKV worker logs this at startup, so seeing it proves the worker's warnings reach the capture
+# and the absence of the violation messages below is evidence.
+_WORKER_CANARY = "DKV duplicates the global KV workload"
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -20,50 +23,41 @@ from ..conftest import llm_models_root
     [(False, False), (True, False), (True, True)],
     ids=["adp", "dkv", "dkv-reuse"],
 )
-@pytest.mark.parametrize(
-    "model_name",
-    ["llama-models-v2/TinyLlama-1.1B-Chat-v1.0", "DeepSeek-V3-Lite/bf16"],
-    ids=["tiny-llama", "deepseek-v3-lite"],
-)
+@pytest.mark.parametrize("model", MODELS, ids=MODEL_IDS)
 def test_dkv_replicated_admission(
-    monkeypatch, capfd, dkv_enabled: bool, enable_block_reuse: bool, model_name: str
+    monkeypatch, capfd, dkv_enabled: bool, enable_block_reuse: bool, model: DkvModel
 ) -> None:
-    """Replicated state stays aligned through admission, retirement, and warm-prefix reuse."""
+    """Replicated state stays aligned through admission, retirement, and warm-prefix reuse.
+
+    The dual ledger is off here so the single-ledger fallback keeps GPU coverage; the lifetime gate
+    runs with it on.
+    """
     if torch.cuda.device_count() < 2:
         pytest.skip("DKV admission needs two GPUs")
+    if not Path(model.path()).is_dir():
+        pytest.skip(f"{model.pytest_id} checkpoint is not available at {model.path()}")
     monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
     monkeypatch.setenv("TRTLLM_DKV_DUAL_LEDGER", "0")
+    monkeypatch.setenv("TLLM_LOG_LEVEL", "WARNING")
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
-    kv_config = KvCacheConfig(
-        use_kv_cache_manager_v2=True,
-        enable_block_reuse=enable_block_reuse,
-        block_reuse_config=BlockReuseConfig(policy="per_request"),
-        free_gpu_memory_fraction=0.5,
-        max_tokens=4096,
-    )
+    block = model.tokens_per_block
     sampling = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
     placements = [
         SchedulingParams(attention_dp_rank=rank, attention_dp_relax=False) for rank in (0, 1, 0, 1)
     ]
-    with LLM(
-        model=f"{llm_models_root()}/{model_name}",
-        tensor_parallel_size=2,
-        moe_expert_parallel_size=2,
-        enable_attention_dp=True,
-        disable_overlap_scheduler=True,
-        enable_chunked_prefill=False,
-        enable_autotuner=False,
-        cuda_graph_config=None,
-        max_batch_size=2,
-        max_num_tokens=256,
-        max_seq_len=256,
-        num_postprocess_workers=0,
-        dkv_config=DkvConfig() if dkv_enabled else None,
-        kv_cache_config=kv_config,
+    with make_dkv_llm(
+        model.path(),
+        dkv=dkv_enabled,
+        tokens_per_block=block,
+        moe_config=model.moe_config(),
+        reuse=enable_block_reuse,
+        enable_iter_perf_stats=False,
     ) as llm:
         for iteration in range(8):
+            # With reuse the prompts repeat and span a full block beyond the one token a match
+            # always leaves uncached; without it every prompt is new and shorter than two blocks.
             prompts = (
-                [[1] + [42 + index] * 127 for index in range(4)]
+                [[1] + [42 + index] * (2 * block - 1) for index in range(4)]
                 if enable_block_reuse
                 else [[1] + [42 + iteration * 4 + index] * 63 for index in range(4)]
             )
@@ -80,8 +74,8 @@ def test_dkv_replicated_admission(
                 if enable_block_reuse and iteration > 0:
                     assert output.cached_tokens > 0
 
-    if dkv_enabled:
-        captured = capfd.readouterr()
-        logs = captured.out + captured.err
-        assert "DKV invariant violation" not in logs
-        assert "exceeds expected_num_active_requests" not in logs
+    captured = capfd.readouterr()
+    logs = captured.out + captured.err
+    assert (_WORKER_CANARY in logs) == dkv_enabled
+    assert "DKV invariant violation" not in logs
+    assert "exceeds expected_num_active_requests" not in logs

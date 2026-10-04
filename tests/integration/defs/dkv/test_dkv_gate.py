@@ -9,57 +9,29 @@ from pathlib import Path
 import pytest
 import torch
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, DkvConfig, MoeConfig
+from tensorrt_llm import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
-from .dkv_precision import compare_precision_runs, validate_adp_control, validate_precision_inputs
+from .dkv_models import MODEL_IDS, MODELS, PRECISION_MODELS, DkvModel, PromptTokenizer, make_dkv_llm
+from .dkv_precision import (
+    PRECISION_PLACEMENT,
+    PrecisionRun,
+    assert_known_answers,
+    assess_prompt_separation,
+    build_precision_prompts,
+    compare_precision_runs,
+    validate_precision_inputs,
+)
 
-_MODEL_NAMES = ["llama-models-v2/TinyLlama-1.1B-Chat-v1.0", "DeepSeek-V3-Lite/bf16"]
 
-
-def _llm(
-    model_path: str,
-    *,
-    dkv_enabled: bool,
-    logits: bool,
-    moe_config: MoeConfig | None = None,
-    tokens_per_block: int = 32,
-) -> LLM:
-    kv_cache_config = KvCacheConfig(
-        use_kv_cache_manager_v2=True,
-        enable_block_reuse=False,
-        enable_swa_scratch_reuse=False,
-        block_reuse_config=BlockReuseConfig(policy="per_request"),
-        free_gpu_memory_fraction=0.5,
-        max_tokens=4096,
-        host_cache_size=0,
-        iteration_stats_interval=1,
-        tokens_per_block=tokens_per_block,
-    )
-    validate_precision_inputs(
-        enable_block_reuse=kv_cache_config.enable_block_reuse,
-        tokens_per_block=kv_cache_config.tokens_per_block,
-    )
-    return LLM(
-        model=model_path,
-        tensor_parallel_size=2,
-        moe_expert_parallel_size=2,
-        enable_attention_dp=True,
-        disable_overlap_scheduler=True,
-        enable_chunked_prefill=False,
-        enable_autotuner=False,
-        cuda_graph_config=None,
-        max_batch_size=2,
-        max_num_tokens=512,
-        max_seq_len=512,
-        num_postprocess_workers=0,
-        enable_iter_perf_stats=True,
-        gather_generation_logits=logits,
-        dkv_config=DkvConfig() if dkv_enabled else None,
-        moe_config=moe_config or MoeConfig(),
-        kv_cache_config=kv_cache_config,
+def _llm(model: DkvModel, *, dkv_enabled: bool, logits: bool):
+    validate_precision_inputs(enable_block_reuse=False, tokens_per_block=model.tokens_per_block)
+    return make_dkv_llm(
+        model.path(),
+        dkv=dkv_enabled,
+        tokens_per_block=model.tokens_per_block,
+        moe_config=model.moe_config(),
+        gather_logits=logits,
     )
 
 
@@ -71,7 +43,7 @@ def _context_rows(stats: list[dict]) -> list[dict]:
     ]
 
 
-def _drain_stats(llm: LLM, stats: list[dict], expected_contexts: int) -> None:
+def _drain_stats(llm, stats: list[dict], expected_contexts: int) -> None:
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         stats.extend(llm.get_stats(timeout=0.2))
@@ -86,26 +58,14 @@ def _drain_stats(llm: LLM, stats: list[dict], expected_contexts: int) -> None:
     pytest.fail(f"Iteration stats did not account for {expected_contexts} sequential requests")
 
 
-def run_aggregate_soak(
-    model_path: str,
-    *,
-    iterations: int = 1000,
-    moe_config: MoeConfig | None = None,
-    tokens_per_block: int = 32,
-) -> dict:
+def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000) -> dict:
     """Exercise one real prefill per iteration and verify pages return after every request."""
     if iterations < 1000:
         raise ValueError("The aggregate lifetime gate requires at least 1000 forward iterations")
     sampling = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
     stats: list[dict] = []
     request_ids: set[int] = set()
-    with _llm(
-        model_path,
-        dkv_enabled=True,
-        logits=False,
-        moe_config=moe_config,
-        tokens_per_block=tokens_per_block,
-    ) as llm:
+    with _llm(model, dkv_enabled=True, logits=False) as llm:
         initial_stats = llm.get_stats(timeout=5)
         initial_free_pages = [
             row["kvCacheStats"]["freeNumBlocks"] for row in initial_stats if "kvCacheStats" in row
@@ -154,46 +114,44 @@ def run_aggregate_soak(
     }
 
 
-def run_precision_sample(
-    model_path: str,
-    *,
-    dkv_enabled: bool,
-    prompts: list[list[int]],
-    moe_config: MoeConfig | None = None,
-    tokens_per_block: int = 32,
-) -> dict:
-    """Run pinned requests one at a time; each process can persist the returned CPU logits."""
+def run_precision_passes(
+    model: DkvModel, *, dkv_enabled: bool, prompts: list[list[int]], passes: int
+) -> list[PrecisionRun]:
+    """Run the pinned prompts one at a time, ``passes`` times in one executor.
+
+    Repeating inside one executor keeps the ADP control and replay under identical initialization,
+    so any difference between them is run-to-run noise of the model itself.
+    """
     sampling = SamplingParams(
         max_tokens=1, temperature=0, ignore_eos=True, return_generation_logits=True
     )
-    tokens: list[list[int]] = []
-    logits: list[torch.Tensor] = []
-    with _llm(
-        model_path,
-        dkv_enabled=dkv_enabled,
-        logits=True,
-        moe_config=moe_config,
-        tokens_per_block=tokens_per_block,
-    ) as llm:
-        for index, prompt in enumerate(prompts):
-            output = llm.generate(
-                prompt,
-                sampling_params=sampling,
-                scheduling_params=SchedulingParams(
-                    attention_dp_rank=index % 2, attention_dp_relax=False
-                ),
-                use_tqdm=False,
-            )
-            assert len(output.outputs) == 1
-            result = output.outputs[0]
-            assert len(result.token_ids) == 1
-            assert isinstance(result.generation_logits, torch.Tensor), "Generation logits missing"
-            values = result.generation_logits.detach().float().cpu().clone()
-            assert values.numel() > 0, "Generation logits are empty"
-            assert torch.isfinite(values).all()
-            tokens.append(list(result.token_ids))
-            logits.append(values)
-    return {"tokens": tokens, "logits": logits}
+    runs: list[PrecisionRun] = []
+    with _llm(model, dkv_enabled=dkv_enabled, logits=True) as llm:
+        for _ in range(passes):
+            tokens: list[list[int]] = []
+            logits: list[torch.Tensor] = []
+            for index, prompt in enumerate(prompts):
+                output = llm.generate(
+                    prompt,
+                    sampling_params=sampling,
+                    scheduling_params=SchedulingParams(
+                        attention_dp_rank=PRECISION_PLACEMENT[index], attention_dp_relax=False
+                    ),
+                    use_tqdm=False,
+                )
+                assert len(output.outputs) == 1
+                result = output.outputs[0]
+                assert len(result.token_ids) == 1
+                assert isinstance(result.generation_logits, torch.Tensor), (
+                    "Generation logits missing"
+                )
+                values = result.generation_logits.detach().float().cpu().clone()
+                assert values.numel() > 0, "Generation logits are empty"
+                assert torch.isfinite(values).all()
+                tokens.append(list(result.token_ids))
+                logits.append(values)
+            runs.append({"tokens": tokens, "logits": logits})
+    return runs
 
 
 @pytest.fixture
@@ -205,12 +163,16 @@ def dkv_gate_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
 
 
-@pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("model_name", _MODEL_NAMES, ids=["tiny-llama", "deepseek-v3-lite"])
-def test_dkv_aggregate_1000_steps(dkv_gate_environment, capfd, model_name: str) -> None:
-    from ..conftest import llm_models_root
+def _require_checkpoint(model: DkvModel) -> None:
+    if not Path(model.path()).is_dir():
+        pytest.skip(f"{model.pytest_id} checkpoint is not available at {model.path()}")
 
-    result = run_aggregate_soak(str(Path(llm_models_root()) / model_name))
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("model", MODELS, ids=MODEL_IDS)
+def test_dkv_aggregate_1000_steps(dkv_gate_environment, capfd, model: DkvModel) -> None:
+    _require_checkpoint(model)
+    result = run_aggregate_soak(model)
     assert result["forward_iterations"] >= 1000
     captured = capfd.readouterr()
     logs = captured.out + captured.err
@@ -220,14 +182,23 @@ def test_dkv_aggregate_1000_steps(dkv_gate_environment, capfd, model_name: str) 
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("model_name", _MODEL_NAMES, ids=["tiny-llama", "deepseek-v3-lite"])
-def test_dkv_sequential_precision(dkv_gate_environment, model_name: str) -> None:
-    from ..conftest import llm_models_root
+@pytest.mark.parametrize("model", PRECISION_MODELS, ids=[m.pytest_id for m in PRECISION_MODELS])
+def test_dkv_sequential_precision(dkv_gate_environment, model: DkvModel) -> None:
+    """DKV must match the ADP control on prompts that tell a wrong KV from a right one.
 
-    model_path = str(Path(llm_models_root()) / model_name)
-    prompts = [[1] + [42 + index] * (63 if index < 4 else 255) for index in range(8)]
-    control = run_precision_sample(model_path, dkv_enabled=False, prompts=prompts)
-    replay = run_precision_sample(model_path, dkv_enabled=False, prompts=prompts)
-    validate_adp_control(control, replay)
-    dkv = run_precision_sample(model_path, dkv_enabled=True, prompts=prompts)
-    compare_precision_runs(control, replay, dkv)
+    The prompts are real text of different lengths spread over both ranks, plus four sentences with
+    known answers. The ADP control must itself answer them, and different prompts must be far enough
+    apart that a request reading another request's KV could not pass.
+    """
+    _require_checkpoint(model)
+    tokenizer = PromptTokenizer(model.path())
+    prompts, answers = build_precision_prompts(tokenizer.encode, model.tokens_per_block)
+    control, replay = run_precision_passes(model, dkv_enabled=False, prompts=prompts, passes=2)
+    (dkv,) = run_precision_passes(model, dkv_enabled=True, prompts=prompts, passes=1)
+
+    policy = model.precision
+    result = compare_precision_runs(control, replay, dkv, policy)
+    assess_prompt_separation(control, result["mean_adp_self_tv"], policy)
+    assert_known_answers(control, answers, tokenizer.decode, "ADP control")
+    assert_known_answers(dkv, answers, tokenizer.decode, "DKV")
+    print(f"DKV precision {model.pytest_id}: {result}")
