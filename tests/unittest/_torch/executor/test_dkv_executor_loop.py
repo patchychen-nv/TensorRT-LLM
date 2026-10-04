@@ -22,6 +22,8 @@ _BUSY = [
     "update_resources",
 ]
 _IDLE = ["control", "schedule", "forward_batch"]
+# Recorded for observation only; they are not phases the loop enters.
+_OBSERVATIONS = {"free", "send", "errors"}
 
 
 def _arrivals(group_size: int, per_iteration: tuple[int, ...]) -> list[list[tuple[int, int, int]]]:
@@ -40,7 +42,8 @@ def _arrivals(group_size: int, per_iteration: tuple[int, ...]) -> list[list[tupl
 def _phases(run: RankRun) -> dict[int, list[str]]:
     by_iteration: dict[int, list[str]] = defaultdict(list)
     for iteration, name, _ in run.events:
-        by_iteration[iteration].append(name)
+        if name not in _OBSERVATIONS:
+            by_iteration[iteration].append(name)
     return by_iteration
 
 

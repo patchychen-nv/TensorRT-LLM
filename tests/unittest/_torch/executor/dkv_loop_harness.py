@@ -29,6 +29,8 @@ import torch
 from _torch.executor.kv_cache.test_dkv_scheduler import _PageManager, _scheduler
 from dkv_test_utils import LockstepTpGroup, make_request
 
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.dkv import DkvInvariantChecker
 from tensorrt_llm._torch.pyexecutor.llm_request import FinishReason, LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -48,6 +50,8 @@ class LoopPages(_PageManager):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.freed: list[int] = []
+        self.released_index_slots: list[int] = []
+        self.on_free = None
 
     def add_dummy_requests(
         self, request_ids, token_nums=None, *, is_gen: bool, prepare_resource: bool
@@ -71,10 +75,12 @@ class LoopPages(_PageManager):
 
     def free_resources(self, request: LlmRequest, *args, **kwargs) -> None:
         self.freed.append(request.py_request_id)
+        if self.on_free is not None:
+            self.on_free(request.py_request_id)
         super().free_resources(request)
 
     def release_index_slot(self, request_id: int) -> None:
-        pass
+        self.released_index_slots.append(request_id)
 
     def consume_dkv_trace(self) -> list:
         trace, self.trace = self.trace, []
@@ -147,6 +153,10 @@ class LoopScript:
     leak: tuple[int, int] | None = None
     # A sampler failure is charged to the error budget of the failing rank as fatal.
     fatal_budget: bool = False
+    # Requests that only prefill and then send their KV; the owner's transceiver reports the
+    # transfer complete from this iteration on.
+    context_only: set[int] = field(default_factory=set)
+    transfer_done_iteration: int = 0
 
 
 @dataclass
@@ -157,10 +167,49 @@ class RankRun:
     emitted: list[tuple[int, int]] = field(default_factory=list)
     errors: list[tuple[str, tuple[int, ...]]] = field(default_factory=list)
     pages: LoopPages | None = None
+    sends: list[int] = field(default_factory=list)
+    status_polls: int = 0
     initial_pages: int = 0
     final_pages: int = 0
     executor: PyExecutor | None = None
     group: LockstepTpGroup | None = None
+
+
+def _attach_transceiver(executor: PyExecutor, script: LoopScript, run: RankRun, record) -> None:
+    """Context-only requests send through a mock transceiver and the real coordinator.
+
+    Only the owner's transceiver is ever asked to send or to report status; its transfers
+    complete from ``script.transfer_done_iteration`` on.
+    """
+
+    def status(at_least: int) -> CtxTransferStatus:
+        run.status_polls += 1
+        if executor.iter_counter < script.transfer_done_iteration:
+            return CtxTransferStatus([], [])
+        in_transfer = executor.async_transfer_manager.requests_in_transfer()
+        return CtxTransferStatus([rid for rid in run.sends if rid in in_transfer], [])
+
+    def send(request: LlmRequest) -> None:
+        run.sends.append(request.py_request_id)
+        record("send", request.py_request_id)
+        # A real transceiver attaches the context phase parameters that the response carries.
+        request.create_response = Mock(return_value=SimpleNamespace(result=SimpleNamespace()))
+
+    executor.kv_cache_transceiver = Mock(
+        kv_transfer_timeout_ms=60000,
+        pipeline_transfer_enabled=False,
+        supports_inflight_cancellation=False,
+        check_context_transfer_status=Mock(side_effect=status),
+        has_retired_send_session=Mock(return_value=False),
+        cancel_request=Mock(return_value=True),
+        respond_and_send_async=Mock(side_effect=send),
+    )
+    # KVCacheManagerV2 has no store-and-pin, so production runs the manager without storing blocks;
+    # the page manager has no such methods, so a call would fail the test.
+    executor.async_transfer_manager = AsyncTransferManager(
+        executor.resource_manager, should_store_blocks=False
+    )
+    executor.__dict__.pop("_disagg_coordinator", None)
 
 
 def build_loop_executor(dist, script: LoopScript, run: RankRun) -> PyExecutor:
@@ -255,6 +304,10 @@ def build_loop_executor(dist, script: LoopScript, run: RankRun) -> PyExecutor:
     def record(name: str, value=None):
         run.events.append((executor.iter_counter, name, value))
 
+    pages.on_free = lambda request_id: record("free", request_id)
+    if script.context_only:
+        _attach_transceiver(executor, script, run, record)
+
     def ids(batch: ScheduledRequests) -> list[tuple[int, bool]]:
         return [(req.py_request_id, req.is_dummy) for req in batch.all_requests()]
 
@@ -274,7 +327,11 @@ def build_loop_executor(dist, script: LoopScript, run: RankRun) -> PyExecutor:
         for request_id, owner, length in arrivals:
             executor.active_requests.append(
                 make_request(
-                    request_id, compute_rank=owner, local_rank=dist.tp_rank, prompt_len=length
+                    request_id,
+                    compute_rank=owner,
+                    local_rank=dist.tp_rank,
+                    prompt_len=length,
+                    context_only=request_id in script.context_only,
                 )
             )
         batch, _, _ = real_schedule()

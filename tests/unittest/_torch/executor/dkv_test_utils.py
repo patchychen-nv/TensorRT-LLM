@@ -29,7 +29,7 @@ from utils.collectives import run_concurrent
 
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType, SamplingConfig
 
 _Result = TypeVar("_Result")
 
@@ -41,6 +41,7 @@ def make_request(
     local_rank: int = 0,
     prompt_len: int = 8,
     is_dummy: bool = False,
+    context_only: bool = False,
 ) -> LlmRequest:
     """Build a request with concrete DKV tags and no CUDA allocations."""
     request = LlmRequest(
@@ -49,6 +50,11 @@ def make_request(
         max_new_tokens=1,
         sampling_config=SamplingConfig(1),
         is_streaming=False,
+        llm_request_type=(
+            LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
+            if context_only
+            else LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION
+        ),
     )
     request.py_dkv_compute_rank = compute_rank
     request.py_dkv_is_local = compute_rank == local_rank
