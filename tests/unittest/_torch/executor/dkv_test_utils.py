@@ -131,7 +131,15 @@ class LockstepTpGroup:
                 self.abort(self._diagnostic(f"Rank {rank} finished with an unmatched collective"))
 
     def run(self, fn: Callable[["LockstepDistributed"], _Result]) -> list[_Result]:
-        """Run rank callbacks and abort collective waits when a peer fails."""
+        """Run rank callbacks and abort collective waits when a peer fails.
+
+        A detected inconsistency fails the run even when the code under test swallows the
+        exception that reported it, and a group that failed once cannot be reused.
+        """
+        if self._error is not None:
+            raise RuntimeError("This lockstep group already failed; build a new group") from (
+                self._error
+            )
         self._finished.clear()
 
         def worker(dist: LockstepDistributed) -> _Result:
@@ -144,7 +152,10 @@ class LockstepTpGroup:
             finally:
                 self._finish(dist.tp_rank)
 
-        return run_concurrent(self.ranks, worker, timeout=self.timeout + 2, on_error=self.abort)
+        results = run_concurrent(self.ranks, worker, timeout=self.timeout + 2, on_error=self.abort)
+        if self._error is not None:
+            raise self._error
+        return results
 
 
 class LockstepDistributed:

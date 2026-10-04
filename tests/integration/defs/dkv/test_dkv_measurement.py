@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Observe metadata reuse without making Option B output-accuracy assertions."""
+"""Observe metadata reuse without making DKV output-accuracy assertions."""
 
 from pathlib import Path
 
@@ -10,9 +10,7 @@ import torch
 from .dkv_measurement_runner import run_measurement_gate
 
 
-@pytest.mark.post_merge
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.timeout(3600)
 def test_dkv_prefix_measurement_validity(tmp_path: Path) -> None:
     from ..conftest import llm_models_root
 

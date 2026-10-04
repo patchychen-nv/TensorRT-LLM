@@ -32,8 +32,9 @@ from types import SimpleNamespace
 
 from utils.collectives import ThreadSafeDistributed, run_concurrent
 
-# Preserve an explicit UCX_NET_DEVICES selection: the test runner can pin an
-# interface that is reachable from the container's network namespace.
+# Do not inherit a NIC pin from the host: the selected interface may not exist
+# in the test container and would prevent the NIXL agent from initializing.
+os.environ.pop("UCX_NET_DEVICES", None)
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).

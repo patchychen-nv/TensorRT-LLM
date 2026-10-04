@@ -14,7 +14,6 @@ from tensorrt_llm.scheduling_params import SchedulingParams
 from ..conftest import llm_models_root
 
 
-@pytest.mark.post_merge
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize(
     "dkv_enabled,enable_block_reuse",
@@ -29,7 +28,7 @@ from ..conftest import llm_models_root
 def test_dkv_replicated_admission(
     monkeypatch, capfd, dkv_enabled: bool, enable_block_reuse: bool, model_name: str
 ) -> None:
-    """C0-C3 remain aligned through admission, retirement, and warm-prefix reuse."""
+    """Replicated state stays aligned through admission, retirement, and warm-prefix reuse."""
     if torch.cuda.device_count() < 2:
         pytest.skip("DKV admission needs two GPUs")
     monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")

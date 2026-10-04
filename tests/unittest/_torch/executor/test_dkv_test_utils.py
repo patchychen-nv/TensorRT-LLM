@@ -134,6 +134,22 @@ def test_worker_failure_unblocks_peers_and_preserves_original_error() -> None:
     assert set(threading.enumerate()) == before
 
 
+def test_swallowed_mismatch_still_fails_the_run_and_poisons_the_group() -> None:
+    group = LockstepTpGroup(2)
+
+    def swallow(dist: LockstepDistributed) -> str:
+        try:
+            dist.tp_allgather_int64([0] * (dist.tp_rank + 1))
+        except AssertionError:
+            return "swallowed"
+        return "ok"
+
+    with pytest.raises(AssertionError, match="Collective sequence mismatch"):
+        group.run(swallow)
+    with pytest.raises(RuntimeError, match="already failed"):
+        group.run(lambda dist: dist.tp_allgather(0))
+
+
 def test_integer_collective_shape_must_match() -> None:
     with pytest.raises(AssertionError, match="Collective sequence mismatch"):
         LockstepTpGroup(2).run(lambda dist: dist.tp_allgather_int64([0] * (dist.tp_rank + 1)))
@@ -141,8 +157,12 @@ def test_integer_collective_shape_must_match() -> None:
 
 def test_shared_transfer_harness_keeps_real_rank_payloads() -> None:
     shared = {"barrier": threading.Barrier(2), "lock": threading.Lock()}
-    ranks = [ThreadSafeDistributed(rank, 2, 2, 1, rank, 0, shared) for rank in range(2)]
-    assert run_concurrent(ranks, lambda dist: dist.tp_allgather(dist.rank)) == [[0, 1], [0, 1]]
+    ranks = [
+        ThreadSafeDistributed(rank, 2, 2, 1, rank, 0, shared, barrier_timeout=10)
+        for rank in range(2)
+    ]
+    result = run_concurrent(ranks, lambda dist: dist.tp_allgather(dist.rank), timeout=15)
+    assert result == [[0, 1], [0, 1]]
 
 
 def test_shared_transfer_harness_independent_tp_pp_cp_groups() -> None:
@@ -163,6 +183,7 @@ def test_shared_transfer_harness_independent_tp_pp_cp_groups() -> None:
             shared,
             cp_rank=rank % 2,
             cp_size=2,
+            barrier_timeout=10,
         )
         for rank in range(8)
     ]
@@ -174,7 +195,7 @@ def test_shared_transfer_harness_independent_tp_pp_cp_groups() -> None:
             tp = dist.tp_allgather(dist.rank)
         return pp, tp
 
-    for rank, (pp, tp) in enumerate(run_concurrent(ranks, exchange)):
+    for rank, (pp, tp) in enumerate(run_concurrent(ranks, exchange, timeout=15)):
         assert pp == [rank % 4, rank % 4 + 4]
         assert tp == [(rank // 4) * 4 + rank % 2, (rank // 4) * 4 + rank % 2 + 2]
 

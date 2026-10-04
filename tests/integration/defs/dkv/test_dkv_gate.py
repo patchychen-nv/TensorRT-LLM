@@ -205,7 +205,6 @@ def dkv_gate_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
 
 
-@pytest.mark.post_merge
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("model_name", _MODEL_NAMES, ids=["tiny-llama", "deepseek-v3-lite"])
 def test_dkv_aggregate_1000_steps(dkv_gate_environment, capfd, model_name: str) -> None:
@@ -220,7 +219,6 @@ def test_dkv_aggregate_1000_steps(dkv_gate_environment, capfd, model_name: str) 
     assert "exceeds expected_num_active_requests" not in logs
 
 
-@pytest.mark.post_merge
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("model_name", _MODEL_NAMES, ids=["tiny-llama", "deepseek-v3-lite"])
 def test_dkv_sequential_precision(dkv_gate_environment, model_name: str) -> None:

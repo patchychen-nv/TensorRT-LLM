@@ -10,9 +10,7 @@ import torch
 from .dkv_transfer_runner import run_transfer_gate
 
 
-@pytest.mark.post_merge
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.timeout(3000)
 def test_dkv_context_transfer_precision_and_timeouts(tmp_path: Path) -> None:
     from ..conftest import llm_models_root
 

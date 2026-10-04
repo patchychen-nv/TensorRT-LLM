@@ -148,7 +148,6 @@ def run_aggregate_faults(
     }
 
 
-@pytest.mark.post_merge
 @pytest.mark.threadleak(enabled=False)
 def test_dkv_aggregate_sampler_failure_and_cancel(monkeypatch, tmp_path: Path) -> None:
     from ..conftest import llm_models_root
