@@ -266,6 +266,83 @@ def test_noisy_policy_tolerates_a_token_flip_inside_the_top_two_margin() -> None
     assert result["decisive_prompts"] <= _PROMPTS - 1
 
 
+_POSITIONS = 4
+
+
+def _continuation_run(base: torch.Tensor, noise: float, seed: int) -> dict:
+    """Runs of several generated tokens per prompt: ``base`` is [prompts, positions, vocabulary]."""
+    generator = torch.Generator().manual_seed(seed)
+    logits = base + noise * torch.randn(base.shape, generator=generator)
+    return {
+        "tokens": [[int(row.argmax()) for row in prompt] for prompt in logits],
+        "logits": list(logits),
+    }
+
+
+def _continuation_runs(noise: float = 0.001) -> tuple[dict, dict, dict]:
+    generator = torch.Generator().manual_seed(0)
+    base = torch.randn(_PROMPTS, _POSITIONS, _VOCABULARY, generator=generator) * 5
+    return tuple(_continuation_run(base, noise, seed) for seed in (1, 2, 3))
+
+
+def _make_near_tie(run: dict, prompt: int, position: int, winner: int) -> None:
+    """Make two tokens of one position nearly equal and let ``winner`` take the argmax."""
+    logits = run["logits"][prompt].clone()
+    top = logits[position].max()
+    logits[position, :2] = torch.tensor([top + 0.05 * (winner == 0), top + 0.05 * (winner == 1)])
+    run["logits"][prompt] = logits
+    run["tokens"][prompt][position] = winner
+
+
+def test_softmax_distance_averages_over_the_generated_positions() -> None:
+    first = torch.tensor([[4.0, 0.0], [0.0, 4.0]])
+    second = torch.tensor([[4.0, 0.0], [4.0, 0.0]])
+    expected = 0.5 * _POLICY.softmax_distance(first[1:], second[1:])
+    assert _POLICY.softmax_distance(first, second) == pytest.approx(expected)
+
+
+def test_noisy_policy_compares_every_position_of_a_continuation_that_agrees() -> None:
+    control, replay, dkv = _continuation_runs()
+    result = _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+    assert result["compared_positions"] == _PROMPTS * _POSITIONS
+    assert result["decisive_positions"] >= _PROMPTS * _POSITIONS // 2
+    assert result["mean_extra_tv"] < _POLICY.NOISY_POLICY.max_mean_extra_tv
+
+
+def test_noisy_policy_stops_comparing_after_a_flip_inside_the_top_two_margin() -> None:
+    control, replay, dkv = _continuation_runs()
+    for run, winner in ((control, 0), (replay, 1), (dkv, 0)):
+        _make_near_tie(run, prompt=2, position=1, winner=winner)
+    # Once the runs chose different tokens, the later positions answer different questions.
+    generator = torch.Generator().manual_seed(9)
+    dkv["logits"][2][2:] = torch.randn(_POSITIONS - 2, _VOCABULARY, generator=generator) * 5
+    dkv["tokens"][2][2:] = [int(row.argmax()) for row in dkv["logits"][2][2:]]
+    result = _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+    assert result["compared_positions"] == _PROMPTS * _POSITIONS - (_POSITIONS - 2)
+
+
+def test_noisy_policy_rejects_a_decisive_flip_at_a_later_position() -> None:
+    control, replay, dkv = _continuation_runs()
+    margins = _POLICY.top_two_margins(dkv["logits"][5])
+    position = int((margins >= _POLICY.NOISY_POLICY.min_margin).nonzero()[-1])
+    assert position > 0
+    dkv["tokens"][5][position] = int(dkv["logits"][5][position].topk(2).indices[1])
+    with pytest.raises(AssertionError, match=f"decisive top-two margin at position {position}"):
+        _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+
+
+def test_noisy_policy_rejects_extra_distance_over_a_whole_continuation() -> None:
+    control, replay, dkv = _continuation_runs()
+    shifted = dkv["logits"][4].clone()
+    for position in range(_POSITIONS):
+        # Keep the argmax but move half of the probability mass to the runner-up.
+        runner_up = int(shifted[position].topk(2).indices[1])
+        shifted[position, runner_up] = shifted[position, dkv["tokens"][4][position]] - 0.01
+    dkv["logits"][4] = shifted
+    with pytest.raises(AssertionError, match="differs from ADP"):
+        _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
+
+
 def test_noisy_policy_needs_enough_decisive_prompts_to_compare_tokens() -> None:
     base = torch.zeros(_PROMPTS, _VOCABULARY)
     base[:, 0] = 0.1
@@ -320,6 +397,16 @@ def test_prompt_set_is_discriminating_and_has_no_shared_leading_block(
     # Both ranks see consecutive requests as well as alternation.
     assert any(a == b for a, b in zip(_POLICY.PRECISION_PLACEMENT, _POLICY.PRECISION_PLACEMENT[1:]))
     assert any(a != b for a, b in zip(_POLICY.PRECISION_PLACEMENT, _POLICY.PRECISION_PLACEMENT[1:]))
+
+
+def test_burst_prompts_have_the_requested_lengths_and_unique_leading_blocks() -> None:
+    lengths = (64, 256, 700)
+    prompts = _POLICY.build_burst_prompts(_word_encode, 20, lengths)
+    assert [len(prompt) for prompt in prompts] == [lengths[i % 3] for i in range(20)]
+    assert len({tuple(prompt[:32]) for prompt in prompts}) == 20
+    _POLICY.validate_precision_inputs(
+        enable_block_reuse=True, tokens_per_block=32, enable_partial_reuse=False, prompts=prompts
+    )
 
 
 def test_known_answers_detect_a_degraded_control() -> None:

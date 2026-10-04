@@ -17,6 +17,9 @@ from pathlib import Path
 if __package__:
     from .dkv_models import make_dkv_llm
     from .dkv_precision import (
+        EXACT_POLICY,
+        NOISY_POLICY,
+        PrecisionPolicy,
         compare_precision_runs,
         validate_adp_control,
         validate_precision_inputs,
@@ -24,10 +27,25 @@ if __package__:
 else:
     from dkv_models import make_dkv_llm
     from dkv_precision import (
+        EXACT_POLICY,
+        NOISY_POLICY,
+        PrecisionPolicy,
         compare_precision_runs,
         validate_adp_control,
         validate_precision_inputs,
     )
+
+# The two requests that follow the timeout and cancellation injections prove the pool still works.
+_TAIL_REQUESTS = 2
+# Loading a large model twice, once per worker pair, takes most of this.
+_PAIR_TIMEOUT_S = 1800
+
+
+def _repeated_token_prompts() -> list[list[int]]:
+    """Four requests before the injections and two after them, each of one repeated token."""
+    return [[1] + [42 + index] * 255 for index in range(4)] + [
+        [1] + [56 + rank] * 255 for rank in range(_TAIL_REQUESTS)
+    ]
 
 
 def _wait(path: Path, timeout: float = 120) -> None:
@@ -60,7 +78,10 @@ def _llm(options: dict, *, context: bool):
         options["model"],
         dkv=context and options["dkv"],
         tokens_per_block=options["tokens_per_block"],
-        moe_config=MoeConfig(backend=options["moe_backend"]),
+        moe_config=MoeConfig(
+            backend=options["moe_backend"],
+            disable_finalize_fusion=options["disable_finalize_fusion"],
+        ),
         attention_dp=context,
         gather_logits=True,
         enable_iter_perf_stats=False,
@@ -129,8 +150,9 @@ def _context_worker(options: dict, directory: Path) -> None:
     generation_index = 0
     timeout_ids = []
 
+    prompts = options["prompts"] or _repeated_token_prompts()
     with _llm(options, context=True) as llm:
-        _wait(directory / "generation-ready", timeout=600)
+        _wait(directory / "generation-ready", timeout=1200)
 
         def submit(prompt, rank):
             return llm.generate_async(
@@ -165,8 +187,8 @@ def _context_worker(options: dict, directory: Path) -> None:
             wait_for_free(params.ctx_request_id)
             generation_index += 1
 
-        for index in range(4):
-            complete([1] + [42 + index] * 255, index % 2)
+        for index, prompt in enumerate(prompts[:-_TAIL_REQUESTS]):
+            complete(prompt, index % 2)
 
         if options["dkv"]:
             # The context reply is deliberately delivered without forwarding its KV metadata.
@@ -190,8 +212,8 @@ def _context_worker(options: dict, directory: Path) -> None:
             timeout_ids.append(cancel_id)
             wait_for_free(cancel_id)
 
-        for rank in range(2):
-            complete([1] + [56 + rank] * 255, rank)
+        for rank, prompt in enumerate(prompts[-_TAIL_REQUESTS:]):
+            complete(prompt, rank)
 
     torch.save(outputs, directory / "outputs.pt")
     (directory / "context-result.json").write_text(
@@ -232,7 +254,11 @@ def validate_transfer_traces(directory: Path) -> dict:
     assert baselines[0]["free_pages"] == baselines[1]["free_pages"]
     baseline = baselines[0]
     expected_ids = set(expected["context_ids"])
-    assert len(expected_ids) == 8
+    # Every prompt completes through generation; the timeout and the cancellation add one each.
+    prompt_count = len(options["prompts"] or _repeated_token_prompts())
+    assert expected["generated"] == prompt_count
+    assert len(expected["timeout_ids"]) == 2
+    assert len(expected_ids) == prompt_count + len(expected["timeout_ids"])
     for kind in ("release_index", "start", "commit", "free"):
         for rank in range(2):
             counts = Counter(row["request_id"] for row in by_kind[kind] if row["rank"] == rank)
@@ -370,7 +396,7 @@ def _run_pair(options: dict, directory: Path) -> None:
                     start_new_session=True,
                 )
             )
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + _PAIR_TIMEOUT_S
         while any(process.poll() is None for process in processes):
             failed = [
                 process.returncode for process in processes if process.poll() not in (None, 0)
@@ -378,7 +404,9 @@ def _run_pair(options: dict, directory: Path) -> None:
             if failed:
                 raise RuntimeError(f"DKV transfer worker failed ({failed}); logs: {directory}")
             if time.monotonic() > deadline:
-                raise TimeoutError(f"DKV transfer pair exceeded 900 seconds; logs: {directory}")
+                raise TimeoutError(
+                    f"DKV transfer pair exceeded {_PAIR_TIMEOUT_S} seconds; logs: {directory}"
+                )
             time.sleep(0.2)
         assert all(process.returncode == 0 for process in processes)
     finally:
@@ -409,10 +437,17 @@ def run_transfer_gate(
     *,
     mode: str = "precision",
     moe_backend: str = "CUTLASS",
+    disable_finalize_fusion: bool = False,
     tokens_per_block: int = 32,
     transfer_timeout_ms: int = 15000,
+    policy: PrecisionPolicy = EXACT_POLICY,
+    prompts: list[list[int]] | None = None,
 ) -> dict:
-    """Run real NIXL transfers; precision requires an independently repeated ADP control."""
+    """Run real NIXL transfers; precision requires an independently repeated ADP control.
+
+    ``prompts`` replaces the default repeated-token requests; the last two run after the timeout
+    and cancellation injections. ``policy`` decides how closely DKV must match the ADP control.
+    """
     import torch
 
     directory = Path(work_dir).resolve()
@@ -420,8 +455,10 @@ def run_transfer_gate(
     options = {
         "model": model,
         "moe_backend": moe_backend,
+        "disable_finalize_fusion": disable_finalize_fusion,
         "tokens_per_block": tokens_per_block,
         "transfer_timeout_ms": transfer_timeout_ms,
+        "prompts": prompts,
     }
     runs = [("adp-control", False), ("adp-replay", False)] if mode == "precision" else []
     runs.append(("dkv", True))
@@ -430,6 +467,7 @@ def run_transfer_gate(
             validate_adp_control(
                 torch.load(directory / "adp-control" / "outputs.pt", weights_only=True),
                 torch.load(directory / "adp-replay" / "outputs.pt", weights_only=True),
+                policy,
             )
         _run_pair({**options, "dkv": enabled}, directory / name)
     summary = {"lifecycle": validate_transfer_traces(directory / "dkv"), "precision": "not_run"}
@@ -437,13 +475,14 @@ def run_transfer_gate(
         control, replay, actual = [
             torch.load(directory / name / "outputs.pt", weights_only=True) for name, _ in runs
         ]
-        assert len(control["logits"]) == len(replay["logits"]) == len(actual["logits"]) == 6
-        comparison = compare_precision_runs(control, replay, actual)
+        expected = len(prompts or _repeated_token_prompts())
+        assert len(control["logits"]) == len(replay["logits"]) == len(actual["logits"]) == expected
+        comparison = compare_precision_runs(control, replay, actual, policy)
         summary["precision"] = {
             **comparison,
             "status": "passed",
             "tokens_per_request": 8,
-            "bitwise": comparison["bitwise_adp_control"],
+            "bitwise": comparison.get("bitwise_adp_control", False),
         }
     (directory / "result.json").write_text(json.dumps(summary, indent=2))
     return summary
@@ -455,8 +494,20 @@ def main() -> None:
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--mode", choices=("precision", "lifecycle"), default="precision")
     parser.add_argument("--moe-backend", default="CUTLASS")
+    parser.add_argument("--disable-finalize-fusion", action="store_true")
     parser.add_argument("--tokens-per-block", type=int, default=32)
     parser.add_argument("--transfer-timeout-ms", type=int, default=15000)
+    parser.add_argument(
+        "--policy",
+        choices=("exact", "noisy"),
+        default="exact",
+        help="noisy judges DKV against the run-to-run noise of the ADP control",
+    )
+    parser.add_argument(
+        "--natural-prompts",
+        action="store_true",
+        help="use the discriminating text prompts instead of repeated tokens",
+    )
     parser.add_argument("--role", choices=("context", "generation"))
     parser.add_argument("--options")
     args = parser.parse_args()
@@ -467,6 +518,18 @@ def main() -> None:
     else:
         if not args.model:
             parser.error("--model is required for a gate run")
+        prompts = None
+        if args.natural_prompts:
+            if __package__:
+                from .dkv_models import PromptTokenizer
+                from .dkv_precision import build_precision_prompts
+            else:
+                from dkv_models import PromptTokenizer
+                from dkv_precision import build_precision_prompts
+
+            prompts, _ = build_precision_prompts(
+                PromptTokenizer(args.model).encode, args.tokens_per_block
+            )
         print(
             json.dumps(
                 run_transfer_gate(
@@ -474,8 +537,11 @@ def main() -> None:
                     args.work_dir,
                     mode=args.mode,
                     moe_backend=args.moe_backend,
+                    disable_finalize_fusion=args.disable_finalize_fusion,
                     tokens_per_block=args.tokens_per_block,
                     transfer_timeout_ms=args.transfer_timeout_ms,
+                    policy=NOISY_POLICY if args.policy == "noisy" else EXACT_POLICY,
+                    prompts=prompts,
                 ),
                 indent=2,
             )

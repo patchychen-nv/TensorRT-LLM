@@ -51,13 +51,16 @@ def test_dkv_replicated_admission(
         tokens_per_block=block,
         moe_config=model.moe_config(),
         reuse=enable_block_reuse,
+        # The reuse variant checks hit counts, not outputs, so partial-block matches stay enabled.
+        kv_cache={"enable_partial_reuse": True} if enable_block_reuse else None,
         enable_iter_perf_stats=False,
     ) as llm:
         for iteration in range(8):
-            # With reuse the prompts repeat and span a full block beyond the one token a match
-            # always leaves uncached; without it every prompt is new and shorter than two blocks.
+            # With reuse the prompts repeat and cover three blocks, so two full blocks can match
+            # whatever the model's cache layout asks of a reusable prefix; without it every prompt
+            # is new, so nothing can match.
             prompts = (
-                [[1] + [42 + index] * (2 * block - 1) for index in range(4)]
+                [[1] + [42 + index] * (3 * block - 1) for index in range(4)]
                 if enable_block_reuse
                 else [[1] + [42 + iteration * 4 + index] * 63 for index in range(4)]
             )

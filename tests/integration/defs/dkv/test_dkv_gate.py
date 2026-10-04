@@ -22,6 +22,7 @@ from .dkv_precision import (
     compare_precision_runs,
     validate_precision_inputs,
 )
+from .dkv_stats import pool_free_pages
 
 
 def _llm(model: DkvModel, *, dkv_enabled: bool, logits: bool):
@@ -56,6 +57,25 @@ def _drain_stats(llm, stats: list[dict], expected_contexts: int) -> None:
         if contexts == expected_contexts:
             return
     pytest.fail(f"Iteration stats did not account for {expected_contexts} sequential requests")
+
+
+def _assert_replicas_agree_on_free_pages(stats: list[dict], *, expected_iterations: int) -> None:
+    """Compare each rank's own free pages, which the kvCacheStats of an attention-DP row cannot."""
+    by_iteration: dict[int, dict[int, int]] = defaultdict(dict)
+    for row in stats:
+        snapshot = row.get("dkvMeasurement")
+        if snapshot is not None:
+            by_iteration[row["iter"]][snapshot["rank"]] = pool_free_pages(snapshot)
+    group = {rank for free in by_iteration.values() for rank in free}
+    assert group == {0, 1}, f"Per-rank KV snapshots were exported for ranks {sorted(group)}"
+    complete = {iteration: free for iteration, free in by_iteration.items() if set(free) == group}
+    assert len(complete) >= expected_iterations, (
+        f"Only {len(complete)} of {expected_iterations} iterations reported every rank's pools"
+    )
+    for iteration, free in complete.items():
+        assert len(set(free.values())) == 1, (
+            f"Replicas disagree on free pages at {iteration}: {free}"
+        )
 
 
 def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000) -> dict:
@@ -105,6 +125,7 @@ def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000) -> dict:
     assert all(free == baseline for free in free_pages), (
         f"KV pages did not return to baseline {baseline}: {free_pages}"
     )
+    _assert_replicas_agree_on_free_pages(stats, expected_iterations=iterations + 1)
     return {
         "requests": len(request_ids),
         "forward_iterations": len(by_iteration),
@@ -170,8 +191,12 @@ def _require_checkpoint(model: DkvModel) -> None:
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("model", MODELS, ids=MODEL_IDS)
-def test_dkv_aggregate_1000_steps(dkv_gate_environment, capfd, model: DkvModel) -> None:
+def test_dkv_aggregate_1000_steps(
+    dkv_gate_environment, monkeypatch, capfd, model: DkvModel
+) -> None:
     _require_checkpoint(model)
+    # Per-rank pool snapshots let the soak compare the replicas' own free pages.
+    monkeypatch.setenv("TRTLLM_DKV_MEASUREMENT", "1")
     result = run_aggregate_soak(model)
     assert result["forward_iterations"] >= 1000
     captured = capfd.readouterr()

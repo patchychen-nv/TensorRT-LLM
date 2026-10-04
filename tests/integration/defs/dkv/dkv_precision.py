@@ -29,9 +29,11 @@ class PrecisionPolicy:
 
     A model whose ADP runs differ from each other (``noisy=True``) is judged against its own
     run-to-run noise. Tokens must agree wherever the top-two logit margin is at least ``min_margin``,
-    because a flip is expected only where that gap is inside the noise. The total-variation (TV)
-    distance of the softmax distributions between DKV and ADP may exceed the ADP run-to-run distance
-    by at most ``max_mean_extra_tv`` on average and ``max_prompt_extra_tv`` for any single prompt.
+    because a flip is expected only where that gap is inside the noise. A continuation of several
+    tokens is compared up to the first position where the three runs choose different tokens, since
+    later positions no longer share a prefix. The total-variation (TV) distance of the softmax
+    distributions between DKV and ADP may exceed the ADP run-to-run distance by at most
+    ``max_mean_extra_tv`` on average and ``max_prompt_extra_tv`` for any single prompt.
     """
 
     name: str
@@ -145,16 +147,28 @@ def validate_adp_control(
 
 
 def softmax_distance(first: torch.Tensor, second: torch.Tensor) -> float:
-    """Total-variation distance between the softmax distributions of two logit tensors."""
-    left = first.double().softmax(-1).flatten()
-    right = second.double().softmax(-1).flatten()
-    return 0.5 * (left - right).abs().sum().item()
+    """Total-variation distance of two [positions, vocabulary] logit tensors, per-position mean."""
+    left = first.double().softmax(-1)
+    right = second.double().softmax(-1)
+    return (0.5 * (left - right).abs().sum(-1)).mean().item()
 
 
-def top_two_margin(logits: torch.Tensor) -> float:
-    """Gap between the largest two logits of the first generated token."""
-    top = logits[0].flatten().topk(2).values
-    return float(top[0] - top[1])
+def top_two_margins(logits: torch.Tensor) -> torch.Tensor:
+    """Gap between the largest two logits at every generated position."""
+    top = logits.topk(2, dim=-1).values
+    return top[:, 0] - top[:, 1]
+
+
+def _comparable_length(*token_runs: Sequence[int]) -> int:
+    """Leading positions whose logits the runs computed from the same prefix.
+
+    Once two runs choose different tokens, their later positions answer different questions, so
+    only the positions up to and including the first disagreement can be compared.
+    """
+    for position in range(len(token_runs[0])):
+        if len({tokens[position] for tokens in token_runs}) > 1:
+            return position + 1
+    return len(token_runs[0])
 
 
 def assess_prompt_separation(run: PrecisionRun, noise: float, policy: PrecisionPolicy) -> dict:
@@ -182,9 +196,11 @@ def assess_prompt_separation(run: PrecisionRun, noise: float, policy: PrecisionP
 def _paired_tv_summary(control: PrecisionRun, replay: PrecisionRun, dkv: PrecisionRun) -> dict:
     self_distances = []
     extra_distances = []
-    for first, second, actual in zip(
-        control["logits"], replay["logits"], dkv["logits"], strict=True
-    ):
+    for index in range(len(control["logits"])):
+        length = _comparable_length(
+            control["tokens"][index], replay["tokens"][index], dkv["tokens"][index]
+        )
+        first, second, actual = (run["logits"][index][:length] for run in (control, replay, dkv))
         self_distance = softmax_distance(first, second)
         cross = (softmax_distance(first, actual) + softmax_distance(second, actual)) / 2
         self_distances.append(self_distance)
@@ -206,19 +222,31 @@ def _compare_noisy(
         f"ADP control is noisier than the policy allows: mean TV {summary['mean_adp_self_tv']:.4f}"
     )
     runs = (control, replay, dkv)
-    decisive = [
-        index
-        for index in range(len(control["logits"]))
-        if min(top_two_margin(run["logits"][index]) for run in runs) >= policy.min_margin
-    ]
-    assert len(decisive) >= policy.min_decisive_fraction * len(control["logits"]), (
-        f"Only {len(decisive)} of {len(control['logits'])} prompts have a top-two margin of at "
-        f"least {policy.min_margin}; the gate cannot compare tokens"
-    )
-    for index in decisive:
-        assert control["tokens"][index] == replay["tokens"][index] == dkv["tokens"][index], (
-            f"Prompt {index} has a decisive top-two margin but generated different tokens"
+    compared_positions = 0
+    decisive_positions = 0
+    decisive_prompts = 0
+    for index in range(len(control["logits"])):
+        tokens = [run["tokens"][index] for run in runs]
+        length = _comparable_length(*tokens)
+        # The smallest top-two gap any run saw at each compared position.
+        margins = (
+            torch.stack([top_two_margins(run["logits"][index][:length]) for run in runs])
+            .min(dim=0)
+            .values
         )
+        flipped = len({sequence[length - 1] for sequence in tokens}) > 1
+        assert not flipped or margins[-1] < policy.min_margin, (
+            f"Prompt {index} has a decisive top-two margin at position {length - 1} but generated "
+            "different tokens"
+        )
+        decided = int((margins >= policy.min_margin).sum())
+        compared_positions += length
+        decisive_positions += decided
+        decisive_prompts += decided == length
+    assert decisive_positions >= policy.min_decisive_fraction * compared_positions, (
+        f"Only {decisive_positions} of {compared_positions} compared positions have a top-two "
+        f"margin of at least {policy.min_margin}; the gate cannot compare tokens"
+    )
     assert summary["mean_extra_tv"] <= policy.max_mean_extra_tv, (
         f"DKV differs from ADP by {summary['mean_extra_tv']:.4f} more than ADP differs from itself"
     )
@@ -229,7 +257,9 @@ def _compare_noisy(
     return {
         "requests": len(control["tokens"]),
         "comparison": "noise_envelope",
-        "decisive_prompts": len(decisive),
+        "compared_positions": compared_positions,
+        "decisive_positions": decisive_positions,
+        "decisive_prompts": decisive_prompts,
         **{key: value for key, value in summary.items() if key != "extra_tv_by_prompt"},
     }
 
@@ -360,6 +390,25 @@ def build_precision_prompts(
     )
     assert len(prompts) == len(PRECISION_PLACEMENT)
     return prompts, answers
+
+
+def build_burst_prompts(
+    encode: Callable[[str, bool], list[int]], count: int, lengths: Sequence[int]
+) -> list[list[int]]:
+    """Distinct natural-text prompts of the given token lengths, cycling through ``lengths``.
+
+    Every prompt starts with a unique tag, so no two prompts share a leading block.
+    """
+    prompts = []
+    for index in range(count):
+        length = lengths[index % len(lengths)]
+        ids = list(encode(f"Burst {index:05d}. ", True))
+        paragraph = index
+        while len(ids) < length:
+            ids.extend(encode(" " + _PARAGRAPHS[paragraph % len(_PARAGRAPHS)], False))
+            paragraph += 1
+        prompts.append(ids[:length])
+    return prompts
 
 
 def assert_known_answers(

@@ -27,6 +27,9 @@ class DkvModel:
     disable_finalize_fusion: bool = False
     precision: PrecisionPolicy | None = None
     path_env: str | None = None
+    # Host cache bytes per rank that hold every block the host-tier test spills: 96 prompts of three
+    # blocks, several times over.
+    host_cache_bytes: int = 2 << 30
 
     def path(self) -> str:
         """Resolve the checkpoint: an explicit environment override, else the models root."""
@@ -66,6 +69,8 @@ DEEPSEEK_V4 = DkvModel(
     moe_backend="TRTLLM",
     precision=NOISY_POLICY,
     path_env="DKV_DEEPSEEK_V4_PATH",
+    # Its blocks span several cache groups; 2 GiB dropped part of the spilled prefixes.
+    host_cache_bytes=64 << 30,
 )
 MODELS = (TINY_LLAMA, DEEPSEEK_V3_LITE, DEEPSEEK_V4)
 MODEL_IDS = [model.pytest_id for model in MODELS]
@@ -82,7 +87,10 @@ class PromptTokenizer:
             from transformers import AutoTokenizer
 
             self._hf = AutoTokenizer.from_pretrained(model_path)
-        except (ValueError, KeyError, OSError):
+        # A model type transformers does not know fails differently across its versions: with a
+        # KeyError or ValueError for the lookup, or an AttributeError when the generic config
+        # standardizes the RoPE parameters.
+        except (ValueError, KeyError, OSError, AttributeError):
             from tokenizers import Tokenizer
 
             self._fast = Tokenizer.from_file(str(Path(model_path) / "tokenizer.json"))
@@ -109,14 +117,17 @@ def make_dkv_llm(
     attention_dp: bool = True,
     reuse: bool = False,
     gather_logits: bool = False,
+    chunked_prefill: bool = False,
+    cuda_graph: bool = False,
+    autotuner: bool = False,
     kv_cache: dict | None = None,
     **llm_kwargs,
 ):
     """Build the LLM every DKV suite runs on, so a flag is set in one place.
 
     The defaults are the replicated-prefill configuration: V2 KV manager, per-request reuse policy,
-    non-overlapped scheduling, no chunked prefill, no CUDA graphs. ``kv_cache`` overrides
-    ``KvCacheConfig`` fields and ``llm_kwargs`` override the LLM arguments.
+    non-overlapped scheduling, no chunked prefill, no CUDA graphs, no autotuner. ``kv_cache``
+    overrides ``KvCacheConfig`` fields and ``llm_kwargs`` override the LLM arguments.
     """
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import KvCacheConfig
@@ -141,9 +152,8 @@ def make_dkv_llm(
         moe_expert_parallel_size=group_size,
         enable_attention_dp=attention_dp,
         disable_overlap_scheduler=True,
-        enable_chunked_prefill=False,
-        enable_autotuner=False,
-        cuda_graph_config=None,
+        enable_chunked_prefill=chunked_prefill,
+        enable_autotuner=autotuner,
         max_batch_size=2,
         max_num_tokens=512,
         max_seq_len=512,
@@ -154,5 +164,7 @@ def make_dkv_llm(
         moe_config=moe_config or MoeConfig(),
         kv_cache_config=KvCacheConfig(**kv_options),
     )
+    if not cuda_graph:
+        options["cuda_graph_config"] = None
     options.update(llm_kwargs)
     return LLM(**options)
