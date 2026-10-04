@@ -19,9 +19,13 @@ class PyExecutorEffects(ExecutorEffects):
         self._executor._terminate_request(request)
 
     def stage_transfer_response(
-        self, request_id: int, response: LlmResponse, terminate_after_publish: Optional[LlmRequest]
+        self,
+        request_id: int,
+        response: Optional[LlmResponse],
+        terminate_after_publish: Optional[LlmRequest],
     ) -> None:
-        self._executor._pending_transfer_responses.append((request_id, response))
+        if response is not None:
+            self._executor._pending_transfer_responses.append((request_id, response))
         if terminate_after_publish is not None:
             self._executor._pending_response_terminations.append(terminate_after_publish)
 

@@ -83,7 +83,7 @@ class ADPIterStatsBuffer:
         self._oldest_iter: Optional[int] = None
 
     @staticmethod
-    def make_payload(stats: IterationStats) -> RankIterStatsPayload:
+    def make_payload(stats: IterationStats, *, dkv_enabled: bool = False) -> RankIterStatsPayload:
         """Pack local IterationStats fields for ADP allgather."""
         ifb = stats.inflight_batching_stats
         return RankIterStatsPayload(
@@ -96,6 +96,10 @@ class ADPIterStatsBuffer:
             num_gen_kv_tokens=ifb.num_gen_kv_tokens,
             num_paused_requests=ifb.num_paused_requests,
             num_paused_kv_tokens=ifb.num_paused_kv_tokens,
+            has_local_request_counts=int(dkv_enabled),
+            num_new_active_requests=stats.num_new_active_requests if dkv_enabled else 0,
+            num_active_requests=stats.num_active_requests if dkv_enabled else 0,
+            num_completed_requests=stats.num_completed_requests if dkv_enabled else 0,
         )
 
     def queue(
@@ -105,12 +109,13 @@ class ADPIterStatsBuffer:
         *,
         kv_iter_stats: Optional[Dict[int, object]] = None,
         is_rank0: bool,
+        dkv_enabled: bool = False,
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
-        payload = self.make_payload(stats)
+        payload = self.make_payload(stats, dkv_enabled=dkv_enabled)
         iter_id = payload.iter_stats_iter
 
         if iter_id in self._payloads and iter_id not in self._synthetic_iters:
@@ -143,13 +148,14 @@ class ADPIterStatsBuffer:
     def _recompute_oldest_iter(self) -> None:
         self._oldest_iter = min(self._payloads) if self._payloads else None
 
-    def _ensure_zero_payload(self, iter_id: int) -> None:
+    def _ensure_zero_payload(self, iter_id: int, *, has_local_request_counts: int = 0) -> None:
         """Add a zero payload when this rank had no work for an iteration."""
         if iter_id in self._payloads:
             return
         self._payloads[iter_id] = RankIterStatsPayload(
             has_iter_stats=1,
             iter_stats_iter=iter_id,
+            has_local_request_counts=has_local_request_counts,
         )
         self._synthetic_iters.add(iter_id)
         self._note_payload_insert(iter_id)
@@ -196,7 +202,9 @@ class ADPIterStatsBuffer:
         Attention-DP emits one stats row per rank so downstream FPM consumers
         can see scheduling distribution and diagnose load imbalance. Scheduled
         fields are rank-local. Queued fields remain rank-0/global because the
-        executor request queue lives on rank 0.
+        executor request queue lives on rank 0. DKV also carries per-rank active,
+        new and completed counts so replicated lifecycle objects are not counted
+        once per copy.
         """
         rank = rank_state.rank
         payload = rank_state.iter_stats
@@ -239,6 +247,11 @@ class ADPIterStatsBuffer:
             stats.num_new_active_requests = 0
             stats.new_active_requests_queue_latency_ms = 0.0
 
+        if payload.has_local_request_counts:
+            stats.num_new_active_requests = payload.num_new_active_requests
+            stats.num_active_requests = payload.num_active_requests
+            stats.num_completed_requests = payload.num_completed_requests
+
         stats.inflight_batching_stats = ifb
         return stats
 
@@ -261,7 +274,10 @@ class ADPIterStatsBuffer:
         # piggyback allgather instead of forcing a mixed-iteration skip.
         iter_stats_iter = rank0_state.iter_stats.iter_stats_iter
         self._drop_before(iter_stats_iter)
-        self._ensure_zero_payload(iter_stats_iter)
+        self._ensure_zero_payload(
+            iter_stats_iter,
+            has_local_request_counts=rank0_state.iter_stats.has_local_request_counts,
+        )
 
         matching_states = [
             s

@@ -19,7 +19,22 @@ import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
-from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
+from functools import wraps
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Concatenate,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    ParamSpec,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -92,6 +107,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..config_utils import uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
+from ..dkv_metrics import DkvMeasurementCounters
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -140,6 +156,95 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 
 # Shared by capacity estimation and growth, in addition to speculative tokens.
 BASE_GENERATION_TOKEN_COUNT = 1
+
+_DkvTraceParams = ParamSpec("_DkvTraceParams")
+_DkvTraceResult = TypeVar("_DkvTraceResult")
+
+
+def _dkv_trace_value(value: object) -> object:
+    """Keep logical call inputs without retaining requests or CUDA objects."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, LlmRequest):
+        return (value.py_request_id, value.context_current_position, value.is_dummy_request)
+    if isinstance(value, ScheduledRequests):
+        return (
+            tuple(_dkv_trace_value(req) for req in value.context_requests),
+            tuple(_dkv_trace_value(req) for req in value.generation_requests),
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_dkv_trace_value(item) for item in value)
+    return type(value).__name__
+
+
+def _trace_dkv_operation(
+    operation: Callable[Concatenate["KVCacheManagerV2", _DkvTraceParams], _DkvTraceResult],
+) -> Callable[Concatenate["KVCacheManagerV2", _DkvTraceParams], _DkvTraceResult]:
+    @wraps(operation)
+    def traced(
+        self: "KVCacheManagerV2", *args: _DkvTraceParams.args, **kwargs: _DkvTraceParams.kwargs
+    ) -> _DkvTraceResult:
+        if self._dkv_measurement is not None:
+            self._dkv_measurement.operation_generation += 1
+        if not self._dkv_trace_enabled:
+            return operation(self, *args, **kwargs)
+        self._dkv_trace.append(
+            (
+                "call",
+                operation.__name__,
+                tuple(_dkv_trace_value(arg) for arg in args),
+                tuple((key, _dkv_trace_value(value)) for key, value in sorted(kwargs.items())),
+            )
+        )
+        completed = False
+        result = None
+        try:
+            result = operation(self, *args, **kwargs)
+            completed = True
+            return result
+        finally:
+            self._dkv_trace.append(
+                ("return" if completed else "raised", operation.__name__, _dkv_trace_value(result))
+            )
+
+    return traced
+
+
+def _measure_dkv_context_operation(
+    operation: Callable[Concatenate["KVCacheManagerV2", LlmRequest, _DkvTraceParams], bool],
+) -> Callable[Concatenate["KVCacheManagerV2", LlmRequest, _DkvTraceParams], bool]:
+    @wraps(operation)
+    def measured(
+        self: "KVCacheManagerV2",
+        req: LlmRequest,
+        *args: _DkvTraceParams.args,
+        **kwargs: _DkvTraceParams.kwargs,
+    ) -> bool:
+        measurement = self._measurement_for_request(req)
+        if measurement is None:
+            return operation(self, req, *args, **kwargs)
+        first_chunk = req.is_first_context_chunk and not req.py_dkv_measurement_prepared
+        completed = False
+        success = False
+        try:
+            success = operation(self, req, *args, **kwargs)
+            completed = True
+            return success
+        finally:
+            cache = self.kv_cache_map.get(req.py_request_id)
+            measurement.record_operation(
+                operation.__name__,
+                prompt_tokens=req.prompt_len,
+                first_chunk=first_chunk,
+                matched_tokens=cache.num_committed_tokens if cache is not None else 0,
+                success=success,
+                raised=not completed,
+            )
+            if completed and success and operation.__name__ == "prepare_context":
+                req.py_dkv_measurement_prepared = True
+
+    return measured
+
 
 # Readable name per CacheTier, used only to label level-indexed counters. The levels themselves
 # come from the configured tier list, so several levels may share a name. Keyed by the enum
@@ -214,7 +319,8 @@ def _fill_kv_pages(buffer: torch.Tensor, pages: Sequence[int], value: float) -> 
     Unpacked FP8 (``float8_e4m3fn``/``float8_e5m2``) has no ``index_fill_`` CUDA
     kernel and raises ``NotImplementedError`` -- the same gap
     ``check_invalid_values_in_kv_cache`` already guards its ``isnan``/``isinf``
-    against. Rather than crash a run, the fill is skipped and the caller told so.
+    against. Zero is written through a byte view for these formats. Other fill
+    values are skipped when the dtype lacks an index-fill kernel.
 
     One ``index_fill_`` per layer rather than one per page: a 4k-token prompt
     is 128 pages on each of ~60 layers, and a fill per page there costs more in
@@ -224,7 +330,9 @@ def _fill_kv_pages(buffer: torch.Tensor, pages: Sequence[int], value: float) -> 
         return True
     index = torch.as_tensor(list(pages), dtype=torch.long, device=buffer.device)
     try:
-        if buffer.dtype.is_floating_point:
+        if value == 0.0 and buffer.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            buffer.view(torch.uint8).index_fill_(0, index, 0)
+        elif buffer.dtype.is_floating_point:
             buffer.index_fill_(0, index, value)
         else:
             buffer.index_fill_(0, index, 0 if value == 0.0 else 0x7F)
@@ -1112,6 +1220,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    dkv_group_size: int | None = None
+    _dkv_trace_enabled = False
+    _dkv_measurement: DkvMeasurementCounters | None = None
 
     def __init__(
         self,
@@ -1146,8 +1257,21 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
+        dkv_group_size: Optional[int] = None,
         **kwargs,
     ) -> None:
+        if dkv_group_size is not None and dkv_group_size < 2:
+            raise ValueError("dkv_group_size must be at least 2")
+        self.dkv_group_size = dkv_group_size
+        self._dkv_trace_enabled = dkv_group_size is not None and os.environ.get(
+            "TRTLLM_DKV_DEBUG", "0"
+        ) not in ("0", "false", "False")
+        self._dkv_trace: list[tuple] = []
+        self._dkv_measurement = (
+            DkvMeasurementCounters()
+            if os.environ.get("TRTLLM_DKV_MEASUREMENT") == "1" and not is_estimating_kv_cache
+            else None
+        )
         self.mapping = mapping
         self.dtype = dtype
         self._validate_speculative_config(spec_config)
@@ -1316,11 +1440,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
+                event_gather = Distributed.get(mapping).allgather
+                if self._dkv_measurement is not None:
+                    event_gather = self._dkv_measurement.wrap_event_gather(event_gather)
                 self.event_manager = KVCacheEventManager(
                     self.event_buffer_max_size,
                     window_size=event_window_size,
                     attention_dp_rank=mapping.rank,
-                    attention_dp_gather=Distributed.get(mapping).allgather,
+                    attention_dp_gather=event_gather,
                     hash_algo=kv_cache_event_hash_algo,
                     mm_token_id_offset=vocab_size,
                 )
@@ -1411,20 +1538,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # across PP ranks, including fixed per-rank costs.
         if mapping.world_size > 1:
             dist = Distributed.get(mapping)
-            resumable_quota = int(quota * max_util_for_resume)
-            max_tokens = self._get_max_tokens_from_quota(resumable_quota)
-            max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
-            # inf max_tokens means all layers are SWA and every rank quota can
-            # fit all SWA fixed cache.
-            if not math.isinf(max_tokens):
-                # allreduce(MIN) must never increase the local quota. The
-                # token↔quota round-trip is not identity when SWA layers
-                # dominate (full_attn_size_per_token==0), so clamp to guard
-                # against a bogus inflation (nvbugs/6418103).
-                synced_quota = int(
-                    math.ceil(self._get_quota_from_max_tokens(max_tokens) / max_util_for_resume)
-                )
-                quota = min(quota, synced_quota)
+            quota = self._sync_device_quota(quota, max_util_for_resume, dist)
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
@@ -1709,8 +1823,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # waiting for the previous batch's transfers to finish. With the overlap
         # scheduler on (non-PP), a retiring request holds its lease one extra
         # iteration and needs the same coefficient.
-        max_num_sequences = max_batch_size * mapping.pp_size
-        needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
         # Both diagnostics below are off unless their environment variable is
         # set; with neither set nothing here changes any allocation, any page
@@ -1729,19 +1841,16 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
-        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
         # longer be comparable with the run it is being read against.
-        index_mapper_capacity = (
-            self.max_admissible_sequences
-            + num_reserved_index_slots
-            + (1 if self._guard_page_value is not None else 0)
+        self.max_admissible_sequences, index_mapper_capacity = self._get_sequence_capacities(
+            num_reserved_index_slots, disable_overlap_scheduler
         )
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
-            f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
+            f"(max_admissible_sequences={self.max_admissible_sequences}, is_disagg={is_disagg}, "
             f"disable_overlap_scheduler={disable_overlap_scheduler}, "
             f"pp_size={mapping.pp_size}, "
             f"num_reserved_index_slots={num_reserved_index_slots}, "
@@ -1750,6 +1859,17 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
         self._prepare_page_table_tensor(index_mapper_capacity)
+        if self.dkv_group_size is not None:
+            host_table_bytes = (
+                self.host_kv_cache_block_offsets.numel()
+                * self.host_kv_cache_block_offsets.element_size()
+            )
+            logger.info(f"DKV host KV block offsets use {host_table_bytes} bytes")
+            logger.warning(
+                "DKV duplicates the global KV workload on every rank with the same device "
+                f"byte budget: effective per-rank capacity is approximately 1/{self.dkv_group_size} "
+                "of ADP. In-flight context transfers also retain these replicated pages."
+            )
 
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
@@ -1984,20 +2104,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 if ordinal < protected or page == BAD_PAGE_INDEX:
                     continue
                 if ordinal >= prev_size or int(previous[ordinal]) == BAD_PAGE_INDEX:
-                    fresh.append(page)
+                    fresh.append(ordinal)
             state[pool_id] = base.copy()
             if not fresh:
                 continue
-            for layer_idx in self.pp_layers:
-                if self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]] != pool_id:
-                    continue
-                buffer = self.get_buffers(layer_idx)
-                if buffer is None:
-                    continue
-                # Same conversion the attention backends index the buffer
-                # with: layers in one pool can carry different scales.
-                scale = self.get_layer_page_index_scale(layer_idx)
-                pages = [page * scale // self.kv_factor for page in fresh]
+            for buffer, pages in self._iter_fresh_page_fill_targets(
+                request_id, pool_id, base.tolist(), fresh
+            ):
                 pages = [page for page in pages if 0 <= page < buffer.shape[0]]
                 if pages:
                     if _fill_kv_pages(buffer, pages, self._fresh_page_fill):
@@ -2027,6 +2140,20 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"KVCacheManagerV2: TRTLLM_KV_FRESH_PAGE_FILL={self._fresh_page_fill} "
                     f"first fill covered {filled} pages for request {request_id}"
                 )
+
+    def _iter_fresh_page_fill_targets(
+        self, request_id: int, pool_id: int, base_pages: list[int], fresh_ordinals: list[int]
+    ) -> Iterable[tuple[torch.Tensor, list[int]]]:
+        """Map fresh logical block ordinals to the buffer rows read by attention."""
+        for layer_idx in self.pp_layers:
+            if self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]] != pool_id:
+                continue
+            buffer = self.get_buffers(layer_idx)
+            if buffer is None:
+                continue
+            scale = self.get_layer_page_index_scale(layer_idx)
+            pages = [base_pages[ordinal] * scale // self.kv_factor for ordinal in fresh_ordinals]
+            yield buffer, pages
 
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         """Return the roles represented by the two page-table index lanes.
@@ -2278,7 +2405,52 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_generation_request_capacity(self) -> int:
         """Return the resident generation requests used for SWA sizing."""
-        return self.max_batch_size
+        return self.max_batch_size * (self.dkv_group_size or 1)
+
+    def _get_context_token_capacity(self, max_num_tokens: int | None) -> int | None:
+        """Size replicated context KV independently of the local forward budget."""
+        if max_num_tokens is None:
+            return None
+        return max_num_tokens * (self.dkv_group_size or 1)
+
+    def _get_sequence_capacities(
+        self, num_reserved_index_slots: int, disable_overlap_scheduler: bool
+    ) -> tuple[int, int]:
+        if self.dkv_group_size is not None:
+            max_num_sequences = self.dkv_group_size * self.max_batch_size
+            needs_extra_leases = self.is_disagg
+            num_reserved_index_slots += self.dkv_group_size
+        else:
+            max_num_sequences = self.max_batch_size * self.mapping.pp_size
+            needs_extra_leases = self.is_disagg or (
+                not disable_overlap_scheduler and not self.mapping.has_pp()
+            )
+        admissible = max_num_sequences * (2 if needs_extra_leases else 1)
+        return (
+            admissible,
+            admissible + num_reserved_index_slots + (self._guard_page_value is not None),
+        )
+
+    def _sync_device_quota(self, quota: int, max_util_for_resume: float, dist: Distributed) -> int:
+        resumable_quota = int(quota * max_util_for_resume)
+        max_tokens = self._get_max_tokens_from_quota(resumable_quota)
+        if self.dkv_group_size is not None:
+            # Torch collectives require matching scalar dtypes, including
+            # ranks whose capacity estimator returned the integer zero.
+            max_tokens = float(max_tokens)
+        max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
+        if not math.isinf(max_tokens):
+            # The token/quota round trip can overshoot with fixed SWA costs.
+            synced_quota = math.ceil(
+                self._get_quota_from_max_tokens(max_tokens) / max_util_for_resume
+            )
+            quota = min(quota, synced_quota)
+        if self.dkv_group_size is not None:
+            # Token capacity cannot distinguish saturated all-SWA pools or
+            # quotas below the fixed SWA cost. Replicated pools need identical
+            # bytes even at those infinity/zero boundaries.
+            quota = dist.allreduce(quota, op=ReduceOp.MIN)
+        return quota
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
@@ -2307,7 +2479,8 @@ class KVCacheManagerV2(BaseResourceManager):
         size_per_batch = self._get_generation_request_capacity() * generation_swa_size_per_request
         if quota < size_per_batch:
             return 0
-        context_limit_quota = self.max_num_tokens * context_size_per_token + size_per_batch
+        context_token_capacity = self._get_context_token_capacity(self.max_num_tokens)
+        context_limit_quota = context_token_capacity * context_size_per_token + size_per_batch
         if quota <= context_limit_quota:
             if context_size_per_token <= 0:
                 return float("inf")
@@ -2315,7 +2488,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if generation_size_per_token <= 0:
             return float("inf")
-        return self.max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
+        return context_token_capacity + (quota - context_limit_quota) / generation_size_per_token
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         """Token capacity (GLOBAL tokens under helix) -> rank-local byte quota."""
@@ -2340,7 +2513,7 @@ class KVCacheManagerV2(BaseResourceManager):
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
         )
-        context_tokens = min(max_tokens, self.max_num_tokens)
+        context_tokens = min(max_tokens, self._get_context_token_capacity(self.max_num_tokens))
         generation_tokens = max_tokens - context_tokens
         return int(
             context_tokens * context_size_per_token
@@ -2750,7 +2923,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 # cache pools.
                 generation_request_capacity = self._get_generation_request_capacity()
                 context_capacity = (
-                    self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
+                    self._get_context_token_capacity(self.max_num_tokens)
+                    if self.max_num_tokens is not None
+                    else typical_seq_len
                 ) + self.num_extra_kv_tokens
                 generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
                 typical_step = BatchDesc(
@@ -2796,8 +2971,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 )
 
-                # General and chunked-prefill warmup uses one fresh context request
-                # at the per-iteration token budget.
+                # Require room for one local prefill. DKV's global context
+                # workload guides pool ratios, but admission may limit the
+                # number of concurrently resident prefills to fit the pool.
                 if self.max_num_tokens is not None:
                     constraints.append(
                         BatchDesc(
@@ -3338,12 +3514,15 @@ class KVCacheManagerV2(BaseResourceManager):
             slots = max(slots, self._kv_reserve_draft_tokens)
         return slots
 
+    @_trace_dkv_operation
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
 
         Resumes from suspended state if needed, then resizes capacity by 1 (+
         draft tokens). Returns True on success, False if allocation failed.
         """
+        if self.dkv_group_size is not None and not req.is_dummy:
+            raise RuntimeError("Generation allocation is not supported with dkv_config yet")
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -3372,6 +3551,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._allocated_draft_lens[request_id] = draft_slots
         return True
 
+    @_trace_dkv_operation
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
 
@@ -3405,6 +3585,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{reverted_cap}"
             )
 
+    @_trace_dkv_operation
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
         not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
@@ -3589,6 +3770,8 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return kv_cache.num_committed_tokens
 
+    @_trace_dkv_operation
+    @_measure_dkv_context_operation
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create/resume the cache and expose local or reserved reuse before budgeting."""
         assert not req.is_disagg_generation_init_state, (
@@ -3612,6 +3795,8 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return False
 
+    @_trace_dkv_operation
+    @_measure_dkv_context_operation
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
 
@@ -3759,6 +3944,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._allocated_draft_lens[request.py_request_id] = current_draft_len
 
+    @_trace_dkv_operation
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
@@ -3850,6 +4036,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        if self._dkv_measurement is not None and not self.is_draft:
+            for request in scheduled_batch.context_requests:
+                measurement = self._measurement_for_request(request)
+                if measurement is not None:
+                    measurement.record_scheduled_context(request.context_chunk_size)
         for request in scheduled_batch.context_requests:
             ready = self._disagg_receive_ready.get(request.py_request_id)
             if ready is not None:
@@ -4366,6 +4557,153 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return self.impl.get_storage_statistics(cache_level)
 
+    def get_dkv_config_fingerprint(self) -> list[tuple]:
+        """Return rank-independent capacity and layout records for the DKV C0 check."""
+        config = self.kv_cache_manager_py_config
+        records = [
+            ("backend", KV_CACHE_MANAGER_V2_BACKEND),
+            ("dkv_group_size", self.dkv_group_size),
+            ("tokens_per_block", self.tokens_per_block, config.tokens_per_block),
+            ("dtype", str(self.dtype)),
+            ("max_seq_len", self.max_seq_len),
+            ("max_batch_size", self.max_batch_size),
+            ("max_num_tokens", self.max_num_tokens),
+            ("context_token_capacity", self._get_context_token_capacity(self.max_num_tokens)),
+            ("fp8_ctx_mla_kv_len_cap", getattr(self, "fp8_ctx_mla_kv_len_cap", None)),
+            ("generation_request_capacity", self._get_generation_request_capacity()),
+            ("max_admissible_sequences", self.max_admissible_sequences),
+            (
+                "index_mapper_capacity",
+                self.index_mapper.size() + self.index_mapper.num_free_slots(),
+            ),
+            ("max_util_for_resume", config.max_util_for_resume),
+            ("reuse", self.enable_block_reuse, str(self.block_reuse_policy)),
+        ]
+        for layer in config.layers:
+            records.append(
+                (
+                    "layer",
+                    int(layer.layer_id),
+                    type(layer).__name__,
+                    layer.window_size if isinstance(layer, AttentionLayerConfig) else None,
+                    layer.num_sink_tokens if isinstance(layer, AttentionLayerConfig) else None,
+                    tuple(
+                        (str(buffer.role), buffer.size, buffer.tokens_per_block_override)
+                        for buffer in layer.buffers
+                    ),
+                )
+            )
+        for level, tier in enumerate(self.impl.cache_tier_list):
+            records.append(
+                (
+                    "tier",
+                    level,
+                    _CACHE_TIER_NAMES[tier],
+                    self.impl.get_quota(CacheLevel(level)),
+                    tuple(self.impl.get_life_cycle_pool_group_indices(CacheLevel(level))),
+                )
+            )
+            for pool, stats in enumerate(self.impl.get_storage_statistics(CacheLevel(level))):
+                records.append(("pool", level, pool, tuple(stats.slot_sizes), stats.total))
+        return records
+
+    def get_dkv_state_fingerprint(self) -> list[tuple]:
+        """Return logical KV state, including every dummy, without physical slot IDs."""
+        records = [
+            ("index_mapper", self.index_mapper.size(), self.index_mapper.num_free_slots()),
+            ("released_index_requests", tuple(sorted(self._early_freed_index_requests))),
+        ]
+        for request_id, cache in sorted(self.kv_cache_map.items()):
+            records.append(
+                (
+                    "request",
+                    request_id,
+                    cache.capacity,
+                    cache.history_length,
+                    cache.num_committed_tokens,
+                    cache.is_active,
+                )
+            )
+        for level in range(len(self.impl.cache_tier_list)):
+            for pool, stats in enumerate(self.impl.get_storage_statistics(CacheLevel(level))):
+                records.append(("pool", level, pool, stats.total, stats.free, stats.evictable))
+        return records
+
+    def get_dkv_control_digest(self) -> tuple[int, tuple[tuple[int, ...], ...]]:
+        """Return IndexMapper usage and free pages by cache level and pool group.
+
+        The public storage counters include recycled slots regardless of CUDA
+        event readiness, so the digest does not depend on physical slot IDs or
+        device progress. Its size and cost depend only on the configured pools.
+        """
+        free_pages = tuple(
+            tuple(stats.free for stats in self.impl.get_storage_statistics(CacheLevel(level)))
+            for level in range(len(self.impl.cache_tier_list))
+        )
+        return self.index_mapper.size(), free_pages
+
+    def consume_dkv_trace(self) -> list[tuple]:
+        """Drain ordered logical KV calls and their results since the previous check."""
+        trace = self._dkv_trace
+        self._dkv_trace = []
+        return trace
+
+    def _measurement_for_request(self, req: LlmRequest) -> DkvMeasurementCounters | None:
+        if self._dkv_measurement is None or self.is_draft or req.is_dummy_request:
+            return None
+        if self.dkv_group_size is not None and req.py_dkv_compute_rank != self.mapping.tp_rank:
+            return None
+        return self._dkv_measurement
+
+    def get_dkv_measurement_snapshot(self) -> dict | None:
+        """Copy internal experiment counters and actual pool sizes without consuming stats.
+
+        Request counters count the compute owner once. Capacity-drop counters
+        count physical direct victims on this rank, across all cache tiers.
+        """
+        measurement = self._dkv_measurement
+        if measurement is None:
+            return None
+        pools = [
+            [
+                {
+                    "slot_sizes": list(self._stats_slot_sizes(stats)),
+                    "total": stats.total,
+                    "free": stats.free,
+                    "evictable": stats.evictable,
+                    "available": stats.available,
+                }
+                for stats in self.impl.get_storage_statistics(CacheLevel(level))
+            ]
+            for level in range(len(self.impl.cache_tier_list))
+        ]
+        observed = measurement.iteration_stats_observations > 0
+        return {
+            "rank": self.mapping.tp_rank,
+            "group_size": self.mapping.tp_size,
+            "dkv_enabled": self.dkv_group_size is not None,
+            "reuse_enabled": self.enable_block_reuse,
+            "tokens_per_block": self.tokens_per_block,
+            "cache_tiers": [_CACHE_TIER_NAMES[tier] for tier in self.impl.cache_tier_list],
+            "pools_by_level": pools,
+            "fresh_page_fill": os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "none"),
+            "counters": measurement.snapshot(),
+            "last_tier_capacity_dropped_pages": (
+                measurement.last_tier_capacity_dropped_pages if observed else None
+            ),
+            "gpu_offloaded_pages": measurement.gpu_offloaded_pages if observed else None,
+            "iteration_stats_observations": measurement.iteration_stats_observations,
+            "reuse_resets": measurement.reuse_resets,
+            "operation_generation": measurement.operation_generation,
+            "stats_generation": measurement.stats_generation,
+            "event_next_id": (
+                measurement.event_next_id
+                if measurement.event_generation == measurement.operation_generation
+                else None
+            ),
+            "event_generation": measurement.event_generation,
+        }
+
     def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
         """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
 
@@ -4848,6 +5186,11 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
+        if self._dkv_measurement is not None:
+            self._dkv_measurement.record_storage_delta(
+                sum(delta.iter_host_dropped_blocks for delta in raw_iteration_stats.values()),
+                sum(delta.iter_offload_blocks for delta in raw_iteration_stats.values()),
+            )
         raw_ssm_snapshot_iteration_stats = self.impl.get_and_reset_ssm_snapshot_iteration_stats()
         suspended_requests, resumed_requests = (
             self.impl.get_and_reset_iteration_suspend_resume_stats()
@@ -4959,6 +5302,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return padded_tensor
 
+    @_trace_dkv_operation
     def add_dummy_requests(
         self,
         request_ids: List[int],
@@ -5161,6 +5505,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
+    @_trace_dkv_operation
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
 
@@ -5181,6 +5526,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
+    @_trace_dkv_operation
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if self.kv_connector_manager is not None and not self.is_draft:
             self.kv_connector_manager.release_unstarted_prefix_loads(request)
@@ -5510,6 +5856,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         max_batch_size: int = 0,
         max_num_tokens: int = 0,
+        dkv_group_size: int | None = None,
         spec_config=None,
         is_draft: bool = False,
         **kwargs,
@@ -5564,7 +5911,7 @@ class KVCacheManagerV2(BaseResourceManager):
         fixed_cost = (
             swa_size_per_request * max_batch_size
             + (context_size_per_token - cache_size_per_token) * max_num_tokens
-        )
+        ) * (dkv_group_size or 1)
         bytes_per_slot = _get_single_swa_pool_slot_bytes(
             layer_sizes, attention_windows, tokens_per_block
         )
@@ -5583,6 +5930,7 @@ class KVCacheManagerV2(BaseResourceManager):
             fixed_cost,
         )
 
+    @_trace_dkv_operation
     def update_context_resources(self, scheduled_batch: ScheduledRequests):
         """Update KV cache for context requests in the current batch.
 
@@ -5638,6 +5986,10 @@ class KVCacheManagerV2(BaseResourceManager):
         attn_metadata: "AttentionMetadata" = None,
         kv_cache_dtype_byte_size: float = None,
     ):
+        if self.dkv_group_size is not None and any(
+            not req.is_dummy for req in scheduled_batch.generation_requests
+        ):
+            raise RuntimeError("Generation KV updates are not supported with dkv_config yet")
         if not self.is_draft:
             _update_kv_cache_draft_token_location(
                 self, scheduled_batch, attn_metadata, kv_cache_dtype_byte_size
@@ -5879,6 +6231,9 @@ class KVCacheManagerV2(BaseResourceManager):
         return success
 
     def reset_reuse_state(self):
+        if self._dkv_measurement is not None:
+            self._dkv_measurement.reuse_resets += 1
+            self._dkv_measurement.operation_generation += 1
         self.impl.clear_reusable_blocks()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()

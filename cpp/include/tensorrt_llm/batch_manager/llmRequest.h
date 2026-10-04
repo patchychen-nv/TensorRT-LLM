@@ -1724,6 +1724,12 @@ public:
         mFinishReasons.at(beam) = reason;
     }
 
+    /// @brief Return the completion reason of every beam without creating a response.
+    [[nodiscard]] std::vector<executor::FinishReason> const& getFinishReasons() const noexcept
+    {
+        return mFinishReasons;
+    }
+
     void setDecodingIter(SizeType32 iter)
     {
         mDecodingIter = iter;
