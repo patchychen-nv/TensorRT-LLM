@@ -529,6 +529,13 @@ generation produces must match those it produces after an ordinary ADP context
 worker, on the same prompt set. Its timeouts, a cancellation race and the two
 requests that follow them run in the same job.
 
+DKV supports prefill only, so the aggregate gate never reads back the KV it stores:
+only the transfer gate can see a request whose KV is wrong. A mutation test keeps that
+gate honest. The sender of the context worker overwrites the transferred KV of one
+prompt, with zeros or with the KV of the previous request, before the transport reads
+it, and the gate must reject the run. The requests that break the policy on their own
+must then be that prompt and no other.
+
 The V2 event tests separately check a request pinned to rank 0: ordinary ADP
 stores it only on rank 0, while DKV emits matching stored-block hashes on both
 ranks, grouped by layer group. A second test serves more distinct prompts than the

@@ -34,8 +34,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/thop/serial
   - unittest/_torch/executor
   - unittest/_torch/disaggregation
-  # DKV replicated-lifecycle gates: two-rank aggregate runs, the four-GPU context transfer and
-  # the DeepSeek-V3-Lite context-worker accuracy test. Entries must be exact node ids.
+  # DKV replicated-lifecycle gates: two-rank aggregate runs, the four-GPU context transfer, the
+  # mutation test of its precision gate and the DeepSeek-V3-Lite context-worker accuracy test.
+  # Entries must be exact node ids.
   - dkv/test_dkv_admission.py::test_dkv_replicated_admission[tiny-llama-adp] TIMEOUT (15)
   - dkv/test_dkv_admission.py::test_dkv_replicated_admission[tiny-llama-dkv] TIMEOUT (15)
   - dkv/test_dkv_admission.py::test_dkv_replicated_admission[tiny-llama-dkv-reuse] TIMEOUT (15)
@@ -71,6 +72,9 @@ l0_gb300_multi_gpus:
   - dkv/test_dkv_transfer.py::test_dkv_context_transfer_precision_and_timeouts[tiny-llama] TIMEOUT (50)
   - dkv/test_dkv_transfer.py::test_dkv_context_transfer_precision_and_timeouts[deepseek-v3-lite] TIMEOUT (80)
   - dkv/test_dkv_transfer.py::test_dkv_context_transfer_precision_and_timeouts[deepseek-v4] TIMEOUT (120)
+  - dkv/test_dkv_mutation.py::test_dkv_transfer_gate_fails_when_a_request_hands_over_corrupted_kv[tiny-llama] TIMEOUT (30)
+  - dkv/test_dkv_mutation.py::test_dkv_transfer_gate_fails_when_a_request_hands_over_corrupted_kv[deepseek-v3-lite] TIMEOUT (80)
+  - dkv/test_dkv_mutation.py::test_dkv_transfer_gate_fails_when_a_request_hands_over_corrupted_kv[deepseek-v4] TIMEOUT (120)
   - dkv/test_dkv_serve.py::test_dkv_context_serve_answers_completions[tiny-llama] TIMEOUT (30)
   - dkv/test_dkv_serve.py::test_dkv_context_serve_answers_completions[deepseek-v3-lite] TIMEOUT (45)
   - dkv/test_dkv_serve.py::test_dkv_context_serve_answers_completions[deepseek-v4] TIMEOUT (60)
