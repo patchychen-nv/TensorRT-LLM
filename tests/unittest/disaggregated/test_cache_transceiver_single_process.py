@@ -30,9 +30,10 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from types import SimpleNamespace
 
-# Do not inherit a NIC pin from the host: the selected interface may not exist
-# in the test container and would prevent the NIXL agent from initializing.
-os.environ.pop("UCX_NET_DEVICES", None)
+from utils.collectives import ThreadSafeDistributed, run_concurrent
+
+# Preserve an explicit UCX_NET_DEVICES selection: the test runner can pin an
+# interface that is reachable from the container's network namespace.
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).
@@ -205,139 +206,6 @@ class KvCacheConfigV2:
     block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     max_util_for_resume: float = 0.95
-
-
-# ---------------------------------------------------------------------------
-# ThreadSafeDistributed: threading.Barrier-based Distributed mock
-# ---------------------------------------------------------------------------
-class ThreadSafeDistributed:
-    """Distributed mock using threading.Barrier for single-process multi-rank testing."""
-
-    def __init__(
-        self,
-        local_rank: int,
-        world_size: int,
-        tp_size: int,
-        pp_size: int,
-        tp_rank: int,
-        pp_rank: int,
-        shared: dict,
-        cp_rank: int = 0,
-        cp_size: int = 1,
-    ):
-        self.rank = local_rank
-        self._world_size = world_size
-        self._tp_size = tp_size
-        self._pp_size = pp_size
-        self._tp_rank = tp_rank
-        self._pp_rank = pp_rank
-        # CP is orthogonal to TP/PP: each cp slice runs its own TP/PP collectives,
-        # so the per-group barriers are indexed by (rank, cp_rank). ctx side is
-        # cp_size==1, preserving the original single-axis behaviour.
-        # HELIX VALIDATE: assumes the transceiver's setup collectives group TP/PP
-        # within a fixed cp_rank (cp orthogonal). Confirm against the real helix
-        # registration exchange on GPU.
-        self._cp_rank = cp_rank
-        self._cp_size = cp_size
-        self._s = shared
-        self._bcast_idx = 0
-        self._ag_idx = 0
-        self._pp_ag_idx = 0
-        self._tp_ag_idx = 0
-
-    @property
-    def tp_size(self):
-        return self._tp_size
-
-    @property
-    def pp_size(self):
-        return self._pp_size
-
-    @property
-    def world_size(self):
-        return self._world_size
-
-    def broadcast(self, obj, root=0):
-        idx = self._bcast_idx
-        self._bcast_idx += 1
-        key = f"bcast_{idx}"
-        if self.rank == root:
-            self._s[key] = obj
-        self._s["barrier"].wait()
-        result = self._s[key]
-        self._s["barrier"].wait()
-        return result
-
-    def allgather(self, obj):
-        idx = self._ag_idx
-        self._ag_idx += 1
-        key = f"ag_{idx}"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None] * self._world_size
-            self._s[key][self.rank] = obj
-        self._s["barrier"].wait()
-        result = list(self._s[key])
-        self._s["barrier"].wait()
-        return result
-
-    def pp_allgather(self, obj):
-        idx = self._pp_ag_idx
-        self._pp_ag_idx += 1
-        key = f"pp_ag_{idx}_tp{self._tp_rank}_cp{self._cp_rank}"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None] * self._pp_size
-            self._s[key][self._pp_rank] = obj
-        # Sync only the PP group that shares this (tp_rank, cp_rank). With attention data
-        # parallelism each tp_rank is an independent instance that may run a different number
-        # of collectives, so a single global barrier would deadlock; a per-group one does not.
-        # CP adds an orthogonal axis, so the group is keyed by cp_rank too.
-        pp_barrier = self._s["pp_barriers"][self._tp_rank * self._cp_size + self._cp_rank]
-        pp_barrier.wait()
-        result = list(self._s[key])
-        pp_barrier.wait()
-        return result
-
-    def tp_allgather(self, obj):
-        idx = self._tp_ag_idx
-        self._tp_ag_idx += 1
-        key = f"tp_ag_{idx}_pp{self._pp_rank}_cp{self._cp_rank}"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None] * self._tp_size
-            self._s[key][self._tp_rank] = obj
-        # Sync only the TP group that shares this (pp_rank, cp_rank) (see pp_allgather).
-        tp_barrier = self._s["tp_barriers"][self._pp_rank * self._cp_size + self._cp_rank]
-        tp_barrier.wait()
-        result = list(self._s[key])
-        tp_barrier.wait()
-        return result
-
-
-# ---------------------------------------------------------------------------
-# Threading helpers
-# ---------------------------------------------------------------------------
-def run_concurrent(items, fn):
-    """Run fn(item) for each item concurrently in threads and propagate errors."""
-    errors = [None] * len(items)
-    results = [None] * len(items)
-
-    def _worker(idx, item):
-        try:
-            results[idx] = fn(item)
-        except Exception as e:
-            errors[idx] = e
-
-    threads = [threading.Thread(target=_worker, args=(i, item)) for i, item in enumerate(items)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    for i, err in enumerate(errors):
-        if err is not None:
-            raise err
-    return results
 
 
 # ---------------------------------------------------------------------------

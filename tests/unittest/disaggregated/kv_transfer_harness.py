@@ -28,6 +28,8 @@ import threading
 import uuid
 from typing import Dict, List, Optional, Protocol, Sequence, TypeVar
 
+from utils.collectives import ThreadSafeDistributed, run_concurrent
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
@@ -107,126 +109,6 @@ class CacheVerifier(Protocol[_CacheManagerT_contra]):
         ctx_request_ids: List[int],
         gen_request_ids: List[int],
     ) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# ThreadSafeDistributed: threading.Barrier-based Distributed mock
-# ---------------------------------------------------------------------------
-class ThreadSafeDistributed:
-    """Distributed mock using threading.Barrier for single-process multi-rank testing.
-
-    Provides the same interface as TorchDistributedWrapper from test_py_cache_transceiver_mp.py
-    but uses Barrier + Lock + shared dict instead of torch.distributed.
-    """
-
-    def __init__(
-        self,
-        local_rank: int,
-        world_size: int,
-        tp_size: int,
-        pp_size: int,
-        tp_rank: int,
-        pp_rank: int,
-        shared: dict,
-    ):
-        self.rank = local_rank
-        self._world_size = world_size
-        self._tp_size = tp_size
-        self._pp_size = pp_size
-        self._tp_rank = tp_rank
-        self._pp_rank = pp_rank
-        self._s = shared
-        self._bcast_idx = 0
-        self._ag_idx = 0
-        self._pp_ag_idx = 0
-        self._tp_ag_idx = 0
-
-    @property
-    def tp_size(self):
-        return self._tp_size
-
-    @property
-    def pp_size(self):
-        return self._pp_size
-
-    @property
-    def world_size(self):
-        return self._world_size
-
-    def broadcast(self, obj, root=0):
-        idx = self._bcast_idx
-        self._bcast_idx += 1
-        key = f"bcast_{idx}"
-        if self.rank == root:
-            self._s[key] = obj
-        self._s["barrier"].wait()
-        result = self._s[key]
-        self._s["barrier"].wait()
-        return result
-
-    def allgather(self, obj):
-        idx = self._ag_idx
-        self._ag_idx += 1
-        key = f"ag_{idx}"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None] * self._world_size
-            self._s[key][self.rank] = obj
-        self._s["barrier"].wait()
-        result = list(self._s[key])
-        self._s["barrier"].wait()
-        return result
-
-    def pp_allgather(self, obj):
-        idx = self._pp_ag_idx
-        self._pp_ag_idx += 1
-        key = f"pp_ag_{idx}_tp{self._tp_rank}"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None] * self._pp_size
-            self._s[key][self._pp_rank] = obj
-        self._s["barrier"].wait()
-        result = list(self._s[key])
-        self._s["barrier"].wait()
-        return result
-
-    def tp_allgather(self, obj):
-        idx = self._tp_ag_idx
-        self._tp_ag_idx += 1
-        key = f"tp_ag_{idx}_pp{self._pp_rank}"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None] * self._tp_size
-            self._s[key][self._tp_rank] = obj
-        self._s["barrier"].wait()
-        result = list(self._s[key])
-        self._s["barrier"].wait()
-        return result
-
-
-# ---------------------------------------------------------------------------
-# Threading helpers
-# ---------------------------------------------------------------------------
-def run_concurrent(items, fn):
-    """Run fn(item) for each item concurrently in threads and propagate errors."""
-    errors = [None] * len(items)
-    results = [None] * len(items)
-
-    def _worker(idx, item):
-        try:
-            results[idx] = fn(item)
-        except Exception as e:
-            errors[idx] = e
-
-    threads = [threading.Thread(target=_worker, args=(i, item)) for i, item in enumerate(items)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    for i, err in enumerate(errors):
-        if err is not None:
-            raise err
-    return results
 
 
 def _create_transceiver_in_thread(rank, mapping, cache_manager, dist_mock, config, results, errors):

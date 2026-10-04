@@ -20,6 +20,7 @@ from typing import Dict, List
 import numpy as np
 import pytest
 import torch
+from utils.collectives import ThreadSafeDistributed, run_concurrent
 
 # Force a deterministic UCX/NIXL config regardless of what the cluster/CI
 # injects; see test_kv_transfer.py for the full rationale.
@@ -71,106 +72,6 @@ _MAMBA_MASK = [False] + [True] * NUM_MAMBA_LAYERS
 _ATTN_MASK = [True] + [False] * NUM_MAMBA_LAYERS
 
 
-# ---------------------------------------------------------------------------
-# ThreadSafeDistributed: barrier-based mock for single-process testing (PP=1)
-# ---------------------------------------------------------------------------
-class ThreadSafeDistributed:
-    def __init__(self, rank, tp_size, shared):
-        self.rank = rank
-        self._world_size = tp_size
-        self._tp_size = tp_size
-        self._tp_rank = rank
-        self._s = shared
-        self._bcast_idx = 0
-        self._ag_idx = 0
-        self._pp_ag_idx = 0
-        self._tp_ag_idx = 0
-
-    @property
-    def tp_size(self):
-        return self._tp_size
-
-    @property
-    def pp_size(self):
-        return 1
-
-    @property
-    def world_size(self):
-        return self._world_size
-
-    def broadcast(self, obj, root=0):
-        idx = self._bcast_idx
-        self._bcast_idx += 1
-        key = f"bcast_{idx}"
-        if self.rank == root:
-            self._s[key] = obj
-        self._s["barrier"].wait()
-        result = self._s[key]
-        self._s["barrier"].wait()
-        return result
-
-    def allgather(self, obj):
-        idx = self._ag_idx
-        self._ag_idx += 1
-        key = f"ag_{idx}"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None] * self._world_size
-            self._s[key][self.rank] = obj
-        self._s["barrier"].wait()
-        result = list(self._s[key])
-        self._s["barrier"].wait()
-        return result
-
-    def pp_allgather(self, obj):
-        idx = self._pp_ag_idx
-        self._pp_ag_idx += 1
-        key = f"pp_ag_{idx}_tp{self._tp_rank}"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None]
-            self._s[key][0] = obj
-        self._s["barrier"].wait()
-        result = list(self._s[key])
-        self._s["barrier"].wait()
-        return result
-
-    def tp_allgather(self, obj):
-        idx = self._tp_ag_idx
-        self._tp_ag_idx += 1
-        key = f"tp_ag_{idx}_pp0"
-        with self._s["lock"]:
-            if key not in self._s:
-                self._s[key] = [None] * self._tp_size
-            self._s[key][self._tp_rank] = obj
-        self._s["barrier"].wait()
-        result = list(self._s[key])
-        self._s["barrier"].wait()
-        return result
-
-
-# ---------------------------------------------------------------------------
-# Infrastructure helpers
-# ---------------------------------------------------------------------------
-def _run_concurrent(items, fn):
-    errors = [None] * len(items)
-
-    def _worker(idx, item):
-        try:
-            fn(item)
-        except Exception as e:
-            errors[idx] = e
-
-    threads = [threading.Thread(target=_worker, args=(i, it)) for i, it in enumerate(items)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    for err in errors:
-        if err is not None:
-            raise err
-
-
 def _create_transceivers(tp, managers, config, enable_attention_dp=False):
     shared = {"barrier": threading.Barrier(tp), "lock": threading.Lock()}
     results = [None] * tp
@@ -185,7 +86,7 @@ def _create_transceivers(tp, managers, config, enable_attention_dp=False):
                 pp_size=1,
                 enable_attention_dp=enable_attention_dp,
             )
-            dist = ThreadSafeDistributed(rank, tp, shared)
+            dist = ThreadSafeDistributed(rank, tp, tp, 1, rank, 0, shared)
             results[rank] = KvCacheTransceiverV2(
                 mapping=mapping,
                 dist=dist,
@@ -827,11 +728,11 @@ def run_mamba_transfer_test(
         for req in ctx_reqs:
             ctx_tcs[rank].respond_and_send_async(req)
 
-    _run_concurrent(
+    run_concurrent(
         ctx_tcs,
         lambda tc: tc.check_context_transfer_status(None, mark_complete=True),
     )
-    _run_concurrent(
+    run_concurrent(
         gen_tcs,
         lambda tc: tc.check_gen_transfer_status(None),
     )
