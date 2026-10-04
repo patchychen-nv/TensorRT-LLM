@@ -14,6 +14,8 @@
 # limitations under the License.
 """DKV request counts retain compute-rank ownership through ADP stats fanout."""
 
+from dataclasses import fields, replace
+
 import pytest
 from dkv_test_utils import LockstepTpGroup
 
@@ -117,3 +119,48 @@ def test_stats_payload_accepts_legacy_wire_fields_without_local_count_semantics(
     assert payload.num_new_active_requests == 0
     assert payload.num_active_requests == 0
     assert payload.num_completed_requests == 0
+
+
+_DKV_COUNT_FIELDS = (
+    "has_local_request_counts",
+    "num_new_active_requests",
+    "num_active_requests",
+    "num_completed_requests",
+)
+
+
+def test_dkv_counts_are_the_trailing_payload_fields() -> None:
+    assert tuple(field.name for field in fields(RankIterStatsPayload))[-4:] == _DKV_COUNT_FIELDS
+
+
+def test_payload_without_dkv_counts_keeps_its_original_width() -> None:
+    payload = RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=4, num_gen_requests=2)
+    assert len(payload.serialize()) == 9
+    state = RankState(rank=3, num_active_requests=5, iter_stats=payload)
+    assert len(state.serialize()) == 13
+    assert RankState.deserialize(state.serialize()) == state
+
+
+@pytest.mark.parametrize("name", _DKV_COUNT_FIELDS)
+def test_any_nonzero_dkv_count_is_transported_with_the_full_width(name: str) -> None:
+    payload = replace(RankIterStatsPayload(has_iter_stats=1), **{name: 3})
+    assert len(payload.serialize()) == 13
+    assert RankIterStatsPayload.deserialize(payload.serialize()) == payload
+    state = RankState(rank=1, iter_stats=payload)
+    assert len(state.serialize()) == 17
+    assert RankState.deserialize(state.serialize()) == state
+
+
+def test_ranks_with_different_payload_widths_still_exchange_and_decode() -> None:
+    group = LockstepTpGroup(2)
+
+    def run_rank(dist):
+        counts = RankIterStatsPayload(has_local_request_counts=1, num_active_requests=2)
+        state = RankState(
+            rank=dist.tp_rank, iter_stats=counts if dist.tp_rank == 0 else RankIterStatsPayload()
+        )
+        return [RankState.deserialize(data) for data in dist.tp_allgather(state.serialize())]
+
+    states = group.run(run_rank)[0]
+    assert states[0].iter_stats.num_active_requests == 2
+    assert states[1].iter_stats == RankIterStatsPayload()

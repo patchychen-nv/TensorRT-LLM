@@ -244,6 +244,105 @@ def test_wallclock_timeout_cannot_release_while_native_reader_is_active():
     worker.kv.unpin_blocks_by_id.assert_called_once_with(7)
 
 
+_CLOCK = "tensorrt_llm._torch.disaggregation.orchestration.coordinator.time.monotonic"
+
+
+@pytest.mark.parametrize("flagged_by", ["earlier_poll", "same_poll"])
+def test_transport_completion_wins_over_the_timeout_flag(flagged_by):
+    request = _request()
+    worker = _rank(1, [request])
+    with patch(_CLOCK, return_value=10):
+        worker.coordinator.send_completed_context([request])
+    if flagged_by == "earlier_poll":
+        request.py_kv_transfer_timed_out = True
+    worker.transceiver.check_context_transfer_status.return_value = CtxTransferStatus([7], [])
+    with patch(_CLOCK, return_value=12):
+        events = worker.coordinator.collect_dkv_transfer_events()
+    assert request.py_kv_transfer_timed_out
+    assert events == (DkvTransferEvent(7, 1, "completed"),)
+    worker.coordinator.commit_dkv_transfer_events(events)
+    assert not request.py_kv_transfer_timed_out
+    worker.effects.fail_requests.assert_not_called()
+
+
+def test_local_send_error_beats_a_reported_completion():
+    request = _request()
+    worker = _rank(1, [request])
+    worker.transceiver.respond_and_send_async.side_effect = RuntimeError("submit failed")
+    worker.coordinator.send_completed_context([request])
+    worker.transceiver.check_context_transfer_status.return_value = CtxTransferStatus([7], [])
+    events = worker.coordinator.collect_dkv_transfer_events()
+    assert [(event.outcome, event.error_message) for event in events] == [
+        ("failed", "submit failed")
+    ]
+
+
+def test_transport_failure_after_a_timeout_is_reported_as_a_timeout():
+    request = _request()
+    worker = _rank(1, [request])
+    worker.coordinator.send_completed_context([request])
+    request.py_kv_transfer_timed_out = True
+    worker.transceiver.check_context_transfer_status.return_value = CtxTransferStatus([], [7])
+    events = worker.coordinator.collect_dkv_transfer_events()
+    assert [event.outcome for event in events] == ["timed_out"]
+
+
+def test_unresolved_send_is_a_collective_fatal_after_twice_the_timeout_exactly_once():
+    request = _request()
+    worker = _rank(1, [request])
+    worker.transceiver.cancel_request.return_value = False
+    with patch(_CLOCK, return_value=10):
+        worker.coordinator.send_completed_context([request])
+    with patch(_CLOCK, return_value=11.5):
+        assert worker.coordinator.collect_dkv_transfer_events() == ()
+        assert worker.coordinator.take_dkv_fatal_messages() == ()
+    with patch(_CLOCK, return_value=12.5):
+        assert worker.coordinator.collect_dkv_transfer_events() == ()
+        messages = worker.coordinator.take_dkv_fatal_messages()
+    assert len(messages) == 1
+    assert "request 7" in messages[0] and "kv_transfer_timeout_ms=1000ms" in messages[0]
+    with patch(_CLOCK, return_value=20):
+        worker.coordinator.collect_dkv_transfer_events()
+        assert worker.coordinator.take_dkv_fatal_messages() == ()
+    assert list(worker.transfers.requests_in_transfer()) == [7]
+    worker.kv.unpin_blocks_by_id.assert_not_called()
+
+
+def test_replica_and_resolved_sends_never_report_a_stall():
+    owner_request, replica_request = _request(7, owner=1), _request(8, owner=1)
+    replica = _rank(0, [replica_request])
+    owner = _rank(1, [owner_request])
+    with patch(_CLOCK, return_value=10):
+        replica.coordinator.send_completed_context([replica_request])
+        owner.coordinator.send_completed_context([owner_request])
+    replica_request.py_kv_transfer_start_time = 0
+    owner.transceiver.check_context_transfer_status.return_value = CtxTransferStatus([7], [])
+    with patch(_CLOCK, return_value=100):
+        replica.coordinator.collect_dkv_transfer_events()
+        owner.coordinator.collect_dkv_transfer_events()
+    assert replica.coordinator.take_dkv_fatal_messages() == ()
+    assert owner.coordinator.take_dkv_fatal_messages() == ()
+
+
+@pytest.mark.parametrize("failure", ["status_raises", "unknown_request"])
+def test_polling_failure_becomes_a_fatal_message_instead_of_a_one_rank_exception(failure):
+    request = _request()
+    worker = _rank(1, [request])
+    worker.coordinator.send_completed_context([request])
+    if failure == "status_raises":
+        worker.transceiver.check_context_transfer_status.side_effect = RuntimeError("status boom")
+        reason = "status boom"
+    else:
+        worker.transceiver.check_context_transfer_status.return_value = CtxTransferStatus([999], [])
+        reason = "DKV transfer status has unknown request 999"
+    assert worker.coordinator.collect_dkv_transfer_events() == ()
+    assert worker.coordinator.take_dkv_fatal_messages() == (
+        f"DKV context transfer polling failed: {reason}",
+    )
+    assert worker.coordinator.take_dkv_fatal_messages() == ()
+    assert list(worker.transfers.requests_in_transfer()) == [7]
+
+
 def test_replica_does_not_poll_or_cancel_based_on_local_clock():
     request = _request()
     worker = _rank(0, [request])

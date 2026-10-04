@@ -167,19 +167,19 @@ def test_fetch_rejects_lost_compute_rank() -> None:
             LockstepTpGroup(2).run(fetch)
 
 
-def test_c1_detects_different_rank_assignments() -> None:
+def test_different_rank_assignments_are_detected() -> None:
     def fetch(dist):
         items = [_queue_item(10), _queue_item(20)]
         routes = {0: [items[dist.tp_rank]], 1: [items[1 - dist.tp_rank]]}
         executor = _fetch_executor(dist, items, routes=routes)
         executor._fetch_new_requests(None, [])
 
-    with pytest.raises(RuntimeError, match="C1"):
+    with pytest.raises(RuntimeError, match="global request order"):
         LockstepTpGroup(2).run(fetch)
 
 
 @pytest.mark.parametrize("mismatch", ["prefix_length", "request_order"])
-def test_c2_detects_prefix_probe_divergence(mismatch: str) -> None:
+def test_prefix_probe_divergence_is_detected(mismatch: str) -> None:
     def fetch(dist):
         executor = _fetch_executor(dist, [_queue_item(10), _queue_item(20)])
         if dist.tp_rank:
@@ -189,12 +189,12 @@ def test_c2_detects_prefix_probe_divergence(mismatch: str) -> None:
                 executor.adp_router.dkv_prefix_matches.reverse()
         executor._fetch_new_requests(None, [])
 
-    with pytest.raises(RuntimeError, match="C2"):
+    with pytest.raises(RuntimeError, match="prefix probes"):
         LockstepTpGroup(2).run(fetch)
 
 
 @pytest.mark.parametrize("different_capacity", [False, True])
-def test_c0_checks_capacity(monkeypatch, different_capacity: bool) -> None:
+def test_startup_capacity_is_checked(monkeypatch, different_capacity: bool) -> None:
     monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
 
     def initialize(dist):
@@ -202,31 +202,66 @@ def test_c0_checks_capacity(monkeypatch, different_capacity: bool) -> None:
         executor.dist = dist
         capacity = 8 + (dist.tp_rank if different_capacity else 0)
         executor.kv_cache_manager = SimpleNamespace(
-            get_dkv_config_fingerprint=lambda: [("max_admissible_sequences", capacity)]
+            get_dkv_config_fingerprint=lambda: [("max_admissible_sequences", capacity)],
+            get_dkv_startup_settings=lambda: {},
         )
         executor.scheduler = SimpleNamespace(dkv_dual_ledger_enabled=False)
         executor._initialize_dkv_invariant_checker()
         return executor._dkv_invariant_checker.enabled
 
     if different_capacity:
-        with pytest.raises(RuntimeError, match="C0"):
+        with pytest.raises(RuntimeError, match="startup configuration"):
             LockstepTpGroup(2).run(initialize)
     else:
         assert LockstepTpGroup(2).run(initialize) == [True, True]
 
 
-def test_c0_detects_different_dual_ledger_switches(monkeypatch) -> None:
-    monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
+@pytest.mark.parametrize("debug", ["0", "1"])
+def test_different_startup_switches_are_detected_without_waiting_for_a_check(
+    monkeypatch, debug: str
+) -> None:
+    monkeypatch.setenv("TRTLLM_DKV_DEBUG", debug)
 
     def initialize(dist):
         executor = PyExecutor.__new__(PyExecutor)
         executor.dist = dist
-        executor.kv_cache_manager = SimpleNamespace(get_dkv_config_fingerprint=lambda: [])
+        executor.kv_cache_manager = SimpleNamespace(
+            get_dkv_config_fingerprint=lambda: [], get_dkv_startup_settings=lambda: {}
+        )
         executor.scheduler = SimpleNamespace(dkv_dual_ledger_enabled=bool(dist.tp_rank))
         executor._initialize_dkv_invariant_checker()
 
-    with pytest.raises(RuntimeError, match="C0"):
-        LockstepTpGroup(2).run(initialize)
+    group = LockstepTpGroup(2)
+    with pytest.raises(RuntimeError, match="startup settings differ.*dual_ledger"):
+        group.run(initialize)
+    assert [len(trace) for trace in group.traces] == [1, 1]
+
+
+def test_startup_settings_cover_every_process_level_switch(monkeypatch) -> None:
+    monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
+    recorded = {}
+
+    class _RecordingChecker:
+        enabled = False
+
+        def __init__(self, dist, enabled=None, startup_settings=None) -> None:
+            recorded.update(startup_settings)
+
+        def check_many(self, iter_counter, items_by_tag) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.DkvInvariantChecker", _RecordingChecker
+    )
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.dist = None
+    executor.kv_cache_manager = SimpleNamespace(
+        get_dkv_config_fingerprint=lambda: [],
+        get_dkv_startup_settings=lambda: {"kv_cache_backend": "py"},
+    )
+    executor.scheduler = SimpleNamespace(dkv_dual_ledger_enabled=True)
+    executor._initialize_dkv_invariant_checker()
+    assert recorded == {"dual_ledger": True, "metrics_all_ranks": True, "kv_cache_backend": "py"}
 
 
 def _scheduled_executor(dist, *, trace, requests, checker_enabled=True) -> PyExecutor:
@@ -254,7 +289,7 @@ def _scheduled_executor(dist, *, trace, requests, checker_enabled=True) -> PyExe
 
 
 @pytest.mark.parametrize("mismatch", [None, "request_order", "chunk", "kv_order", "kv_result"])
-def test_c3_checks_scheduled_requests_and_ordered_kv_trace(mismatch: str | None) -> None:
+def test_scheduling_decisions_and_ordered_kv_trace_are_checked(mismatch: str | None) -> None:
     def schedule(dist):
         requests = [make_request(8, compute_rank=1), make_request(3, compute_rank=0)]
         for request in requests:
@@ -277,11 +312,11 @@ def test_c3_checks_scheduled_requests_and_ordered_kv_trace(mismatch: str | None)
     if mismatch is None:
         assert LockstepTpGroup(2).run(schedule) == [[8, 3]] * 2
     else:
-        with pytest.raises(RuntimeError, match="C3"):
+        with pytest.raises(RuntimeError, match="scheduling decisions"):
             LockstepTpGroup(2).run(schedule)
 
 
-def test_c3_drains_trace_when_debug_is_disabled() -> None:
+def test_kv_trace_is_drained_when_debug_is_disabled() -> None:
     def schedule(dist):
         executor = _scheduled_executor(dist, trace=[], requests=[], checker_enabled=False)
         executor._prepare_and_schedule_batch()

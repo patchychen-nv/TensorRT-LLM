@@ -1832,11 +1832,12 @@ class AttentionDpConfig(StrictBaseModel):
 
 
 class DkvConfig(StrictBaseModel):
-    """Configuration for DKV (layer-split distributed KV storage).
+    """Configuration for DKV (replicated KV lifecycle across the attention-DP group).
 
-    DKV stores KV per layer across the attention-DP / TP group with a
-    group-replicated KV lifecycle, for prefill. The DKV group is the
-    attention-DP / TP group; its size always equals tp_size and is not
+    Every rank of the attention-DP / TP group runs the KV cache lifecycle of
+    every request, while only the request's compute rank runs the forward
+    pass, sampling and KV send. Only prefill is supported. The DKV group is
+    the attention-DP / TP group; its size always equals tp_size and is not
     separately configurable.
     """
     attention_mode: Literal["dp", "sp"] = Field(
@@ -5691,8 +5692,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
     dkv_config: Optional[DkvConfig] = Field(
         default=None,
-        description="Enable DKV: layer-split KV storage across the "
-        "attention-DP/TP group with a group-replicated KV lifecycle. "
+        description="Enable DKV: every rank of the attention-DP/TP group "
+        "runs the KV cache lifecycle of every request, so prefix reuse is "
+        "visible group-wide; only the compute rank runs the forward pass. "
         "Prefill only. Disabled when unset.",
         status="prototype")
 
@@ -6507,9 +6509,16 @@ class TorchLlmArgs(BaseLlmArgs):
         if reuse_policy == "per_conversation" or (
                 self.kv_cache_config.enable_block_reuse
                 and reuse_policy != "per_request"):
+            remedy = "use 'per_request'"
+            if reuse_policy != "per_conversation":
+                # Reuse across ranks yields invalid outputs, so a deployment
+                # that needs correct outputs should turn reuse off instead.
+                remedy += (" (outputs of requests that reuse a prefix computed "
+                           "on another rank are not valid), or set "
+                           "kv_cache_config.enable_block_reuse=False")
             raise ValueError(
                 f"kv_cache_config.block_reuse_config.policy={reuse_policy!r} "
-                "is not supported with dkv_config yet; use 'per_request'")
+                f"is not supported with dkv_config yet; {remedy}")
         if not self.kv_cache_config.enable_block_reuse:
             logger.warning(
                 "dkv_config is enabled with KV block reuse disabled; "

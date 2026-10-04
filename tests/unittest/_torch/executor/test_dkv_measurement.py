@@ -13,9 +13,13 @@ from tensorrt_llm._torch.pyexecutor.dkv_metrics import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
-    _measure_dkv_context_operation,
+    _dkv_group_size_of,
+    _dkv_measurement_of,
+    _measured_dkv_context_operation,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _record(
@@ -401,12 +405,12 @@ def test_manager_hook_deduplicates_request_repreparation_without_retaining_ids()
     manager = _manager()
     request = _request()
 
-    @_measure_dkv_context_operation
-    def prepare_context(self: KVCacheManagerV2, req: SimpleNamespace) -> bool:
+    def prepare_context(req: SimpleNamespace) -> bool:
         return True
 
-    assert prepare_context(manager, request)
-    assert prepare_context(manager, request)
+    hooked = _measured_dkv_context_operation(manager, prepare_context)
+    assert hooked(request)
+    assert hooked(request)
     assert request.py_dkv_measurement_prepared
     counters = manager._dkv_measurement.snapshot()
     assert counters["request_count"] == 1
@@ -417,11 +421,11 @@ def test_manager_hook_deduplicates_request_repreparation_without_retaining_ids()
 def test_manager_hook_excludes_replica_and_dummy_work(owner: int, dummy: bool) -> None:
     manager = _manager()
 
-    @_measure_dkv_context_operation
-    def prepare_context(self: KVCacheManagerV2, req: SimpleNamespace) -> bool:
+    def prepare_context(req: SimpleNamespace) -> bool:
         return True
 
-    assert prepare_context(manager, _request(owner, dummy))
+    hooked = _measured_dkv_context_operation(manager, prepare_context)
+    assert hooked(_request(owner, dummy))
     assert manager._dkv_measurement.snapshot()["prepare_attempts"] == 0
 
 
@@ -429,17 +433,41 @@ def test_manager_hook_preserves_failure_and_exception_contract() -> None:
     manager = _manager()
     request = _request()
 
-    @_measure_dkv_context_operation
-    def prepare_context(self: KVCacheManagerV2, req: SimpleNamespace) -> bool:
+    def prepare_context(req: SimpleNamespace) -> bool:
         return False
 
-    assert not prepare_context(manager, request)
+    assert not _measured_dkv_context_operation(manager, prepare_context)(request)
     assert not request.py_dkv_measurement_prepared
 
-    @_measure_dkv_context_operation
-    def resize_context(self: KVCacheManagerV2, req: SimpleNamespace) -> bool:
+    def resize_context(req: SimpleNamespace) -> bool:
         raise RuntimeError("allocation failed")
 
     with pytest.raises(RuntimeError, match="allocation failed"):
-        resize_context(manager, request)
+        _measured_dkv_context_operation(manager, resize_context)(request)
     assert manager._dkv_measurement.snapshot()["resize_errors"] == 1
+
+
+def test_hooks_wrap_only_the_instance_that_enables_them() -> None:
+    manager = _manager()
+    other = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager._dkv_trace_enabled = False
+    manager._install_dkv_hooks()
+    assert "prepare_context" in vars(manager)
+    assert "prepare_context" not in vars(other)
+    # The class keeps the plain function, so borrowed methods run without any hook.
+    assert not hasattr(KVCacheManagerV2.prepare_context, "__wrapped__")
+
+
+def test_dkv_state_reads_as_off_for_partial_managers_and_spec_doubles() -> None:
+    from unittest.mock import Mock
+
+    for double in (
+        Mock(spec=KVCacheManagerV2),
+        SimpleNamespace(),
+        KVCacheManagerV2.__new__(KVCacheManagerV2),
+    ):
+        assert _dkv_group_size_of(double) is None
+        assert _dkv_measurement_of(double) is None
+    manager = _manager()
+    assert _dkv_group_size_of(manager) == 2
+    assert _dkv_measurement_of(manager) is manager._dkv_measurement

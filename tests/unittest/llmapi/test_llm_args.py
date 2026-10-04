@@ -4982,6 +4982,19 @@ class TestDkvConfig:
                     match="policy=.*not supported with dkv_config yet"):
                 self._dkv_args(kv_cache_config=config)
 
+    def test_reuse_policy_error_offers_disabling_reuse_only_when_that_helps(
+            self) -> None:
+        with pytest.raises(
+                ValueError,
+                match=r"use 'per_request'.*enable_block_reuse=False"):
+            self._dkv_args(kv_cache_config=KvCacheConfig(
+                block_reuse_config=BlockReuseConfig(policy="all_reusable")))
+        with pytest.raises(ValueError, match="use 'per_request'") as caught:
+            self._dkv_args(kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                block_reuse_config=BlockReuseConfig(policy="per_conversation")))
+        assert "enable_block_reuse" not in str(caught.value)
+
     def test_attention_dp_is_required(self) -> None:
         with pytest.raises(ValueError, match="enable_attention_dp=True"):
             self._dkv_args(enable_attention_dp=False)

@@ -73,6 +73,7 @@ def test_sequence_capacity_reserves_global_admission_and_dummies(
     manager.is_disagg = is_disagg
     manager._guard_page_value = guard
     admission, indices = manager._get_sequence_capacities(1, True)
+    assert manager._get_max_num_sequences() == 2 * (group_size or 1)
     assert admission == 2 * (group_size or 1) * (2 if is_disagg else 1)
     assert indices == admission + 1 + (group_size or 0) + (guard is not None)
 
@@ -81,6 +82,7 @@ def test_non_dkv_overlap_retains_extra_sequence_leases() -> None:
     manager = _manager(None)
     assert manager._get_sequence_capacities(1, False) == (4, 5)
     manager.mapping = Mapping(world_size=2, pp_size=2)
+    assert manager._get_max_num_sequences() == 4
     assert manager._get_sequence_capacities(1, False) == (4, 5)
 
 
@@ -268,6 +270,7 @@ def test_generation_dummy_can_still_initialize_kv() -> None:
 def test_debug_trace_records_failed_admission_and_drains() -> None:
     manager = _manager(2)
     manager._dkv_trace_enabled = True
+    manager._install_dkv_hooks()
     manager.prepare_context_cache = Mock(return_value=None)
     request = _request()
     assert not manager.prepare_context(request)
@@ -285,6 +288,7 @@ def test_debug_trace_records_failed_admission_and_drains() -> None:
 def test_debug_trace_preserves_generation_guard_errors() -> None:
     manager = _manager(2)
     manager._dkv_trace_enabled = True
+    manager._install_dkv_hooks()
     with pytest.raises(RuntimeError, match="not supported with dkv_config yet"):
         manager.try_allocate_generation(_request())
     assert manager.consume_dkv_trace()[-1] == ("raised", "try_allocate_generation", None)
@@ -294,6 +298,7 @@ def test_debug_trace_preserves_generation_guard_errors() -> None:
 def test_context_rollback_exposes_success_and_failure_to_c3(resize_succeeds: bool) -> None:
     manager = _manager(2)
     manager._dkv_trace_enabled = True
+    manager._install_dkv_hooks()
     manager._connector_reservations_enabled = lambda: False
     cache = SimpleNamespace(
         capacity=128,

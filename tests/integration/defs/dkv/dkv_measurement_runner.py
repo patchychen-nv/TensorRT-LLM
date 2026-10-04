@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Two-rank metadata reuse experiments with explicit Option B validity controls."""
+"""Two-rank metadata reuse experiments with explicit validity controls."""
 
 import argparse
 import json

@@ -12,15 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DKV: layer-split distributed KV storage with a group-replicated KV lifecycle.
+"""DKV: group-replicated KV lifecycle for attention-DP prefill.
 
-All DKV-related helper code lives in this module for now; it will be split
-into a package once the streamer/staging components land.
+Every rank runs the KV cache lifecycle of every request, so the ranks must reach
+the same decisions from the same replicated state. This module holds the two
+lockstep exchanges that keep them aligned and the checker that detects drift:
+
+* the sample sync: one allgather per iteration in which the compute rank of each
+  request publishes the sampler outcome (completion, finish reason, error) so
+  every replica reaches the same state before KV is committed;
+* the control sync: one allgather at the top of every iteration that carries the
+  capacity digest, fatal errors, pending responses and transfer events;
+* ``DkvInvariantChecker``: startup agreement plus debug-only fingerprint checks.
 """
 
 import hashlib
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import DkvTransferEvent
@@ -49,11 +57,39 @@ class DkvSamplerError:
 
 @dataclass(frozen=True)
 class DkvSamplePayload:
-    """The single S-sample exchange, including pre-exchange validation failures."""
+    """The single S-sample exchange, including pre-exchange validation failures.
+
+    ``batch_digest`` is ``(request count, digest)`` of the global batch as this rank sees it, so a
+    rank whose replica of the batch diverged is reported by every rank at the same moment.
+    """
 
     completions: tuple[DkvSampleCompletion, ...]
     errors: tuple[DkvSamplerError, ...]
     validation_errors: tuple[str, ...]
+    batch_digest: tuple[int, int] = (0, 0)
+
+
+def _digest_text(text: str) -> int:
+    """64-bit digest that is identical across processes (unlike the salted builtin ``hash``)."""
+    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big")
+
+
+def digest_global_batch(requests: Iterable[LlmRequest]) -> tuple[int, int]:
+    """Order-sensitive digest of ``(id, compute rank, context position)`` of the real requests."""
+    records = [
+        (request.py_request_id, request.py_dkv_compute_rank, request.context_current_position)
+        for request in requests
+        if not request.is_dummy
+    ]
+    return len(records), _digest_text(repr(records))
+
+
+def _valid_batch_digest(digest: object) -> bool:
+    return (
+        isinstance(digest, tuple)
+        and len(digest) == 2
+        and all(type(value) is int and value >= 0 for value in digest)
+    )
 
 
 def sync_dkv_sample_results(
@@ -123,6 +159,7 @@ def sync_dkv_sample_results(
         tuple(completions),
         tuple(DkvSamplerError(message, tuple(request_ids)) for message, request_ids in errors),
         tuple(validation_errors),
+        digest_global_batch(global_requests),
     )
     all_payloads = dist.tp_allgather(payload)
     if len(all_payloads) != dist.tp_size or any(
@@ -134,6 +171,16 @@ def sync_dkv_sample_results(
         for rank, rank_payload in enumerate(all_payloads)
         for message in rank_payload.validation_errors
     ]
+    for rank, rank_payload in enumerate(all_payloads):
+        if not _valid_batch_digest(rank_payload.batch_digest):
+            problems.append(f"rank {rank}: invalid global batch digest")
+        elif rank_payload.batch_digest != all_payloads[0].batch_digest:
+            problems.append(
+                f"rank {rank}: global batch differs from rank 0 "
+                f"({rank_payload.batch_digest[0]} requests, digest {rank_payload.batch_digest[1]} "
+                f"vs {all_payloads[0].batch_digest[0]} requests, "
+                f"digest {all_payloads[0].batch_digest[1]})"
+            )
     received: dict[int, DkvSampleCompletion] = {}
     sampler_errors: list[DkvSamplerError] = []
     failed_ids: set[int] = set()
@@ -205,6 +252,13 @@ class DkvControlDigest:
     free_pages: tuple[tuple[int, ...], ...]
     index_mapper_used: int
     active_request_count: int
+    in_transfer_count: int = 0
+    in_transfer_digest: int = 0
+
+
+def digest_request_ids(request_ids: Iterable[int]) -> int:
+    """Order-independent 64-bit digest of request ids, identical across processes."""
+    return _digest_text(",".join(str(request_id) for request_id in sorted(request_ids)))
 
 
 @dataclass(frozen=True)
@@ -231,7 +285,13 @@ class DkvControlResult:
 def _valid_control_digest(digest: DkvControlDigest) -> bool:
     if not isinstance(digest, DkvControlDigest):
         return False
-    counters = (digest.iter_counter, digest.index_mapper_used, digest.active_request_count)
+    counters = (
+        digest.iter_counter,
+        digest.index_mapper_used,
+        digest.active_request_count,
+        digest.in_transfer_count,
+        digest.in_transfer_digest,
+    )
     return (
         all(type(value) is int and value >= 0 for value in counters)
         and isinstance(digest.free_pages, tuple)
@@ -245,8 +305,8 @@ def _valid_control_digest(digest: DkvControlDigest) -> bool:
 def sync_dkv_control(dist: Distributed, payload: DkvControlPayload) -> DkvControlResult:
     """Validate replicated state and combine local events in one collective.
 
-    D12 capacity counters are checked even with debugging disabled. Debug C4
-    free sets share this exchange, including diagnostics on
+    Capacity counters are checked even with debugging disabled. The debug-only
+    freed-request sets share this exchange, including diagnostics on
     mismatch, so no failure-only collective is necessary. Fatal events are
     returned for the executor's collectively aligned shutdown path.
     """
@@ -260,7 +320,7 @@ def sync_dkv_control(dist: Distributed, payload: DkvControlPayload) -> DkvContro
             problems.append(f"rank {rank}: invalid control payload")
             continue
         if not _valid_control_digest(rank_payload.digest):
-            problems.append(f"rank {rank}: invalid D12 digest")
+            problems.append(f"rank {rank}: invalid capacity digest")
         if not isinstance(rank_payload.fatal_messages, tuple) or any(
             not isinstance(message, str) for message in rank_payload.fatal_messages
         ):
@@ -296,13 +356,13 @@ def sync_dkv_control(dist: Distributed, payload: DkvControlPayload) -> DkvContro
         reference = all_payloads[0]
         for rank, rank_payload in enumerate(all_payloads[1:], start=1):
             if rank_payload.digest != reference.digest:
-                problems.append(f"rank {rank}: D12 digest differs from rank 0")
+                problems.append(f"rank {rank}: capacity digest differs from rank 0")
             if rank_payload.debug_enabled != reference.debug_enabled:
                 problems.append(f"rank {rank}: debug flag differs from rank 0")
             if rank_payload.debug_enabled and (
                 rank_payload.freed_request_ids != reference.freed_request_ids
             ):
-                problems.append(f"rank {rank}: C4 free request IDs differ from rank 0")
+                problems.append(f"rank {rank}: freed request IDs differ from rank 0")
     if problems:
         summaries = "\n".join(
             f"  rank {rank}: {rank_payload!r}" for rank, rank_payload in enumerate(all_payloads)
@@ -323,27 +383,80 @@ def sync_dkv_control(dist: Distributed, payload: DkvControlPayload) -> DkvContro
     )
 
 
+_MAX_RANK_REPORT_CHARS = 4000
+
+
+def _first_record_difference(reference: object, other: object) -> str:
+    """Name the first record where ``other`` departs from ``reference``."""
+    if isinstance(reference, (list, tuple)) and isinstance(other, (list, tuple)):
+        for index, (left, right) in enumerate(zip(reference, other)):
+            if left != right:
+                return f"record {index}: {left!r} != {right!r}"
+        if len(reference) != len(other):
+            return f"{len(reference)} records != {len(other)} records"
+    return f"{reference!r} != {other!r}"
+
+
+def _first_payload_difference(reference: tuple, other: tuple) -> str:
+    """Summarize where one rank's ``(iter, [(tag, items), ...])`` differs from rank 0."""
+    if reference[0] != other[0]:
+        return f"iteration {reference[0]} != {other[0]}"
+    reference_tags = [tag for tag, _ in reference[1]]
+    other_tags = [tag for tag, _ in other[1]]
+    if reference_tags != other_tags:
+        return f"tags {reference_tags} != {other_tags}"
+    for (tag, left), (_, right) in zip(reference[1], other[1]):
+        if left != right:
+            return f"tag {tag}, {_first_record_difference(left, right)}"
+    return "no difference found"
+
+
+def _bounded_repr(value: object) -> str:
+    text = repr(value)
+    if len(text) > _MAX_RANK_REPORT_CHARS:
+        return text[:_MAX_RANK_REPORT_CHARS] + f"... ({len(text)} characters)"
+    return text
+
+
 class DkvInvariantChecker:
-    """Debug-only cross-rank consistency checker for DKV.
+    """Cross-rank consistency checker for DKV; per-iteration checks are debug-only.
 
     DKV correctness relies on every rank independently deriving identical
     scheduling decisions from replicated state. A divergence is silent and
-    surfaces much later (e.g. as a mismatched MoE collective). When enabled
-    (TRTLLM_DKV_DEBUG=1) this checker fingerprints per-iteration decisions,
-    allgathers one digest per rank, and on mismatch dumps a per-rank diff
-    and raises at the exact iteration the divergence appeared.
+    surfaces much later (e.g. as a mismatched MoE collective). Construction
+    always agrees on the debug flag and on the startup settings that every rank
+    must share. When debugging is enabled (TRTLLM_DKV_DEBUG=1) the checker
+    fingerprints per-iteration decisions, allgathers one digest per rank, and on
+    mismatch reports the first differing record per rank and raises at the exact
+    iteration the divergence appeared.
     """
 
-    def __init__(self, dist: Distributed, enabled: bool | None = None) -> None:
+    def __init__(
+        self,
+        dist: Distributed,
+        enabled: bool | None = None,
+        startup_settings: Mapping[str, object] | None = None,
+    ) -> None:
         self.dist = dist
         if enabled is None:
             enabled = os.environ.get("TRTLLM_DKV_DEBUG", "0") not in ("0", "false", "False")
         self.enabled = enabled
-        enabled_by_rank = self.dist.tp_allgather(self.enabled)
-        if any(flag != self.enabled for flag in enabled_by_rank):
+        settings = tuple(sorted((startup_settings or {}).items()))
+        by_rank = self.dist.tp_allgather((self.enabled, settings))
+        if any(rank_enabled != self.enabled for rank_enabled, _ in by_rank):
             raise RuntimeError(
                 "DKV invariant checker enable flags differ across ranks: "
-                f"{enabled_by_rank}; set TRTLLM_DKV_DEBUG consistently"
+                f"{[rank_enabled for rank_enabled, _ in by_rank]}; set TRTLLM_DKV_DEBUG "
+                "consistently"
+            )
+        if any(rank_settings != settings for _, rank_settings in by_rank):
+            raise RuntimeError(
+                "DKV startup settings differ across ranks: "
+                + "; ".join(
+                    f"rank {rank}: {dict(rank_settings)}"
+                    for rank, (_, rank_settings) in enumerate(by_rank)
+                )
+                + ". Set the corresponding environment variables identically on every rank."
             )
 
     def check(self, iter_counter: int, tag: str, items: object) -> None:
@@ -373,15 +486,15 @@ class DkvInvariantChecker:
         if all(d == all_digests[0] for d in all_digests):
             return
         all_items = self.dist.tp_allgather(payload)
-        report = [
-            f"DKV invariant violation at iter {iter_counter}, tags={list(items_by_tag)}",
-            f"  rank0: {all_items[0]!r}",
-        ]
-        reference = all_items[0]
+        report = [f"DKV invariant violation at iter {iter_counter}, tags={list(items_by_tag)}"]
         for rank, rank_items in enumerate(all_items[1:], start=1):
-            if rank_items == reference:
-                continue
-            report.append(f"  rank{rank}: {rank_items!r}")
+            if rank_items != all_items[0]:
+                report.append(
+                    f"  rank{rank} differs from rank0: "
+                    f"{_first_payload_difference(all_items[0], rank_items)}"
+                )
+        for rank, rank_items in enumerate(all_items):
+            report.append(f"  rank{rank}: {_bounded_repr(rank_items)}")
         msg = "\n".join(report)
         logger.error(msg)
         raise RuntimeError(msg)

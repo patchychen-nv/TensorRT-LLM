@@ -2555,7 +2555,8 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             "tokens_per_block": 128,
             "enable_swa_scratch_reuse": True,
         }
-        if llm_args is not None and llm_args.dkv_config is not None:
+        # Callers such as the config database pass a plain dict, which never enables DKV.
+        if getattr(llm_args, "dkv_config", None) is not None:
             kv_cache_defaults["enable_swa_scratch_reuse"] = False
             kv_cache_defaults["block_reuse_config"] = {"policy": "per_request"}
         if get_sm_version() == 90:

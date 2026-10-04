@@ -10,6 +10,7 @@ reached through the ``interfaces`` Protocols.
 
 import os
 import time
+import traceback
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
@@ -108,6 +109,8 @@ class DisaggTransferCoordinator:
         self._is_local = is_local
         self._dkv_transfer_events: Dict[int, DkvTransferEvent] = {}
         self._dkv_send_errors: Dict[int, str] = {}
+        self._dkv_fatal_messages: List[str] = []
+        self._dkv_stalled_request_ids: Set[int] = set()
         # Context sends that failed after leaving the transfer manager; applied
         # at the next rank-synchronized error pass.
         self._pending_ctx_transfer_failures: Set[int] = set()
@@ -501,19 +504,26 @@ class DisaggTransferCoordinator:
             # Native admission failures are local observations until S-control.
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-    def _stage_dkv_transfer_event(self, request: LlmRequest, *, failed: bool = False) -> None:
+    def _stage_dkv_transfer_event(
+        self, request: LlmRequest, *, reported_completed: bool = False
+    ) -> None:
+        """Stage the terminal outcome of one local send.
+
+        A completion reported by the transport wins over the local timeout flag: the pages were
+        delivered, so a deadline that expired in the same poll must not fail the request.
+        """
         request_id = request.py_request_id
         if request_id in self._dkv_transfer_events:
             return
         error_message = self._dkv_send_errors.get(request_id, "")
-        if request.py_kv_transfer_timed_out:
+        if reported_completed and not error_message:
+            outcome = "completed"
+        elif request.py_kv_transfer_timed_out:
             outcome = "timed_out"
             error_message = f"Request {request_id} timed out (KV transfer)"
-        elif failed or error_message:
+        else:
             outcome = "failed"
             error_message = error_message or "Context KV transfer failed"
-        else:
-            outcome = "completed"
         self._dkv_transfer_events[request_id] = DkvTransferEvent(
             request_id, request.py_dkv_compute_rank, outcome, error_message
         )
@@ -536,7 +546,9 @@ class DisaggTransferCoordinator:
             request = by_transfer_id.get(transfer_id)
             if request is None:
                 raise RuntimeError(f"DKV transfer status has unknown request {transfer_id}")
-            self._stage_dkv_transfer_event(request, failed=transfer_id in failed_ids)
+            self._stage_dkv_transfer_event(
+                request, reported_completed=transfer_id not in failed_ids
+            )
 
         for request_id, request in sorted(local_requests.items()):
             if request_id in self._dkv_transfer_events:
@@ -544,20 +556,65 @@ class DisaggTransferCoordinator:
             if request.py_kv_transfer_timed_out or request_id in self._dkv_send_errors:
                 # A timeout alone does not establish physical quiescence.
                 if self.request_cancellation(request):
-                    self._stage_dkv_transfer_event(request, failed=True)
+                    self._stage_dkv_transfer_event(request)
             elif self._transceiver.has_retired_send_session(request):
                 # V2 also retires remote cancellations without a completion ID.
-                self._stage_dkv_transfer_event(request, failed=True)
+                self._stage_dkv_transfer_event(request)
         for request in local_requests.values():
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
+    def _stalled_dkv_transfers(self) -> List[str]:
+        """Describe local sends still unresolved after twice the transfer timeout.
+
+        The first timeout requests cancellation; a send that stays unresolved for as long again
+        cannot be released, because the fabric may still read its pages. Each stall is reported
+        once.
+        """
+        timeout_ms = self._transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return []
+        now = time.monotonic()
+        stalled = []
+        for request_id, request in sorted(self._transfers.requests_in_transfer().items()):
+            if (
+                not self._is_local(request)
+                or request_id in self._dkv_transfer_events
+                or request_id in self._dkv_stalled_request_ids
+                or request.py_kv_transfer_start_time is None
+            ):
+                continue
+            elapsed_ms = (now - request.py_kv_transfer_start_time) * 1000
+            if elapsed_ms > 2 * timeout_ms:
+                self._dkv_stalled_request_ids.add(request_id)
+                stalled.append(
+                    f"KV transfer of request {request_id} has no terminal result after "
+                    f"{elapsed_ms:.0f}ms (kv_transfer_timeout_ms={timeout_ms}ms)"
+                )
+        return stalled
+
     def collect_dkv_transfer_events(self) -> Tuple[DkvTransferEvent, ...]:
-        """Observe local sends without releasing any replicated resources."""
+        """Observe local sends without releasing any replicated resources.
+
+        A failure while polling only happens on a compute rank, so it is not raised here: the
+        executor publishes it through ``take_dkv_fatal_messages`` and every rank stops together.
+        """
         if self._is_local is None:
             return ()
-        self.check_transfer_timeouts()
-        self._poll_dkv_context_sends()
+        try:
+            self.check_transfer_timeouts()
+            self._poll_dkv_context_sends()
+            self._dkv_fatal_messages.extend(self._stalled_dkv_transfers())
+        except Exception as error:
+            logger.error(f"DKV context transfer polling failed: {error}")
+            logger.error(traceback.format_exc())
+            self._dkv_fatal_messages.append(f"DKV context transfer polling failed: {error}")
         return tuple(self._dkv_transfer_events[key] for key in sorted(self._dkv_transfer_events))
+
+    def take_dkv_fatal_messages(self) -> Tuple[str, ...]:
+        """Drain the fatal conditions found by the DKV transfer path on this rank."""
+        messages = tuple(self._dkv_fatal_messages)
+        self._dkv_fatal_messages.clear()
+        return messages
 
     def dkv_context_send_failed(self, request: LlmRequest) -> bool:
         """Whether a local failure makes the context success response unsafe."""
@@ -571,6 +628,10 @@ class DisaggTransferCoordinator:
 
         Returns whether the executor must collectively flush staged responses
         and terminations before it schedules another batch.
+
+        Response creation runs on the compute rank only. An exception raised there is not
+        replicated: it ends the event loop of that rank and the rank-crash hard kill stops the
+        group, which is the accepted outcome for a fault that cannot be agreed on beforehand.
         """
         if self._is_local is None:
             if events:
@@ -802,6 +863,7 @@ class DisaggTransferCoordinator:
         self._timed_out_gen_cancelled_ids.discard(request_id)
         self._dkv_transfer_events.pop(request_id, None)
         self._dkv_send_errors.pop(request_id, None)
+        self._dkv_stalled_request_ids.discard(request_id)
 
     @nvtx_range("cancel_timed_out_gen_transfers")
     def _cancel_timed_out_gen_transfers(self) -> None:
@@ -1010,6 +1072,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         return None
 
     def collect_dkv_transfer_events(self) -> Tuple[DkvTransferEvent, ...]:
+        return ()
+
+    def take_dkv_fatal_messages(self) -> Tuple[str, ...]:
         return ()
 
     def dkv_context_send_failed(self, request: LlmRequest) -> bool:

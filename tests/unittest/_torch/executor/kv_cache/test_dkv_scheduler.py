@@ -419,6 +419,42 @@ def test_empty_prefill_recovers_by_rewinding_last_started_request(
     assert _ids(scheduler.schedule_request(requests, set()).context_requests) == [5]
 
 
+def test_repeated_stall_recoveries_are_counted_and_warned_on_each_doubling() -> None:
+    manager = _PageManager(pages=2)
+    scheduler = _scheduler(manager, tokens=64, chunked=True)
+    requests = _contexts([(5, 0, 128), (2, 1, 128)])
+
+    def stall_again() -> None:
+        for request in requests:
+            manager.fail_prepare.discard(request.py_request_id)
+            if request.py_request_id not in manager.kv_cache_map:
+                manager.prepare_context(request)
+                manager.resize_context(request, 64)
+                request.context_current_position = 64
+            manager.kv_cache_map[request.py_request_id].is_active = False
+            manager.fail_prepare.add(request.py_request_id)
+        assert scheduler.schedule_request(requests, set()).context_requests == []
+
+    with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger.warning") as warning:
+        for _ in range(4):
+            stall_again()
+        assert scheduler._dkv_stall_recoveries == {2: 4}
+        messages = [call.args[0] for call in warning.call_args_list]
+        assert [message.split(":")[0] for message in messages] == [
+            "DKV stall recovery #1",
+            "DKV stall recovery #2",
+            "DKV stall recovery #4",
+        ]
+        assert all("request 2 released its KV cache" in message for message in messages)
+        # A request that left the active set no longer holds a counter.
+        requests.pop()
+        manager.fail_prepare.discard(5)
+        manager.kv_cache_map[5].is_active = False
+        manager.fail_prepare.add(5)
+        scheduler.schedule_request(requests, set())
+    assert scheduler._dkv_stall_recoveries == {5: 1}
+
+
 @pytest.mark.parametrize("waiting", ["inflight", "connector", "transfer", "unstarted"])
 def test_empty_batch_does_not_rewind_asynchronous_or_unstarted_work(dual_ledger, waiting) -> None:
     manager = _PageManager(pages=1)

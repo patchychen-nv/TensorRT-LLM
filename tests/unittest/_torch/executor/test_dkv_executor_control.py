@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 from dkv_test_utils import LockstepTpGroup, make_request
 
+from tensorrt_llm._torch.pyexecutor.dkv import DkvInvariantChecker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     FinishReason,
     LlmRequest,
@@ -18,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     SamplingConfig,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
@@ -312,7 +314,7 @@ def test_rank_local_fatal_budget_shuts_down_every_rank_at_control() -> None:
 @pytest.mark.parametrize("method", ["_terminate_request", "_free_request_resources"])
 def test_free_outside_commit_window_is_rejected_before_resources_mutate(method: str) -> None:
     executor = _executor(LockstepTpGroup(1).ranks[0])
-    with pytest.raises(AssertionError, match="outside.*commit window"):
+    with pytest.raises(RuntimeError, match="outside.*commit window"):
         getattr(executor, method)(make_request(8))
     assert _freed(executor) == []
     assert executor._dkv_freed_request_ids == []
@@ -328,7 +330,7 @@ def test_each_commit_window_records_real_frees_and_restores_scope(reason: str) -
     assert _freed(executor) == [8]
 
 
-def test_c4_detects_different_free_sets_without_extra_failure_collective() -> None:
+def test_different_free_sets_are_detected_without_extra_failure_collective() -> None:
     group = LockstepTpGroup(2)
 
     def run(dist) -> None:
@@ -336,13 +338,13 @@ def test_c4_detects_different_free_sets_without_extra_failure_collective() -> No
         executor._dkv_freed_request_ids = [8 + dist.tp_rank]
         executor._sync_dkv_control()
 
-    with pytest.raises(RuntimeError, match="C4 free request IDs differ"):
+    with pytest.raises(RuntimeError, match="freed request IDs differ"):
         group.run(run)
     assert group.traces[0] == group.traces[1]
     assert len(group.traces[0]) == 1
 
 
-def test_d12_capacity_divergence_is_checked_without_debug() -> None:
+def test_capacity_divergence_is_checked_without_debug() -> None:
     group = LockstepTpGroup(2)
 
     def run(dist) -> None:
@@ -353,9 +355,87 @@ def test_d12_capacity_divergence_is_checked_without_debug() -> None:
         )
         executor._sync_dkv_control()
 
-    with pytest.raises(RuntimeError, match="D12 digest differs"):
+    with pytest.raises(RuntimeError, match="capacity digest differs"):
         group.run(run)
     assert group.traces[0] == group.traces[1]
+
+
+def _iteration_end_executor(dist, *, enabled: bool = True, **changes) -> PyExecutor:
+    """Executor whose replicated end-of-iteration state can differ per rank."""
+    executor = _executor(dist)
+    executor._dkv_invariant_checker = DkvInvariantChecker(dist, enabled=enabled)
+    fingerprint = changes.get("kv_state", [("pool", 4, 2)])
+    executor.kv_cache_manager = SimpleNamespace(get_dkv_state_fingerprint=lambda: fingerprint)
+    in_transfer = changes.get("in_transfer", ())
+    executor.kv_cache_transceiver = object() if in_transfer else None
+    executor.async_transfer_manager = Mock(
+        requests_in_transfer=Mock(return_value={request_id: None for request_id in in_transfer})
+    )
+    executor.active_requests = changes.get("active", [make_request(8), make_request(9)])
+    executor._dkv_freed_request_ids = list(changes.get("freed", ()))
+    return executor
+
+
+def test_iteration_end_check_passes_when_replicated_state_agrees() -> None:
+    group = LockstepTpGroup(2)
+
+    def run(dist) -> None:
+        executor = _iteration_end_executor(dist, in_transfer=(5, 3), freed=(8,))
+        executor._check_dkv_iteration_end(include_freed=True)
+
+    group.run(run)
+    assert [len(trace) for trace in group.traces] == [2, 2]
+
+
+@pytest.mark.parametrize(
+    "divergence, tag",
+    [
+        ("kv_state", "end of iteration kv state"),
+        ("in_transfer", "end of iteration in transfer"),
+        ("active", "end of iteration active"),
+    ],
+)
+def test_iteration_end_check_reports_the_diverging_record(divergence: str, tag: str) -> None:
+    group = LockstepTpGroup(2)
+
+    def run(dist) -> None:
+        changes = {}
+        if divergence == "kv_state":
+            changes["kv_state"] = [("pool", 4, 2 + dist.tp_rank)]
+        elif divergence == "in_transfer":
+            changes["in_transfer"] = (5,) if dist.tp_rank else (5, 6)
+        executor = _iteration_end_executor(dist, **changes)
+        if divergence == "active":
+            executor.active_requests[1].context_current_position = dist.tp_rank
+        executor._check_dkv_iteration_end()
+
+    with pytest.raises(RuntimeError, match="DKV invariant violation") as caught:
+        group.run(run)
+    assert f"rank1 differs from rank0: tag {tag}" in str(caught.value)
+
+
+def test_iteration_end_check_includes_freed_requests_only_when_requested() -> None:
+    def run(include_freed: bool):
+        def per_rank(dist) -> None:
+            executor = _iteration_end_executor(dist, freed=(8 + dist.tp_rank,))
+            executor._check_dkv_iteration_end(include_freed=include_freed)
+
+        return per_rank
+
+    LockstepTpGroup(2).run(run(False))
+    with pytest.raises(RuntimeError, match="end of iteration freed"):
+        LockstepTpGroup(2).run(run(True))
+
+
+def test_iteration_end_check_is_free_when_debug_is_disabled() -> None:
+    group = LockstepTpGroup(2)
+
+    def run(dist) -> None:
+        executor = _iteration_end_executor(dist, enabled=False, kv_state=[("pool", dist.tp_rank)])
+        executor._check_dkv_iteration_end(include_freed=True)
+
+    group.run(run)
+    assert [len(trace) for trace in group.traces] == [1, 1]
 
 
 def _context_transfer(rank: int) -> LlmRequest:
@@ -420,3 +500,49 @@ def test_aggregate_cancel_marks_both_replicas_and_response_commit_frees_them() -
     assert result[0]["emitted"] == [(8, 1, None)]
     assert result[1]["emitted"] == []
     assert group.traces[0] == group.traces[1]
+
+
+_UNREPLICATED_LOOP_FEATURES = {
+    "benchmark disaggregation": ("is_benchmark_disagg", True),
+    "multimodal encoder scheduling": ("_mm_encoder_item_scheduling_enabled", True),
+    "a KV cache connector": ("kv_connector_manager", object()),
+    "guided decoding": ("guided_decoder", object()),
+    "a drafter": ("drafter", object()),
+    "a speculation gate": ("speculation_gate", object()),
+}
+
+
+def _plain_loop_executor() -> PyExecutor:
+    executor = _executor(LockstepTpGroup(1).ranks[0])
+    executor.resource_manager = SimpleNamespace(resource_managers={})
+    executor.is_benchmark_disagg = False
+    executor._mm_encoder_item_scheduling_enabled = False
+    executor.kv_connector_manager = None
+    executor.guided_decoder = None
+    executor.drafter = None
+    executor.speculation_gate = None
+    return executor
+
+
+def test_loop_accepts_a_plain_dkv_configuration() -> None:
+    _plain_loop_executor()._validate_dkv_loop_features()
+
+
+@pytest.mark.parametrize("feature", list(_UNREPLICATED_LOOP_FEATURES))
+def test_loop_rejects_features_whose_control_flow_is_not_replicated(feature: str) -> None:
+    executor = _plain_loop_executor()
+    attribute, value = _UNREPLICATED_LOOP_FEATURES[feature]
+    setattr(executor, attribute, value)
+    with pytest.raises(RuntimeError, match=f"not supported with {feature}$"):
+        executor._validate_dkv_loop_features()
+
+
+def test_loop_rejects_a_speculative_resource_manager_and_names_every_feature() -> None:
+    executor = _plain_loop_executor()
+    executor.resource_manager = SimpleNamespace(
+        resource_managers={ResourceManagerType.SPEC_RESOURCE_MANAGER: object()}
+    )
+    executor.drafter = object()
+    with pytest.raises(RuntimeError) as caught:
+        executor._validate_dkv_loop_features()
+    assert "a drafter, a speculative-decoding resource manager" in str(caught.value)

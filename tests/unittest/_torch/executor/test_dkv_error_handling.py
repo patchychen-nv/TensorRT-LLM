@@ -193,7 +193,7 @@ def test_missing_compute_tag_is_a_debug_invariant() -> None:
         request = make_request(8, local_rank=dist.tp_rank)
         request.py_dkv_compute_rank = None
         executor = _executor(dist, [request])
-        with pytest.raises(AssertionError, match="no compute-rank tag"):
+        with pytest.raises(RuntimeError, match="no compute-rank tag"):
             executor._handle_errors("failed", requests=[request], charge_budget=False)
         assert executor.active_requests == [request]
         assert request.state == LlmRequestState.CONTEXT_INIT

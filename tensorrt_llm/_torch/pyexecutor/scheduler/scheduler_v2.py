@@ -254,6 +254,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.dkv_dual_ledger_enabled = (
             dkv_group_size is not None and os.environ.get("TRTLLM_DKV_DUAL_LEDGER", "1") == "1"
         )
+        # Times each request had to release its KV because an iteration scheduled nothing.
+        self._dkv_stall_recoveries: dict[int, int] = {}
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
@@ -425,7 +427,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             return dkv_budget.all_ranks_full if dkv_budget is not None else budget.requests_full
 
         def stop_rank(req: LlmRequest) -> None:
-            assert dkv_budget is not None
+            if dkv_budget is None:
+                raise RuntimeError("DKV invariant violation: rank budgets are not replicated")
             dkv_budget.stop_rank(req.py_dkv_compute_rank)
 
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
@@ -723,6 +726,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     and req.py_request_id in self.kv_cache_manager.kv_cache_map
                 ):
                     self._rollback_context_admission(req, first_chunk=True)
+                    self._record_dkv_stall_recovery(req, requests_list)
                     break
 
         return (
@@ -748,6 +752,29 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         budget.rank_attended_kv[rank] = cumulative
         return True
+
+    def _record_dkv_stall_recovery(
+        self, req: LlmRequest, active_requests: list[LlmRequest]
+    ) -> None:
+        """Count repeated stall recoveries of one request and warn on each doubling.
+
+        A request that keeps having to restart means the KV pool cannot hold the active context
+        requests together, so the count makes that visible instead of silently looping.
+        """
+        active_ids = {request.py_request_id for request in active_requests}
+        self._dkv_stall_recoveries = {
+            request_id: count
+            for request_id, count in self._dkv_stall_recoveries.items()
+            if request_id in active_ids
+        }
+        count = self._dkv_stall_recoveries.get(req.py_request_id, 0) + 1
+        self._dkv_stall_recoveries[req.py_request_id] = count
+        if count & (count - 1) == 0:
+            logger.warning(
+                f"DKV stall recovery #{count}: request {req.py_request_id} released its KV cache "
+                "and restarts its context because no request could be scheduled; the KV cache "
+                "is likely too small for the active context requests"
+            )
 
     def _rollback_context_admission(self, req: LlmRequest, first_chunk: bool) -> None:
         """Release first-chunk claims or undo a continuation's unexecuted resize."""

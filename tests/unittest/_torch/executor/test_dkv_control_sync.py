@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""S-control event fan-in and always-on D12 consistency with strict TP exchange."""
+"""S-control event fan-in and always-on capacity-digest consistency with strict TP exchange."""
 
 from dataclasses import replace
 
@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.dkv import (
     DkvControlDigest,
     DkvControlPayload,
     DkvControlResult,
+    digest_request_ids,
     sync_dkv_control,
 )
 
@@ -84,6 +85,14 @@ def test_transfer_id_cannot_be_claimed_by_two_owners() -> None:
     assert errors[0] == errors[1]
 
 
+def test_request_id_digest_ignores_order_and_distinguishes_sets() -> None:
+    assert digest_request_ids([3, 1, 2]) == digest_request_ids((1, 2, 3))
+    assert digest_request_ids([]) != digest_request_ids([0])
+    assert digest_request_ids([1, 2]) != digest_request_ids([12])
+    assert digest_request_ids([1, 2, 3]) != digest_request_ids([1, 2, 4])
+    assert 0 <= digest_request_ids([5]) < 2**64
+
+
 def _payload(**changes) -> DkvControlPayload:
     return DkvControlPayload(
         digest=DkvControlDigest(
@@ -138,9 +147,11 @@ def test_pending_response_and_fatal_events_are_combined_in_rank_order() -> None:
         {"free_pages": ((24, 16), (8, 12, 4))},
         {"index_mapper_used": 4},
         {"active_request_count": 3},
+        {"in_transfer_count": 1},
+        {"in_transfer_digest": digest_request_ids([4])},
     ],
 )
-def test_d12_divergence_is_fatal_even_with_debug_disabled(changes) -> None:
+def test_capacity_digest_divergence_is_fatal_even_with_debug_disabled(changes) -> None:
     group = LockstepTpGroup(2)
 
     def run_rank(dist):
@@ -148,7 +159,7 @@ def test_d12_divergence_is_fatal_even_with_debug_disabled(changes) -> None:
         assert payload.debug_enabled is False
         if dist.tp_rank == 1:
             payload = replace(payload, digest=replace(payload.digest, **changes))
-        with pytest.raises(RuntimeError, match="D12 digest differs") as caught:
+        with pytest.raises(RuntimeError, match="capacity digest differs") as caught:
             sync_dkv_control(dist, payload)
         assert "rank 0: DkvControlPayload" in str(caught.value)
         assert "rank 1: DkvControlPayload" in str(caught.value)
@@ -159,7 +170,7 @@ def test_d12_divergence_is_fatal_even_with_debug_disabled(changes) -> None:
     assert [len(trace) for trace in group.traces] == [1, 1]
 
 
-def test_c4_free_set_is_piggybacked_on_the_same_collective() -> None:
+def test_freed_request_set_is_piggybacked_on_the_same_collective() -> None:
     group = LockstepTpGroup(2)
     expected = DkvControlResult((), False)
     assert group.run(
@@ -169,12 +180,12 @@ def test_c4_free_set_is_piggybacked_on_the_same_collective() -> None:
 
 
 @pytest.mark.parametrize("rank_one_ids", [(7,), (7, 9), (7, 7, 8), (8, 7)])
-def test_c4_detects_different_frees_and_duplicate_frees(rank_one_ids) -> None:
+def test_different_and_duplicate_frees_are_detected(rank_one_ids) -> None:
     group = LockstepTpGroup(2)
 
     def run_rank(dist):
         freed_ids = (7, 8) if dist.tp_rank == 0 else rank_one_ids
-        with pytest.raises(RuntimeError, match="C4 free request IDs differ"):
+        with pytest.raises(RuntimeError, match="freed request IDs differ"):
             sync_dkv_control(dist, _payload(debug_enabled=True, freed_request_ids=freed_ids))
 
     group.run(run_rank)
@@ -202,7 +213,7 @@ def test_debug_flag_divergence_is_rejected_at_control_boundary() -> None:
         ({"freed_request_ids": ("7",)}, "invalid free request IDs"),
         ({"freed_request_ids": (True,)}, "invalid free request IDs"),
         ({"freed_request_ids": (7,)}, "debug state supplied with debugging disabled"),
-        ({"digest": None}, "invalid D12 digest"),
+        ({"digest": None}, "invalid capacity digest"),
     ],
 )
 def test_malformed_control_payload_fails_on_every_rank(changes, diagnostic: str) -> None:
@@ -223,6 +234,8 @@ def test_malformed_control_payload_fails_on_every_rank(changes, diagnostic: str)
         {"iter_counter": -1},
         {"index_mapper_used": True},
         {"active_request_count": -1},
+        {"in_transfer_count": -1},
+        {"in_transfer_digest": True},
         {"free_pages": [[24, 16, 8], [12, 4]]},
         {"free_pages": ((24, -1),)},
         {"free_pages": ((24, True),)},
@@ -235,7 +248,7 @@ def test_malformed_capacity_digest_is_rejected_after_exchange(changes) -> None:
         payload = _payload()
         if dist.tp_rank == 1:
             payload = replace(payload, digest=replace(payload.digest, **changes))
-        with pytest.raises(RuntimeError, match="invalid D12 digest"):
+        with pytest.raises(RuntimeError, match="invalid capacity digest"):
             sync_dkv_control(dist, payload)
 
     group.run(run_rank)

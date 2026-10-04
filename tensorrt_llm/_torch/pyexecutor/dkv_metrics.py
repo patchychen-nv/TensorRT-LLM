@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in Option B experiment counters and offline measurement reports.
+"""Opt-in replicated-KV experiment counters and offline measurement reports.
 
 These reports are internal experiment artifacts, not telemetry or public iteration
 stats. Event residency describes committed logical blocks across all cache tiers;
@@ -369,7 +369,7 @@ def build_dkv_measurement_report(
         reasons.append("dkv_replica_capacity_mismatch")
     return {
         "schema_version": 1,
-        "mode": "dkv_option_b" if dkv_enabled else "adp",
+        "mode": "dkv_replicated" if dkv_enabled else "adp",
         "global": {
             **_prefix_metrics(global_counters),
             "scheduled_context_token_rank_variance": pvariance(
@@ -403,7 +403,7 @@ def build_dkv_measurement_report(
                 "removals invalidate the no-eviction proxy conservatively; "
                 "not a physical page eviction count"
             ),
-            "capacity": "Option B unique capacity equals one replica; compare every ADP pool summed across ranks",
+            "capacity": "Replicated KV: unique capacity equals one replica; compare every ADP pool summed across ranks",
             "interval": (
                 "fixed capacity, no explicit cache reset; rank snapshots taken "
                 "after the interval's iteration stats were collected"

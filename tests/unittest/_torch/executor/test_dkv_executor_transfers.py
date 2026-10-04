@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Executor transfer commits preserve response ownership and replicated frees."""
 
+import time
 from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
@@ -244,6 +245,38 @@ def test_fatal_control_preserves_pages_until_inflight_fabric_is_stopped() -> Non
         assert executor._dkv_commit_reason is None
 
     LockstepTpGroup(2).run(run)
+
+
+@pytest.mark.parametrize("failure", ["stalled_send", "polling_error"])
+def test_owner_only_transfer_faults_stop_every_rank_with_the_same_message(failure: str) -> None:
+    def run(dist) -> None:
+        executor = _executor(dist)
+        executor.kv_cache_transceiver.kv_transfer_timeout_ms = 1000
+        executor.kv_cache_transceiver.cancel_request.return_value = False
+        request = _request(dist.tp_rank)
+        executor.active_requests = [request]
+        executor._send_kv_async([request])
+        if failure == "stalled_send":
+            if dist.tp_rank == 1:
+                request.py_kv_transfer_start_time = time.monotonic() - 5
+        elif dist.tp_rank == 1:
+            executor.kv_cache_transceiver.check_context_transfer_status.side_effect = RuntimeError(
+                "fabric status failure"
+            )
+        expected = (
+            "KV transfer of request 8 has no terminal result"
+            if failure == "stalled_send"
+            else "DKV context transfer polling failed: fabric status failure"
+        )
+        with pytest.raises(RuntimeError, match=f"Fatal DKV error: rank 1: {expected}"):
+            executor._sync_dkv_control()
+        assert executor.freed == []
+        assert executor.async_transfer_manager.requests_in_transfer() == {8: request}
+        executor.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+
+    group = LockstepTpGroup(2)
+    group.run(run)
+    assert group.traces[0] == group.traces[1]
 
 
 @pytest.mark.parametrize("owner_timed_out", [False, True])

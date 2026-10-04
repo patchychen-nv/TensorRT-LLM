@@ -22,6 +22,7 @@ from dkv_test_utils import LockstepTpGroup, make_request
 from tensorrt_llm._torch.pyexecutor.dkv import (
     DkvSamplePayload,
     DkvSamplerError,
+    digest_global_batch,
     sync_dkv_sample_results,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -380,3 +381,70 @@ def test_stale_remote_finish_reason_is_rejected_on_all_ranks() -> None:
             sync_dkv_sample_results(dist, [request], [request] if request.py_dkv_is_local else [])
 
     group.run(run_rank)
+
+
+def test_global_batch_digest_covers_identity_owner_position_and_order_but_not_dummies() -> None:
+    first, second = _request(7, 0, 0), _request(8, 1, 0)
+    for request in (first, second):
+        _advance_context(request, 2)
+    dummy = make_request(100, is_dummy=True)
+    reference = digest_global_batch([first, second])
+    assert reference[0] == 2
+    assert digest_global_batch([first, dummy, second]) == reference
+    assert digest_global_batch([second, first]) != reference
+    assert digest_global_batch([first]) != reference
+    _advance_context(second, 2)
+    assert digest_global_batch([first, second]) != reference
+    assert digest_global_batch([])[0] == 0
+
+
+@pytest.mark.parametrize("divergence", ["missing", "position", "owner", "order"])
+def test_diverged_global_batch_is_reported_by_every_rank_in_one_exchange(divergence: str) -> None:
+    group = LockstepTpGroup(3)
+
+    def run_rank(dist):
+        requests = [_request(7, 0, dist.tp_rank), _request(8, 1, dist.tp_rank)]
+        for request in requests:
+            _advance_context(request, 2)
+        local_requests = [request for request in requests if request.py_dkv_is_local]
+        global_requests = list(requests)
+        if dist.tp_rank == 2:
+            if divergence == "missing":
+                global_requests = requests[:1]
+            elif divergence == "position":
+                _advance_context(requests[0], 2)
+            elif divergence == "owner":
+                requests[0].py_dkv_compute_rank = 2
+            else:
+                global_requests.reverse()
+        with pytest.raises(
+            RuntimeError, match="rank 2: global batch differs from rank 0"
+        ) as caught:
+            sync_dkv_sample_results(dist, global_requests, local_requests)
+        assert "rank 1: global batch differs" not in str(caught.value)
+        return str(caught.value).count("global batch differs")
+
+    assert group.run(run_rank) == [1, 1, 1]
+    assert [len(trace) for trace in group.traces] == [1, 1, 1]
+
+
+@pytest.mark.parametrize("digest", [(1,), (1, 2, 3), "digest", (True, 1), (-1, 1), [1, 2], None])
+def test_invalid_batch_digest_fails_on_every_rank(digest) -> None:
+    group = LockstepTpGroup(2)
+
+    def run_rank(dist):
+        request = _request(7, 0, dist.tp_rank)
+        _advance_context(request, 2)
+        original_allgather = dist.tp_allgather
+
+        def exchange(payload):
+            if dist.tp_rank == 1:
+                payload = replace(payload, batch_digest=digest)
+            return original_allgather(payload)
+
+        dist.tp_allgather = exchange
+        with pytest.raises(RuntimeError, match="rank 1: invalid global batch digest"):
+            sync_dkv_sample_results(dist, [request], [request] if request.py_dkv_is_local else [])
+
+    group.run(run_rank)
+    assert [len(trace) for trace in group.traces] == [1, 1]

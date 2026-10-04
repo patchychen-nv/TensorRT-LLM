@@ -48,16 +48,22 @@ def _check_rank(scenario: str) -> bool:
             DkvInvariantChecker(dist, enabled=bool(rank))
         return True
     checker = DkvInvariantChecker(dist, enabled=True)
-    checker.check_many(0, {"C0": [("slots", 32), ("mapper", 10)], "C1": [(7, 0), (8, 1)]})
+    checker.check_many(
+        0,
+        {
+            "startup configuration": [("slots", 32), ("mapper", 10)],
+            "global request order": [(7, 0), (8, 1)],
+        },
+    )
     for iteration in range(3):
         requests = [(7, 0), (8, 1), (-1, 0)]
         if scenario == "request_order" and rank:
             requests.reverse()
         if scenario == "request_order":
             with pytest.raises(RuntimeError, match="DKV invariant violation"):
-                checker.check(iteration, "C1", requests)
+                checker.check(iteration, "global request order", requests)
         else:
-            checker.check(iteration, "C1", requests)
+            checker.check(iteration, "global request order", requests)
     return True
 
 
@@ -105,7 +111,12 @@ def _check_executor_rank(scenario: str) -> bool:
     )
     executor._dkv_invariant_checker = DkvInvariantChecker(dist, enabled=True)
     executor._dkv_invariant_checker.check_many(
-        -1, {"C0": {"dual_ledger_enabled": executor.scheduler.dkv_dual_ledger_enabled}}
+        -1,
+        {
+            "startup configuration": {
+                "dual_ledger_enabled": executor.scheduler.dkv_dual_ledger_enabled
+            }
+        },
     )
 
     def fetch_and_activate():
@@ -147,7 +158,7 @@ def _check_executor_rank(scenario: str) -> bool:
             ]
             executor.kv_cache_manager.consume_dkv_trace.assert_called_once_with()
         else:
-            checkpoint = "C2" if scenario == "prefix_length" else "C3"
+            checkpoint = "prefix probes" if scenario == "prefix_length" else "scheduling decisions"
             with pytest.raises(RuntimeError, match=checkpoint):
                 executor._prepare_and_schedule_batch()
     return True
@@ -155,7 +166,9 @@ def _check_executor_rank(scenario: str) -> bool:
 
 @pytest.mark.parametrize("scenario", ["consistent", "prefix_length", "kv_order"])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_dkv_executor_c2_c3_two_rank_mpi(mpi_pool_executor: MPIPoolExecutor, scenario: str) -> None:
+def test_dkv_executor_scheduling_checks_two_rank_mpi(
+    mpi_pool_executor: MPIPoolExecutor, scenario: str
+) -> None:
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two GPUs")
     results = mpi_pool_executor.map(_check_executor_rank, [scenario] * 2, timeout=60)

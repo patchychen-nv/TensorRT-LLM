@@ -177,18 +177,49 @@ def _dkv_trace_value(value: object) -> object:
     return type(value).__name__
 
 
-def _trace_dkv_operation(
-    operation: Callable[Concatenate["KVCacheManagerV2", _DkvTraceParams], _DkvTraceResult],
-) -> Callable[Concatenate["KVCacheManagerV2", _DkvTraceParams], _DkvTraceResult]:
+# KV operations whose calls are traced (debug) or counted (measurement) on DKV managers. The wrappers
+# are installed on the instance (KVCacheManagerV2._install_dkv_hooks), so managers that neither trace
+# nor measure -- and test doubles that borrow the class methods -- run the plain functions.
+_DKV_TRACED_OPERATIONS = (
+    "try_allocate_generation",
+    "revert_allocate_generation",
+    "revert_allocate_context",
+    "prepare_context",
+    "resize_context",
+    "suspend_request",
+    "add_dummy_requests",
+    "release_index_slot",
+    "free_resources",
+    "update_context_resources",
+)
+_DKV_MEASURED_OPERATIONS = ("prepare_context", "resize_context")
+
+
+def _dkv_group_size_of(manager: object) -> int | None:
+    """Replication group size of ``manager``; ``None`` when DKV is off.
+
+    Read through the instance dict so partially built managers and spec-based test doubles, which
+    inherit the class-level default or hand out child mocks, read as DKV off.
+    """
+    return vars(manager).get("dkv_group_size")
+
+
+def _dkv_measurement_of(manager: object) -> DkvMeasurementCounters | None:
+    """Measurement counters of ``manager``; ``None`` unless the instance enabled them."""
+    return vars(manager).get("_dkv_measurement")
+
+
+def _traced_dkv_operation(
+    manager: "KVCacheManagerV2", operation: Callable[_DkvTraceParams, _DkvTraceResult]
+) -> Callable[_DkvTraceParams, _DkvTraceResult]:
     @wraps(operation)
-    def traced(
-        self: "KVCacheManagerV2", *args: _DkvTraceParams.args, **kwargs: _DkvTraceParams.kwargs
-    ) -> _DkvTraceResult:
-        if self._dkv_measurement is not None:
-            self._dkv_measurement.operation_generation += 1
-        if not self._dkv_trace_enabled:
-            return operation(self, *args, **kwargs)
-        self._dkv_trace.append(
+    def traced(*args: _DkvTraceParams.args, **kwargs: _DkvTraceParams.kwargs) -> _DkvTraceResult:
+        measurement = manager._dkv_measurement
+        if measurement is not None:
+            measurement.operation_generation += 1
+        if not manager._dkv_trace_enabled:
+            return operation(*args, **kwargs)
+        manager._dkv_trace.append(
             (
                 "call",
                 operation.__name__,
@@ -199,39 +230,36 @@ def _trace_dkv_operation(
         completed = False
         result = None
         try:
-            result = operation(self, *args, **kwargs)
+            result = operation(*args, **kwargs)
             completed = True
             return result
         finally:
-            self._dkv_trace.append(
+            manager._dkv_trace.append(
                 ("return" if completed else "raised", operation.__name__, _dkv_trace_value(result))
             )
 
     return traced
 
 
-def _measure_dkv_context_operation(
-    operation: Callable[Concatenate["KVCacheManagerV2", LlmRequest, _DkvTraceParams], bool],
-) -> Callable[Concatenate["KVCacheManagerV2", LlmRequest, _DkvTraceParams], bool]:
+def _measured_dkv_context_operation(
+    manager: "KVCacheManagerV2", operation: Callable[Concatenate[LlmRequest, _DkvTraceParams], bool]
+) -> Callable[Concatenate[LlmRequest, _DkvTraceParams], bool]:
     @wraps(operation)
     def measured(
-        self: "KVCacheManagerV2",
-        req: LlmRequest,
-        *args: _DkvTraceParams.args,
-        **kwargs: _DkvTraceParams.kwargs,
+        req: LlmRequest, *args: _DkvTraceParams.args, **kwargs: _DkvTraceParams.kwargs
     ) -> bool:
-        measurement = self._measurement_for_request(req)
+        measurement = manager._measurement_for_request(req)
         if measurement is None:
-            return operation(self, req, *args, **kwargs)
+            return operation(req, *args, **kwargs)
         first_chunk = req.is_first_context_chunk and not req.py_dkv_measurement_prepared
         completed = False
         success = False
         try:
-            success = operation(self, req, *args, **kwargs)
+            success = operation(req, *args, **kwargs)
             completed = True
             return success
         finally:
-            cache = self.kv_cache_map.get(req.py_request_id)
+            cache = manager.kv_cache_map.get(req.py_request_id)
             measurement.record_operation(
                 operation.__name__,
                 prompt_tokens=req.prompt_len,
@@ -1272,6 +1300,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if os.environ.get("TRTLLM_DKV_MEASUREMENT") == "1" and not is_estimating_kv_cache
             else None
         )
+        if self._dkv_trace_enabled or self._dkv_measurement is not None:
+            self._install_dkv_hooks()
         self.mapping = mapping
         self.dtype = dtype
         self._validate_speculative_config(spec_config)
@@ -1850,7 +1880,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
-            f"(max_admissible_sequences={self.max_admissible_sequences}, is_disagg={is_disagg}, "
+            f"(max_num_sequences={self._get_max_num_sequences()}, is_disagg={is_disagg}, "
             f"disable_overlap_scheduler={disable_overlap_scheduler}, "
             f"pp_size={mapping.pp_size}, "
             f"num_reserved_index_slots={num_reserved_index_slots}, "
@@ -2413,15 +2443,20 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return max_num_tokens * (self.dkv_group_size or 1)
 
+    def _get_max_num_sequences(self) -> int:
+        """Sequences the scheduler can hold at once, before overlap and transfer leases."""
+        if self.dkv_group_size is not None:
+            return self.dkv_group_size * self.max_batch_size
+        return self.max_batch_size * self.mapping.pp_size
+
     def _get_sequence_capacities(
         self, num_reserved_index_slots: int, disable_overlap_scheduler: bool
     ) -> tuple[int, int]:
+        max_num_sequences = self._get_max_num_sequences()
         if self.dkv_group_size is not None:
-            max_num_sequences = self.dkv_group_size * self.max_batch_size
             needs_extra_leases = self.is_disagg
             num_reserved_index_slots += self.dkv_group_size
         else:
-            max_num_sequences = self.max_batch_size * self.mapping.pp_size
             needs_extra_leases = self.is_disagg or (
                 not disable_overlap_scheduler and not self.mapping.has_pp()
             )
@@ -2439,10 +2474,15 @@ class KVCacheManagerV2(BaseResourceManager):
             # ranks whose capacity estimator returned the integer zero.
             max_tokens = float(max_tokens)
         max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
+        # inf max_tokens means all layers are SWA and every rank quota can
+        # fit all SWA fixed cache.
         if not math.isinf(max_tokens):
-            # The token/quota round trip can overshoot with fixed SWA costs.
-            synced_quota = math.ceil(
-                self._get_quota_from_max_tokens(max_tokens) / max_util_for_resume
+            # allreduce(MIN) must never increase the local quota. The
+            # token↔quota round-trip is not identity when SWA layers
+            # dominate (full_attn_size_per_token==0), so clamp to guard
+            # against a bogus inflation (nvbugs/6418103).
+            synced_quota = int(
+                math.ceil(self._get_quota_from_max_tokens(max_tokens) / max_util_for_resume)
             )
             quota = min(quota, synced_quota)
         if self.dkv_group_size is not None:
@@ -3514,14 +3554,13 @@ class KVCacheManagerV2(BaseResourceManager):
             slots = max(slots, self._kv_reserve_draft_tokens)
         return slots
 
-    @_trace_dkv_operation
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
 
         Resumes from suspended state if needed, then resizes capacity by 1 (+
         draft tokens). Returns True on success, False if allocation failed.
         """
-        if self.dkv_group_size is not None and not req.is_dummy:
+        if _dkv_group_size_of(self) is not None and not req.is_dummy:
             raise RuntimeError("Generation allocation is not supported with dkv_config yet")
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -3551,7 +3590,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self._allocated_draft_lens[request_id] = draft_slots
         return True
 
-    @_trace_dkv_operation
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
 
@@ -3585,7 +3623,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{reverted_cap}"
             )
 
-    @_trace_dkv_operation
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
         not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
@@ -3770,8 +3807,6 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return kv_cache.num_committed_tokens
 
-    @_trace_dkv_operation
-    @_measure_dkv_context_operation
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create/resume the cache and expose local or reserved reuse before budgeting."""
         assert not req.is_disagg_generation_init_state, (
@@ -3795,8 +3830,6 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return False
 
-    @_trace_dkv_operation
-    @_measure_dkv_context_operation
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
 
@@ -3944,7 +3977,6 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._allocated_draft_lens[request.py_request_id] = current_draft_len
 
-    @_trace_dkv_operation
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
@@ -4036,7 +4068,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        if self._dkv_measurement is not None and not self.is_draft:
+        if _dkv_measurement_of(self) is not None and not self.is_draft:
             for request in scheduled_batch.context_requests:
                 measurement = self._measurement_for_request(request)
                 if measurement is not None:
@@ -4557,8 +4589,20 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return self.impl.get_storage_statistics(cache_level)
 
+    def _install_dkv_hooks(self) -> None:
+        """Wrap this instance's KV operations for tracing and measurement."""
+        for name in _DKV_TRACED_OPERATIONS:
+            operation = getattr(self, name)
+            if self._dkv_measurement is not None and name in _DKV_MEASURED_OPERATIONS:
+                operation = _measured_dkv_context_operation(self, operation)
+            setattr(self, name, _traced_dkv_operation(self, operation))
+
+    def get_dkv_startup_settings(self) -> dict[str, object]:
+        """Process-level choices that every rank of a DKV group must make identically."""
+        return {"kv_cache_backend": KV_CACHE_MANAGER_V2_BACKEND}
+
     def get_dkv_config_fingerprint(self) -> list[tuple]:
-        """Return rank-independent capacity and layout records for the DKV C0 check."""
+        """Return rank-independent capacity and layout records for the DKV startup check."""
         config = self.kv_cache_manager_py_config
         records = [
             ("backend", KV_CACHE_MANAGER_V2_BACKEND),
@@ -5186,8 +5230,9 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
-        if self._dkv_measurement is not None:
-            self._dkv_measurement.record_storage_delta(
+        measurement = _dkv_measurement_of(self)
+        if measurement is not None:
+            measurement.record_storage_delta(
                 sum(delta.iter_host_dropped_blocks for delta in raw_iteration_stats.values()),
                 sum(delta.iter_offload_blocks for delta in raw_iteration_stats.values()),
             )
@@ -5302,7 +5347,6 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return padded_tensor
 
-    @_trace_dkv_operation
     def add_dummy_requests(
         self,
         request_ids: List[int],
@@ -5505,7 +5549,6 @@ class KVCacheManagerV2(BaseResourceManager):
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
-    @_trace_dkv_operation
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
 
@@ -5526,7 +5569,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
-    @_trace_dkv_operation
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if self.kv_connector_manager is not None and not self.is_draft:
             self.kv_connector_manager.release_unstarted_prefix_loads(request)
@@ -5930,7 +5972,6 @@ class KVCacheManagerV2(BaseResourceManager):
             fixed_cost,
         )
 
-    @_trace_dkv_operation
     def update_context_resources(self, scheduled_batch: ScheduledRequests):
         """Update KV cache for context requests in the current batch.
 
@@ -5986,7 +6027,7 @@ class KVCacheManagerV2(BaseResourceManager):
         attn_metadata: "AttentionMetadata" = None,
         kv_cache_dtype_byte_size: float = None,
     ):
-        if self.dkv_group_size is not None and any(
+        if _dkv_group_size_of(self) is not None and any(
             not req.is_dummy for req in scheduled_batch.generation_requests
         ):
             raise RuntimeError("Generation KV updates are not supported with dkv_config yet")
@@ -6231,9 +6272,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return success
 
     def reset_reuse_state(self):
-        if self._dkv_measurement is not None:
-            self._dkv_measurement.reuse_resets += 1
-            self._dkv_measurement.operation_generation += 1
+        measurement = _dkv_measurement_of(self)
+        if measurement is not None:
+            measurement.reuse_resets += 1
+            measurement.operation_generation += 1
         self.impl.clear_reusable_blocks()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()

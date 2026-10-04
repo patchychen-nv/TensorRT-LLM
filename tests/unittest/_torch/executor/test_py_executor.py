@@ -3223,9 +3223,25 @@ class TestDkvRuntimeValidation:
     def test_warns_when_reuse_disabled(self):
         executor = self._make_executor()
         executor.kv_cache_manager.enable_block_reuse = False
-        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning:
+        with (
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning,
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning_once") as warn_once,
+        ):
             executor._validate_dkv_runtime()
         assert "reuse is disabled" in warning.call_args.args[0]
+        warn_once.assert_not_called()
+
+    def test_warns_that_outputs_can_be_invalid_when_reuse_is_enabled(self):
+        executor = self._make_executor()
+        with (
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning,
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning_once") as warn_once,
+        ):
+            executor._validate_dkv_runtime()
+        assert "block reuse is enabled" in warn_once.call_args.args[0]
+        assert "output is not valid" in warn_once.call_args.args[0]
+        assert warn_once.call_args.kwargs["key"] == "dkv_block_reuse_enabled"
+        assert not any("reuse is disabled" in call.args[0] for call in warning.call_args_list)
 
     def test_warns_when_expert_parallel_size_differs(self):
         from tensorrt_llm.mapping import Mapping

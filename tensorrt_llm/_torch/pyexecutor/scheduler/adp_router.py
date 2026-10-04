@@ -79,6 +79,9 @@ def count_retiring_requests(active_requests) -> int:
     return sum(1 for req in active_requests if is_retiring_request(req))
 
 
+_DKV_COUNT_FIELDS = 4
+
+
 @dataclass
 class RankIterStatsPayload:
     """Per-rank IterationStats payload piggybacked on the ADP allgather."""
@@ -92,15 +95,23 @@ class RankIterStatsPayload:
     num_gen_kv_tokens: int = 0
     num_paused_requests: int = 0
     num_paused_kv_tokens: int = 0
-    # DKV counts real requests only on their compute rank.
+    # DKV counts real requests only on their compute rank. These are the last
+    # ``_DKV_COUNT_FIELDS`` fields so that ``serialize`` can leave them out.
     has_local_request_counts: int = 0
     num_new_active_requests: int = 0
     num_active_requests: int = 0
     num_completed_requests: int = 0
 
     def serialize(self) -> list[int]:
-        """Serialize to a flat list for allgather transport."""
-        return list(astuple(self))
+        """Serialize to a flat list for allgather transport.
+
+        The trailing DKV counts are omitted while they are all zero, so a payload without DKV has
+        the width it always had; ``deserialize`` restores the omitted defaults.
+        """
+        values = list(astuple(self))
+        if not any(values[-_DKV_COUNT_FIELDS:]):
+            del values[-_DKV_COUNT_FIELDS:]
+        return values
 
     @classmethod
     def deserialize(cls, data: list[int]) -> RankIterStatsPayload:

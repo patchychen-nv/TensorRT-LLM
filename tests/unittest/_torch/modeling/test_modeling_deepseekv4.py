@@ -192,7 +192,6 @@ def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks(monkeypatch) -> None:
     )
 
     class LlmArgs:
-        dkv_config = None
         kv_cache_config = KvCacheConfig(dtype="fp8_ds_mla")
 
     defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
@@ -203,6 +202,14 @@ def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks(monkeypatch) -> None:
             "enable_swa_scratch_reuse": True,
         }
     }
+
+
+def test_deepseek_v4_defaults_accept_a_plain_dict_without_enabling_dkv(monkeypatch) -> None:
+    monkeypatch.setattr("tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 90)
+
+    assert DeepseekV4ForCausalLM.get_model_defaults({"dkv_config": {}}) == (
+        DeepseekV4ForCausalLM.get_model_defaults(None)
+    )
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():

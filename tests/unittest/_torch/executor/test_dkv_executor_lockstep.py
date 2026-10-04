@@ -290,7 +290,7 @@ def test_debug_forward_participation_rejects_missing_rank_dummy() -> None:
             forward.generation_requests.clear()
         executor._can_queue(batch, forward)
 
-    with pytest.raises(AssertionError, match="forward participation differs"):
+    with pytest.raises(RuntimeError, match="forward participation differs"):
         group.run(run)
 
 
