@@ -147,17 +147,30 @@ def _capacity_signature(snapshot: dict) -> tuple:
     )
 
 
-def _equal_capacity(dkv_snapshots: Sequence[dict], adp_snapshots: Sequence[dict]) -> bool:
+def _pool_values(row: dict, key: str) -> list[list[int]]:
+    return [[pool[key] for pool in level] for level in row["pools_by_level"]]
+
+
+def _capacity_comparison(
+    dkv_snapshots: Sequence[dict], adp_snapshots: Sequence[dict], tolerance_pages: int
+) -> dict | None:
+    """Compare the pages a request can use in each mode, or None when the layouts differ.
+
+    One DKV replica holds the whole workload, so it is compared with the pages of all ADP ranks
+    together. Usable pages are the free and evictable pages of an idle pool: a replica's resident
+    forward dummies and a guard page are subtracted in this way, while a pool's total would count
+    them as capacity.
+    """
     if not adp_snapshots or len(adp_snapshots) != len(dkv_snapshots):
-        return False
+        return None
     if sorted(row["rank"] for row in adp_snapshots) != list(range(len(dkv_snapshots))):
-        return False
+        return None
     target = dkv_snapshots[0]
     if any(
         not row["dkv_enabled"] or _capacity_signature(row) != _capacity_signature(target)
         for row in dkv_snapshots
     ):
-        return False
+        return None
     if any(
         row["dkv_enabled"]
         or row["cache_tiers"] != target["cache_tiers"]
@@ -165,17 +178,38 @@ def _equal_capacity(dkv_snapshots: Sequence[dict], adp_snapshots: Sequence[dict]
         or len(row["pools_by_level"]) != len(target["pools_by_level"])
         for row in adp_snapshots
     ):
-        return False
+        return None
+    levels = []
     for level_id, pools in enumerate(target["pools_by_level"]):
         if any(len(row["pools_by_level"][level_id]) != len(pools) for row in adp_snapshots):
-            return False
+            return None
         for pool_id, pool in enumerate(pools):
             peers = [row["pools_by_level"][level_id][pool_id] for row in adp_snapshots]
             if any(peer["slot_sizes"] != pool["slot_sizes"] for peer in peers):
-                return False
-            if sum(peer["total"] for peer in peers) != pool["total"]:
-                return False
-    return True
+                return None
+            levels.append(
+                {
+                    "level": level_id,
+                    "pool": pool_id,
+                    "dkv_replica_total_pages": pool["total"],
+                    "adp_total_pages_by_rank": [peer["total"] for peer in peers],
+                    "dkv_replica_usable_pages": pool["available"],
+                    "adp_usable_pages_by_rank": [peer["available"] for peer in peers],
+                    "usable_gap_pages": sum(peer["available"] for peer in peers)
+                    - pool["available"],
+                    "total_gap_pages": sum(peer["total"] for peer in peers) - pool["total"],
+                    "same_pages_per_rank": all(peer["total"] == pool["total"] for peer in peers),
+                }
+            )
+    return {
+        "basis": "usable (free plus evictable) pages of an idle pool, summed over the ADP ranks",
+        "tolerance_pages": tolerance_pages,
+        "pools": levels,
+        "equal_usable_capacity": all(
+            abs(row["usable_gap_pages"]) <= tolerance_pages for row in levels
+        ),
+        "equal_total_capacity": all(row["total_gap_pages"] == 0 for row in levels),
+    }
 
 
 def _event_measurement(
@@ -247,6 +281,58 @@ def _event_measurement(
     }
 
 
+def _logical_counts(event_stats: dict, dkv_enabled: bool) -> dict:
+    """Per-replica (logical) counts next to the physical sums.
+
+    Under DKV every rank holds a full copy, so the logical count is one rank's value when all ranks
+    agree and unknown when they do not. Under ADP each rank holds different data and the logical
+    count is the sum.
+    """
+    logical = {}
+    for name in ("removed_blocks", "last_tier_capacity_dropped_pages"):
+        by_rank = event_stats.get(f"{name}_by_rank")
+        if by_rank is None:
+            logical[f"{name}_logical"] = None
+        elif dkv_enabled:
+            logical[f"{name}_logical"] = by_rank[0] if len(set(by_rank)) == 1 else None
+        else:
+            logical[f"{name}_logical"] = sum(by_rank)
+    return logical
+
+
+def _iteration_load(iteration_stats: Sequence[dict] | None, group_size: int) -> dict:
+    """Cross-rank imbalance of the context tokens scheduled in each iteration, averaged."""
+    empty = {
+        "per_iteration_token_variance": None,
+        "per_iteration_token_imbalance": None,
+        "iterations_measured": None,
+        "per_iteration_source": None,
+    }
+    if iteration_stats is None:
+        return empty
+    by_iteration: dict[int, dict[int, int]] = {}
+    for row in iteration_stats:
+        rank = row.get("attentionDpRank")
+        batching = row.get("inflightBatchingStats")
+        if type(rank) is not int or batching is None:
+            continue
+        by_iteration.setdefault(row["iter"], {})[rank] = batching["numCtxTokens"]
+    complete = [
+        [loads[rank] for rank in range(group_size)]
+        for loads in by_iteration.values()
+        if set(loads) == set(range(group_size))
+    ]
+    if not complete:
+        return empty
+    return {
+        "per_iteration_token_variance": sum(pvariance(loads) for loads in complete) / len(complete),
+        "per_iteration_token_imbalance": sum(max(loads) - min(loads) for loads in complete)
+        / len(complete),
+        "iterations_measured": len(complete),
+        "per_iteration_source": "iteration stats numCtxTokens of every rank in each iteration",
+    }
+
+
 def build_dkv_measurement_report(
     rank_snapshots: Sequence[dict],
     events: Sequence[dict],
@@ -255,6 +341,8 @@ def build_dkv_measurement_report(
     baseline_snapshots: Sequence[dict] | None = None,
     baseline_event_count: int = 0,
     adp_capacity_reference: Sequence[dict] | None = None,
+    capacity_tolerance_pages: int = 0,
+    iteration_stats: Sequence[dict] | None = None,
 ) -> dict:
     """Build an interval report from owner counters and complete rank event streams.
 
@@ -263,8 +351,11 @@ def build_dkv_measurement_report(
     measurement interval without discarding earlier residency. Event boundaries
     use the per-rank snapshot watermarks; the legacy list count only validates
     that a supplied boundary is within the input. Equal-capacity
-    validation compares each measured ADP pool's summed capacity with one DKV
-    replica, including secondary tiers. No missing measurement becomes a zero.
+    validation compares the usable pages of each measured ADP pool, summed over
+    the ranks, with one DKV replica, including secondary tiers; the gap is
+    reported and may not exceed ``capacity_tolerance_pages``. ``iteration_stats``
+    are the exported per-rank rows of the interval and give the per-iteration
+    load imbalance. No missing measurement becomes a zero.
     """
     rows = sorted(rank_snapshots, key=lambda row: row["rank"])
     if not rows or [row["rank"] for row in rows] != list(range(len(rows))):
@@ -313,15 +404,23 @@ def build_dkv_measurement_report(
         storage_counters[name] = values
         event_stats[f"{name}_by_rank"] = values
         event_stats[name] = sum(values) if values is not None else None
+    event_stats.update(_logical_counts(event_stats, dkv_enabled))
+    event_stats["tier_scope"] = {
+        "tiers": list(rows[0]["cache_tiers"]),
+        "hit_rate_includes_secondary_tiers": any(name != "gpu" for name in rows[0]["cache_tiers"]),
+    }
     event_stats["eviction_count_source"] = (
         "last_tier_capacity_dropped_pages: consumed V2 iter_host_dropped_blocks; "
         "direct physical LRU victims at the last tier, including GPU-only pools; "
         "excludes indirect radix GC, quota changes and cache resets"
     )
-    matched_capacity = (
-        _equal_capacity(rows, adp_capacity_reference)
+    capacity_comparison = (
+        _capacity_comparison(rows, adp_capacity_reference, capacity_tolerance_pages)
         if adp_capacity_reference is not None and dkv_enabled
-        else False
+        else None
+    )
+    matched_capacity = (
+        capacity_comparison is not None and capacity_comparison["equal_usable_capacity"]
     )
     reuse = all(row["reuse_enabled"] for row in rows)
     no_failures = not any(
@@ -368,15 +467,21 @@ def build_dkv_measurement_report(
     ):
         reasons.append("dkv_replica_capacity_mismatch")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "dkv_replicated" if dkv_enabled else "adp",
-        "global": {
-            **_prefix_metrics(global_counters),
-            "scheduled_context_token_rank_variance": pvariance(
+        "global": _prefix_metrics(global_counters),
+        "load": {
+            "scheduled_context_tokens_by_rank": [
+                row["scheduled_context_tokens"] for row in per_rank
+            ],
+            "request_count_by_rank": [row["request_count"] for row in per_rank],
+            "interval_total_token_variance": pvariance(
                 row["scheduled_context_tokens"] for row in per_rank
             ),
-            "request_count_rank_variance": pvariance(row["request_count"] for row in per_rank),
+            "interval_total_request_variance": pvariance(row["request_count"] for row in per_rank),
+            **_iteration_load(iteration_stats, len(rows)),
         },
+        "capacity_comparison": capacity_comparison,
         "per_rank": per_rank,
         "storage": event_stats,
         "capacity_by_rank": [
@@ -388,6 +493,11 @@ def build_dkv_measurement_report(
             "no_committed_block_removals": no_removals,
             "no_capacity_drops": no_drops,
             "equal_capacity_verified": matched_capacity,
+            "equal_total_pages": (
+                capacity_comparison["equal_total_capacity"]
+                if capacity_comparison is not None
+                else None
+            ),
             "timing_perturbed_by_fresh_page_fill": any(
                 row["fresh_page_fill"] != "none" for row in rows
             ),
@@ -397,13 +507,29 @@ def build_dkv_measurement_report(
             "prefix": "first successful prepare per owner request; match capped at prompt_tokens - 1",
             "request_hit_rate": "requests with a nonzero match / successfully prepared requests",
             "token_hit_rate": "matched prefix tokens / eligible prompt prefix tokens",
-            "load": "scheduled owner context tokens, including retries; excludes dummy and replica work",
+            "load": (
+                "scheduled owner context tokens, including retries; excludes dummy and replica "
+                "work. per_iteration_* statistics are taken across ranks within each iteration and "
+                "then averaged; interval_total_* statistics are across ranks of the interval totals"
+            ),
+            "physical_vs_logical": (
+                "removed_block_copies and the dropped-page counters are physical, summed over the "
+                "ranks; the *_logical counts are per replica under DKV (equal on every rank, or "
+                "null when the replicas disagree) and the rank sum under ADP"
+            ),
+            "hit_rate_scope": (
+                "matched prefix tokens include every cache tier in storage.tier_scope.tiers; "
+                "no per-tier split is measured"
+            ),
             "duplicate_storage_ratio": "(resident rank copies - distinct blocks) / resident rank copies",
             "eviction_proxy": (
                 "removals invalidate the no-eviction proxy conservatively; "
                 "not a physical page eviction count"
             ),
-            "capacity": "Replicated KV: unique capacity equals one replica; compare every ADP pool summed across ranks",
+            "capacity": (
+                "Replicated KV: unique capacity equals one replica; compare the usable pages of "
+                "every ADP pool summed across ranks (capacity_comparison)"
+            ),
             "interval": (
                 "fixed capacity, no explicit cache reset; rank snapshots taken "
                 "after the interval's iteration stats were collected"

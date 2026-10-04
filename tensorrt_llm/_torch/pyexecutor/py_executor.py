@@ -983,7 +983,8 @@ class PyExecutor:
         self._kv_iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
-        self._adp_iter_stats = ADPIterStatsBuffer()
+        self._adp_iter_stats = ADPIterStatsBuffer(
+            measurement_provider=self._dkv_measurement_snapshot)
         # Per-loop CPU wall and GPU forward time captured by the profile_step
         # closure (see _profiler). Populated whenever enable_iter_perf_stats or
         # print_iter_log is on so the /metrics serializer can read them
@@ -2501,7 +2502,8 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           dkv_measurement: Optional[dict] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -2527,6 +2529,8 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
+            dkv_measurement: Opt-in replicated-KV experiment counters of the
+                row's rank. Surfaces as ``dkvMeasurement`` in the stats JSON.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
@@ -2588,6 +2592,7 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] dkv_measurement: Optional[dict]
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -2595,7 +2600,16 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, dkv_measurement))
+
+    def _dkv_measurement_snapshot(self) -> Optional[dict]:
+        """This rank's opt-in replicated-KV experiment counters, or None when not collected."""
+        if getattr(self, "dkv_enabled", False) is not True:
+            return None
+        snapshot = getattr(self.kv_cache_manager,
+                           "get_dkv_measurement_snapshot", None)
+        result = snapshot() if callable(snapshot) else None
+        return result if isinstance(result, dict) else None
 
     def _process_iter_stats(
         self,
@@ -2659,6 +2673,7 @@ class PyExecutor:
                 kv_iter_stats=self._latest_kv_iter_stats,
                 is_rank0=self.dist.rank == 0,
                 dkv_enabled=getattr(self, "dkv_enabled", False) is True,
+                dkv_measurement=self._dkv_measurement_snapshot(),
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
@@ -6478,7 +6493,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        dkv_measurement=record.dkv_measurement)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]

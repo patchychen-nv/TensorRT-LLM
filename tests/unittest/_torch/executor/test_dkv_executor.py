@@ -478,3 +478,23 @@ def test_dkv_rejects_rank_local_balancing() -> None:
     executor.dkv_enabled = True
     with pytest.raises(ValueError, match="not supported with dkv_config yet"):
         executor._balance_adp_requests([], [])
+
+
+@pytest.mark.parametrize(
+    "dkv_enabled, manager, expected",
+    [
+        (False, SimpleNamespace(get_dkv_measurement_snapshot=lambda: {"rank": 1}), None),
+        (True, SimpleNamespace(get_dkv_measurement_snapshot=lambda: {"rank": 1}), {"rank": 1}),
+        (True, SimpleNamespace(get_dkv_measurement_snapshot=lambda: None), None),
+        (True, SimpleNamespace(), None),
+        (True, Mock(), None),
+    ],
+    ids=["dkv-off", "collected", "not-collected", "no-accessor", "fabricating-double"],
+)
+def test_measurement_snapshot_is_exported_only_when_dkv_collects_a_dict(
+    dkv_enabled: bool, manager, expected
+) -> None:
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.dkv_enabled = dkv_enabled
+    executor.kv_cache_manager = manager
+    assert executor._dkv_measurement_snapshot() == expected

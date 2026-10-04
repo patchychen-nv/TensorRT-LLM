@@ -41,7 +41,9 @@ def _record(
     )
 
 
-def _snapshot(rank: int, *, dkv: bool = True, capacity: int = 8) -> dict:
+def _snapshot(rank: int, *, dkv: bool = True, capacity: int = 8, held: int | None = None) -> dict:
+    """A rank's snapshot; ``held`` pages (a DKV replica's resident dummies) are not usable."""
+    held = (2 if dkv else 0) if held is None else held
     counters = DkvMeasurementCounters()
     _record(counters)
     counters.record_scheduled_context(33)
@@ -51,9 +53,17 @@ def _snapshot(rank: int, *, dkv: bool = True, capacity: int = 8) -> dict:
         "dkv_enabled": dkv,
         "reuse_enabled": True,
         "tokens_per_block": 32,
-        "cache_tiers": ["GPU"],
+        "cache_tiers": ["gpu"],
         "pools_by_level": [
-            [{"slot_sizes": [128], "total": capacity, "free": 4, "evictable": 2, "available": 6}]
+            [
+                {
+                    "slot_sizes": [128],
+                    "total": capacity,
+                    "free": capacity - held,
+                    "evictable": 0,
+                    "available": capacity - held,
+                }
+            ]
         ],
         "fresh_page_fill": "none",
         "counters": counters.snapshot(),
@@ -199,7 +209,91 @@ def test_token_hit_rate_is_weighted_globally() -> None:
 def test_local_load_variance_excludes_replica_counts() -> None:
     rows = [_snapshot(0), _snapshot(1)]
     rows[1]["counters"]["scheduled_context_tokens"] = 1
-    assert _report(rows)["global"]["scheduled_context_token_rank_variance"] == 256
+    load = _report(rows)["load"]
+    assert load["interval_total_token_variance"] == 256
+    assert load["scheduled_context_tokens_by_rank"] == [33, 1]
+    assert load["per_iteration_token_variance"] is None
+
+
+def _stats_row(iteration: int, rank: int, tokens: int) -> dict:
+    return {
+        "iter": iteration,
+        "attentionDpRank": rank,
+        "inflightBatchingStats": {"numCtxTokens": tokens},
+    }
+
+
+def test_load_imbalance_is_measured_inside_each_iteration_and_then_averaged() -> None:
+    stats = [
+        _stats_row(1, 0, 8),
+        _stats_row(1, 1, 0),
+        _stats_row(2, 0, 4),
+        _stats_row(2, 1, 4),
+        _stats_row(3, 0, 9),  # rank 1 reported nothing for this iteration
+        {"iter": 4},  # a row without per-rank batching stats
+    ]
+    load = _report(iteration_stats=stats)["load"]
+    assert load["iterations_measured"] == 2
+    assert load["per_iteration_token_variance"] == 8
+    assert load["per_iteration_token_imbalance"] == 4
+    assert "numCtxTokens" in load["per_iteration_source"]
+    # The same totals can hide a persistent imbalance that the interval variance reports as zero.
+    assert load["interval_total_token_variance"] == 0
+
+
+def test_load_imbalance_is_unknown_without_a_complete_iteration() -> None:
+    load = _report(iteration_stats=[_stats_row(1, 0, 8)])["load"]
+    assert load["per_iteration_token_variance"] is None
+    assert load["iterations_measured"] is None
+
+
+def test_report_uses_the_second_schema_and_names_its_scopes() -> None:
+    report = _report()
+    assert report["schema_version"] == 2
+    assert "scheduled_context_token_rank_variance" not in report["global"]
+    assert report["storage"]["tier_scope"] == {
+        "tiers": ["gpu"],
+        "hit_rate_includes_secondary_tiers": False,
+    }
+    assert "usable pages" in report["semantics"]["capacity"]
+    assert "physical" in report["semantics"]["physical_vs_logical"]
+
+
+def test_secondary_tiers_are_named_in_the_hit_rate_scope() -> None:
+    rows = [_snapshot(0), _snapshot(1)]
+    for row in rows:
+        row["cache_tiers"] = ["gpu", "host"]
+        row["pools_by_level"].append(row["pools_by_level"][0])
+    scope = _report(rows)["storage"]["tier_scope"]
+    assert scope["tiers"] == ["gpu", "host"]
+    assert scope["hit_rate_includes_secondary_tiers"]
+
+
+def _removal_events(removing_ranks: Sequence[int]) -> list[dict]:
+    return [*_events(), *(_event(rank, 2, "removed", [11]) for rank in removing_ranks)]
+
+
+@pytest.mark.parametrize("dkv", [True, False])
+def test_removals_are_reported_physically_and_logically(dkv: bool) -> None:
+    rows = [_snapshot(0, dkv=dkv), _snapshot(1, dkv=dkv)]
+    for row in rows:
+        row["event_next_id"] = 3
+    report = build_dkv_measurement_report(rows, _removal_events([0, 1]), dkv_enabled=dkv)
+    storage = report["storage"]
+    assert storage["removed_block_copies"] == 2
+    # Replicas remove the same block once each, so one logical removal; ADP ranks are independent.
+    assert storage["removed_blocks_logical"] == (1 if dkv else 2)
+
+
+def test_logical_counts_are_unknown_when_replicas_disagree() -> None:
+    rows = [_snapshot(0), _snapshot(1)]
+    for row in rows:
+        row["event_next_id"] = 3
+    rows[0]["last_tier_capacity_dropped_pages"] = 1
+    storage = build_dkv_measurement_report(rows, _removal_events([0]), dkv_enabled=True)["storage"]
+    assert storage["removed_blocks_logical"] is None
+    assert storage["last_tier_capacity_dropped_pages_logical"] is None
+    assert storage["last_tier_capacity_dropped_pages"] == 1
 
 
 def test_unobserved_prefix_and_empty_residency_are_null() -> None:
@@ -250,26 +344,62 @@ def test_removal_proxy_is_not_physical_drop_count() -> None:
     assert not report["validity"]["prefix_hit_rate_proxy_valid"]
 
 
-def test_equal_capacity_uses_actual_pool_totals_despite_removals() -> None:
+def _equal_usable_reference() -> list[dict]:
+    """ADP ranks with 3 usable pages each match one DKV replica of 6 usable pages (8 minus 2)."""
+    return [_snapshot(0, dkv=False, capacity=3), _snapshot(1, dkv=False, capacity=3)]
+
+
+def test_equal_capacity_counts_usable_pages_despite_removals() -> None:
     rows = [_snapshot(0), _snapshot(1)]
     rows[0]["last_tier_capacity_dropped_pages"] = 2
-    reference = [_snapshot(0, dkv=False, capacity=4), _snapshot(1, dkv=False, capacity=4)]
-    report = _report(rows, adp_capacity_reference=reference)
+    report = _report(rows, adp_capacity_reference=_equal_usable_reference())
     assert report["validity"]["equal_capacity_verified"]
     assert report["validity"]["prefix_hit_rate_proxy_valid"]
+    pool = report["capacity_comparison"]["pools"][0]
+    assert pool["usable_gap_pages"] == 0
+    # The replica's resident dummies make its pool larger than its usable capacity.
+    assert pool["total_gap_pages"] == -2
+    assert not report["validity"]["equal_total_pages"]
+
+
+def test_equal_total_pages_do_not_prove_equal_capacity() -> None:
+    reference = [_snapshot(0, dkv=False, capacity=4), _snapshot(1, dkv=False, capacity=4)]
+    report = _report(adp_capacity_reference=reference)
+    assert report["validity"]["equal_total_pages"]
+    assert not report["validity"]["equal_capacity_verified"]
+    assert report["capacity_comparison"]["pools"][0]["usable_gap_pages"] == 2
+
+
+def test_declared_capacity_tolerance_accepts_a_known_gap() -> None:
+    reference = [_snapshot(0, dkv=False, capacity=4), _snapshot(1, dkv=False, capacity=4)]
+    assert _report(adp_capacity_reference=reference, capacity_tolerance_pages=2)["validity"][
+        "equal_capacity_verified"
+    ]
+    assert not _report(adp_capacity_reference=reference, capacity_tolerance_pages=1)["validity"][
+        "equal_capacity_verified"
+    ]
+
+
+def test_per_rank_pool_size_differences_between_modes_are_flagged() -> None:
+    comparison = _report(adp_capacity_reference=_equal_usable_reference())["capacity_comparison"]
+    pool = comparison["pools"][0]
+    assert not pool["same_pages_per_rank"]
+    assert pool["dkv_replica_total_pages"] == 8
+    assert pool["adp_total_pages_by_rank"] == [3, 3]
 
 
 @pytest.mark.parametrize(
     "fault", ["capacity", "slot_size", "tier", "block_size", "rank", "pool_count"]
 )
 def test_equal_capacity_rejects_incomparable_layouts(fault: str) -> None:
-    reference = [_snapshot(0, dkv=False, capacity=4), _snapshot(1, dkv=False, capacity=4)]
+    reference = _equal_usable_reference()
     if fault == "capacity":
         reference[0]["pools_by_level"][0][0]["total"] = 8
+        reference[0]["pools_by_level"][0][0]["available"] = 8
     elif fault == "slot_size":
         reference[0]["pools_by_level"][0][0]["slot_sizes"] = [64]
     elif fault == "tier":
-        reference[0]["cache_tiers"] = ["HOST"]
+        reference[0]["cache_tiers"] = ["host"]
     elif fault == "block_size":
         reference[0]["tokens_per_block"] = 64
     elif fault == "rank":
@@ -307,8 +437,7 @@ def test_event_offset_cannot_hide_removals_without_counter_baseline() -> None:
 def test_stale_native_stats_invalid_even_with_verified_equal_capacity() -> None:
     rows = [_snapshot(0), _snapshot(1)]
     rows[1]["operation_generation"] += 1
-    reference = [_snapshot(0, dkv=False, capacity=4), _snapshot(1, dkv=False, capacity=4)]
-    report = _report(rows, adp_capacity_reference=reference)
+    report = _report(rows, adp_capacity_reference=_equal_usable_reference())
     assert report["validity"]["equal_capacity_verified"]
     assert not report["validity"]["prefix_hit_rate_proxy_valid"]
 
@@ -471,3 +600,33 @@ def test_dkv_state_reads_as_off_for_partial_managers_and_spec_doubles() -> None:
     manager = _manager()
     assert _dkv_group_size_of(manager) == 2
     assert _dkv_measurement_of(manager) is manager._dkv_measurement
+
+
+def _load_runner():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[3] / "integration/defs/dkv/dkv_measurement_runner.py"
+    spec = importlib.util.spec_from_file_location("dkv_measurement_runner_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_runner_reads_each_ranks_newest_snapshot_from_the_exported_rows() -> None:
+    runner = _load_runner()
+    first = _snapshot(0)
+    newer = {**_snapshot(0), "counters": {**_snapshot(0)["counters"], "request_count": 5}}
+    rows = [
+        {"iter": 1},
+        {"attentionDpRank": 0, "dkvMeasurement": first},
+        {"attentionDpRank": 1, "dkvMeasurement": _snapshot(1)},
+        {"attentionDpRank": 0, "dkvMeasurement": None},
+        {"attentionDpRank": 0, "dkvMeasurement": newer},
+    ]
+    snapshots = runner._latest_snapshots(rows)
+    assert [snapshot["rank"] for snapshot in snapshots] == [0, 1]
+    assert snapshots[0] is newer
+    assert runner._request_counts(snapshots) == [5, 1]
+    assert runner._latest_snapshots([{"iter": 1}]) == []

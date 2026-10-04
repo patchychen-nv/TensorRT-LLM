@@ -95,22 +95,28 @@ class RankIterStatsPayload:
     num_gen_kv_tokens: int = 0
     num_paused_requests: int = 0
     num_paused_kv_tokens: int = 0
-    # DKV counts real requests only on their compute rank. These are the last
-    # ``_DKV_COUNT_FIELDS`` fields so that ``serialize`` can leave them out.
+    # DKV counts real requests only on their compute rank. These ``_DKV_COUNT_FIELDS`` fields
+    # come right before the measurement snapshot so that ``serialize`` can leave them out.
     has_local_request_counts: int = 0
     num_new_active_requests: int = 0
     num_active_requests: int = 0
     num_completed_requests: int = 0
+    # Opt-in replicated-KV experiment counters of this rank (``dkv_metrics``), or None. The
+    # allgather carries Python objects, so the snapshot travels as a plain dict.
+    dkv_measurement: dict | None = None
 
-    def serialize(self) -> list[int]:
+    def serialize(self) -> list:
         """Serialize to a flat list for allgather transport.
 
-        The trailing DKV counts are omitted while they are all zero, so a payload without DKV has
-        the width it always had; ``deserialize`` restores the omitted defaults.
+        The measurement snapshot is omitted while absent and the DKV counts while they are all
+        zero, so a payload without DKV has the width it always had; ``deserialize`` restores the
+        omitted defaults.
         """
         values = list(astuple(self))
-        if not any(values[-_DKV_COUNT_FIELDS:]):
-            del values[-_DKV_COUNT_FIELDS:]
+        if self.dkv_measurement is None:
+            values.pop()
+            if not any(values[-_DKV_COUNT_FIELDS:]):
+                del values[-_DKV_COUNT_FIELDS:]
         return values
 
     @classmethod

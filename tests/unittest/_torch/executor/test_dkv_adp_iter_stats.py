@@ -129,8 +129,10 @@ _DKV_COUNT_FIELDS = (
 )
 
 
-def test_dkv_counts_are_the_trailing_payload_fields() -> None:
-    assert tuple(field.name for field in fields(RankIterStatsPayload))[-4:] == _DKV_COUNT_FIELDS
+def test_dkv_counts_precede_the_measurement_snapshot_at_the_end_of_the_payload() -> None:
+    names = tuple(field.name for field in fields(RankIterStatsPayload))
+    assert names[-5:-1] == _DKV_COUNT_FIELDS
+    assert names[-1] == "dkv_measurement"
 
 
 def test_payload_without_dkv_counts_keeps_its_original_width() -> None:
@@ -164,3 +166,69 @@ def test_ranks_with_different_payload_widths_still_exchange_and_decode() -> None
     states = group.run(run_rank)[0]
     assert states[0].iter_stats.num_active_requests == 2
     assert states[1].iter_stats == RankIterStatsPayload()
+
+
+def _snapshot(rank: int, requests: int) -> dict:
+    return {
+        "rank": rank,
+        "group_size": 2,
+        "counters": {"request_count": requests},
+        "cache_tiers": ["gpu"],
+        "pools_by_level": [[{"slot_sizes": [8], "total": 32}]],
+    }
+
+
+def test_measurement_snapshot_travels_with_the_payload_and_widens_it() -> None:
+    payload = RankIterStatsPayload(has_iter_stats=1, dkv_measurement=_snapshot(1, 2))
+    values = payload.serialize()
+    assert len(values) == 14 and values[-1] == _snapshot(1, 2)
+    assert RankIterStatsPayload.deserialize(values) == payload
+    state = RankState(rank=1, iter_stats=payload)
+    assert len(state.serialize()) == 18
+    assert RankState.deserialize(state.serialize()) == state
+
+
+def test_each_rank_reports_its_own_measurement_through_the_stats_fanout() -> None:
+    group = LockstepTpGroup(2)
+
+    def run_rank(dist):
+        # Rank 1 has no work, so the fanout gives it a zero payload that still reports its counters.
+        buffer = ADPIterStatsBuffer(
+            measurement_provider=lambda: _snapshot(dist.tp_rank, 5 * dist.tp_rank)
+        )
+        if dist.tp_rank == 0:
+            buffer.queue(
+                _stats(7, 2), is_rank0=True, dkv_enabled=True, dkv_measurement=_snapshot(0, 9)
+            )
+        records = []
+        for _ in range(2):
+            state = RankState(rank=dist.tp_rank)
+            state.copy_iter_stats_from(buffer.next_payload())
+            all_states = [
+                RankState.deserialize(data) for data in dist.tp_allgather(state.serialize())
+            ]
+            records = buffer.finalize(all_states, is_rank0=dist.tp_rank == 0)
+        return [(record.attention_dp_rank, record.dkv_measurement) for record in records]
+
+    rows = group.run(run_rank)[0]
+    assert rows == [(0, _snapshot(0, 9)), (1, _snapshot(1, 5))]
+
+
+def test_rows_without_a_provider_or_snapshot_carry_none() -> None:
+    group = LockstepTpGroup(2)
+
+    def run_rank(dist):
+        buffer = ADPIterStatsBuffer()
+        if dist.tp_rank == 0:
+            buffer.queue(_stats(7, 2), is_rank0=True)
+        records = []
+        for _ in range(2):
+            state = RankState(rank=dist.tp_rank)
+            state.copy_iter_stats_from(buffer.next_payload())
+            all_states = [
+                RankState.deserialize(data) for data in dist.tp_allgather(state.serialize())
+            ]
+            records = buffer.finalize(all_states, is_rank0=dist.tp_rank == 0)
+        return [record.dkv_measurement for record in records]
+
+    assert group.run(run_rank)[0] == [None, None]

@@ -12,35 +12,18 @@ import time
 from pathlib import Path
 
 
-def _snapshots(directory: Path, *, baseline: bool = False) -> list[dict]:
-    snapshots = {}
-    for path in directory.glob("rank-*.jsonl"):
-        contents = path.read_text()
-        complete = contents.rsplit("\n", 1)[0]
-        rows = [json.loads(line) for line in complete.splitlines()]
-        if rows:
-            row = rows[0] if baseline else rows[-1]
-            rank = row["snapshot"]["rank"]
-            assert rank not in snapshots, "Multiple final executors recorded the same rank"
-            snapshots[rank] = row["snapshot"]
-    return [snapshots[rank] for rank in sorted(snapshots)]
+def _latest_snapshots(rows: list[dict]) -> list[dict]:
+    """The newest measurement snapshot each rank exported through the iteration stats."""
+    latest: dict[int, dict] = {}
+    for row in rows:
+        snapshot = row.get("dkvMeasurement")
+        if snapshot is not None:
+            latest[snapshot["rank"]] = snapshot
+    return [latest[rank] for rank in sorted(latest)]
 
 
-def _wait_snapshots(directory: Path, counts: list[int]) -> list[dict]:
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        baseline = _snapshots(directory, baseline=True)
-        current = _snapshots(directory)
-        if len(baseline) == len(current) == 2:
-            actual = [
-                row["counters"]["request_count"] - start["counters"]["request_count"]
-                for row, start in zip(current, baseline, strict=True)
-            ]
-            assert all(a <= b for a, b in zip(actual, counts, strict=True)), actual
-            if actual == counts:
-                return current
-        time.sleep(0.02)
-    raise TimeoutError(f"Missing rank measurement counters {counts}: {directory}")
+def _request_counts(snapshots: list[dict]) -> list[int]:
+    return [snapshot["counters"]["request_count"] for snapshot in snapshots]
 
 
 def _worker(options: dict, directory: Path) -> None:
@@ -55,7 +38,6 @@ def _worker(options: dict, directory: Path) -> None:
         from dkv_models import make_dkv_llm
 
     block = options["tokens_per_block"]
-    snapshots_dir = directory / "traces"
     events: list[dict] = []
     stats: list[dict] = []
     counts = [0, 0]
@@ -78,27 +60,43 @@ def _worker(options: dict, directory: Path) -> None:
         max_num_tokens=4 * block,
         max_seq_len=4 * block,
     ) as llm:
-        _wait_snapshots(snapshots_dir, counts)
+
+        def pull() -> list[dict]:
+            """Collect the events and iteration-stats rows produced since the last pull."""
+            latest = [event for event in llm.get_kv_cache_events(0.2) if event]
+            events.extend(latest)
+            latest_stats = llm.get_stats(timeout=0.2)
+            stats.extend(latest_stats)
+            for name, rows in (("events", latest), ("iteration-stats", latest_stats)):
+                if rows:
+                    with (directory / f"{name}.jsonl").open("a") as stream:
+                        stream.writelines(json.dumps(row) + "\n" for row in rows)
+            return latest
 
         def drain() -> None:
             deadline = time.monotonic() + 15
             quiet_since = time.monotonic()
             while time.monotonic() < deadline:
-                latest = [event for event in llm.get_kv_cache_events(0.2) if event]
-                events.extend(latest)
-                latest_stats = llm.get_stats(timeout=0.2)
-                stats.extend(latest_stats)
-                for name, rows in (("events", latest), ("iteration-stats", latest_stats)):
-                    if rows:
-                        with (directory / f"{name}.jsonl").open("a") as stream:
-                            stream.writelines(json.dumps(row) + "\n" for row in rows)
-                if latest:
+                if pull():
                     quiet_since = time.monotonic()
                 elif time.monotonic() - quiet_since >= 0.5:
                     return
             raise TimeoutError("KV event stream did not become idle after sequential requests")
 
-        drain()
+        def settle() -> list[dict]:
+            """Wait until every rank has exported counters for all requests submitted so far."""
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                pull()
+                snapshots = _latest_snapshots(stats)
+                if len(snapshots) == len(counts):
+                    actual = _request_counts(snapshots)
+                    assert all(a <= b for a, b in zip(actual, counts, strict=True)), actual
+                    if actual == counts:
+                        drain()
+                        return _latest_snapshots(stats)
+                time.sleep(0.02)
+            raise TimeoutError(f"Missing rank measurement counters {counts}")
 
         def submit(prompt: list[int], rank: int, salt: str) -> None:
             output = llm.generate_async(
@@ -114,19 +112,17 @@ def _worker(options: dict, directory: Path) -> None:
             counts[rank] += 1
 
         submit([200], 0, "measurement-prime")
-        _wait_snapshots(snapshots_dir, counts)
-        drain()
-        initial = _snapshots(snapshots_dir)
+        initial = settle()
         initial_event_count = len(events)
+        initial_stats_count = len(stats)
 
         def phase(name: str, requests: list[tuple[list[int], int, str]]) -> None:
-            before = _snapshots(snapshots_dir)
+            before = _latest_snapshots(stats)
             event_start = len(events)
+            stats_start = len(stats)
             for prompt, rank, salt in requests:
                 submit(prompt, rank, salt)
-            _wait_snapshots(snapshots_dir, counts)
-            drain()
-            after = _snapshots(snapshots_dir)
+            after = settle()
             (directory / f"{name}-snapshots.json").write_text(
                 json.dumps({"before": before, "after": after}, indent=2)
             )
@@ -136,6 +132,7 @@ def _worker(options: dict, directory: Path) -> None:
                 dkv_enabled=options["dkv"],
                 baseline_snapshots=before,
                 baseline_event_count=event_start,
+                iteration_stats=stats[stats_start:],
             )
             phases[name] = {
                 "baseline_snapshots": before,
@@ -157,13 +154,14 @@ def _worker(options: dict, directory: Path) -> None:
             ]
             phase("pressure", pressure)
             phase("after_pressure", [(prefix + [103], 0, "shared")])
-        final = _snapshots(snapshots_dir)
+        final = _latest_snapshots(stats)
         total = build_dkv_measurement_report(
             final,
             events,
             dkv_enabled=options["dkv"],
             baseline_snapshots=initial,
             baseline_event_count=initial_event_count,
+            iteration_stats=stats[initial_stats_count:],
         )
 
     result = {
@@ -184,14 +182,6 @@ def _run_session(options: dict, directory: Path) -> dict:
     directory.mkdir(parents=True)
     options_path = directory / "options.json"
     options_path.write_text(json.dumps(options))
-    hook = directory / "hook"
-    hook.mkdir()
-    (hook / "sitecustomize.py").write_text(
-        "import os\n"
-        "if os.environ.get('DKV_MEASUREMENT_TRACE_DIR'):\n"
-        "    from dkv_measurement_probe import install_import_hook\n"
-        "    install_import_hook(os.environ['DKV_MEASUREMENT_TRACE_DIR'])\n"
-    )
     env = {
         key: value
         for key, value in os.environ.items()
@@ -205,12 +195,9 @@ def _run_session(options: dict, directory: Path) -> dict:
             "TRTLLM_DKV_DEBUG": "1",
             "TRTLLM_DKV_MEASUREMENT": "1",
             "TRTLLM_KV_FRESH_PAGE_FILL": "zero",
-            "DKV_MEASUREMENT_TRACE_DIR": str(directory / "traces"),
         }
     )
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(hook), str(Path(__file__).parent), env.get("PYTHONPATH", "")]
-    )
+    env["PYTHONPATH"] = os.pathsep.join([str(Path(__file__).parent), env.get("PYTHONPATH", "")])
     env.pop("TLLM_WORKER_USE_SINGLE_PROCESS", None)
     with (directory / "worker.log").open("w") as log:
         process = subprocess.Popen(
