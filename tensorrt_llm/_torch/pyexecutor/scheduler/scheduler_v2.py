@@ -414,7 +414,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             else None
         )
         budget = BudgetTracker(self.max_num_tokens, self.max_num_requests, self.peft_cache_manager)
-        dummy_budget = BudgetTracker(None, len(active_requests))
+        # Only the DKV ledgers route a dummy request to a budget of its own.
+        dummy_budget = BudgetTracker(None, len(active_requests)) if dkv_budget is not None else None
 
         def budget_for(req: LlmRequest) -> BudgetTracker:
             if dkv_budget is None:
