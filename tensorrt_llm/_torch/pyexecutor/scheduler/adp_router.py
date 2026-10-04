@@ -480,7 +480,7 @@ class DefaultADPRouter(ADPRouter):
         super().__init__(
             dist, has_seq_slot_headroom=has_seq_slot_headroom, kv_cache_manager=kv_cache_manager
         )
-        # Input-order probe results consumed by the executor's C2 checkpoint.
+        # Input-order probe results that the executor's prefix-probe check compares across ranks.
         self.dkv_prefix_matches: list[tuple[int, int]] = []
 
     def create_rank_state(
