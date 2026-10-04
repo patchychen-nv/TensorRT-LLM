@@ -1,6 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Four-GPU DKV context to ordinary generation gate, also runnable outside pytest."""
+"""DKV context to ordinary generation gate, also runnable outside pytest.
+
+By default a context group and a generation group of two ranks each share one four-GPU node and
+the runner starts both. Larger groups, or groups on different nodes, are started by the job: it
+runs ``--prepare-phase`` once per phase (``adp-control``, ``adp-replay``, ``dkv``, or a mutated
+``dkv``), starts every rank of each group with ``--role`` after exporting what ``--role-env``
+prints, and judges the finished phases with ``--judge`` or ``--judge-mutation``.
+"""
 
 import argparse
 import copy
