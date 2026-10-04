@@ -34,6 +34,15 @@ l0_gb300_multi_gpus:
   - unittest/_torch/thop/serial
   - unittest/_torch/executor
   - unittest/_torch/disaggregation
+  - kv_cache/test_dkv_stage0.py TIMEOUT (30)
+  - dkv/test_dkv_gate.py TIMEOUT (60)
+  - dkv/test_dkv_faults.py TIMEOUT (15)
+  - dkv/test_dkv_transfer.py TIMEOUT (60)
+  - dkv/test_dkv_measurement.py TIMEOUT (60)
+  - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_v2_kv_events TIMEOUT (15)
+  - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_dkv_v2_kv_events TIMEOUT (15)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_dkv_context TIMEOUT (60)
+  - unittest/_torch/multi_gpu/test_dkv_invariants_tp.py
   # GLM-5.3-Flash: ADP/MTP/FP8-KV and non-speculative prefix reuse.
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv] TIMEOUT (60)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_size=4] TIMEOUT (60)

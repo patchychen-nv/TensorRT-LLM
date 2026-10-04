@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -23,6 +25,7 @@ from tensorrt_llm.inputs.multimodal import (MultimodalInput,
 from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, DkvConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1
 from tensorrt_llm.sampling_params import SamplingParams
@@ -1091,3 +1094,135 @@ def test_llm_api_attention_dp_kv_events():
 
         check_events(llm, requests, sampling_params, scheduling_params,
                      attention_dp_rank)
+
+
+def _check_v2_attention_dp_stored_events(dkv_enabled: bool,
+                                         output_path: Path) -> None:
+    cache_salt = "dkv-stage5-lifecycle"
+    prompt = list(range(42, 171))
+    expected_blocks = {
+        tuple(prompt[offset:offset + 32])
+        for offset in range(0, 128, 32)
+    }
+
+    def belongs_to_request(block: dict) -> bool:
+        return tuple(token["token_id"]
+                     for token in block["tokens"]) in expected_blocks
+
+    events = []
+    expected_ranks = {0, 1} if dkv_enabled else {0}
+    with LLM(model=llama_model_path,
+             tensor_parallel_size=2,
+             enable_attention_dp=True,
+             disable_overlap_scheduler=True,
+             enable_chunked_prefill=False,
+             enable_autotuner=False,
+             cuda_graph_config=None,
+             max_batch_size=2,
+             max_num_tokens=256,
+             max_seq_len=256,
+             num_postprocess_workers=0,
+             dkv_config=DkvConfig() if dkv_enabled else None,
+             kv_cache_config=KvCacheConfig(
+                 use_kv_cache_manager_v2=True,
+                 block_reuse_config=BlockReuseConfig(policy="per_request"),
+                 enable_block_reuse=True,
+                 enable_swa_scratch_reuse=False,
+                 event_buffer_max_size=1024,
+                 free_gpu_memory_fraction=0.4,
+                 max_tokens=1024,
+                 tokens_per_block=32,
+                 host_cache_size=0)) as llm:
+        llm.generate(prompt,
+                     sampling_params=SamplingParams(max_tokens=1,
+                                                    temperature=0,
+                                                    ignore_eos=True),
+                     scheduling_params=SchedulingParams(
+                         attention_dp_rank=0, attention_dp_relax=False),
+                     cache_salt=cache_salt,
+                     use_tqdm=False)
+        deadline = time.monotonic() + 15
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            latest = [event for event in llm.get_kv_cache_events(0.2) if event]
+            if latest:
+                quiet_since = time.monotonic()
+                events.extend(latest)
+            created = {
+                event["attention_dp_rank"]
+                for event in events if event["data"]["type"] == "created"
+            }
+            stored = {
+                event["attention_dp_rank"]
+                for event in events
+                if event["data"]["type"] == "stored" and any(
+                    belongs_to_request(block)
+                    for block in event["data"]["blocks"])
+            }
+            if (created == {0, 1} and expected_ranks <= stored
+                    and time.monotonic() - quiet_since >= 2):
+                break
+        else:
+            output_path.write_text(json.dumps({"events": events}, indent=2))
+            pytest.fail(
+                f"Missing event streams: created={created}, stored={stored}; "
+                f"raw events: {output_path}")
+
+    output_path.write_text(json.dumps({"events": events}, indent=2))
+    hashes = {0: {}, 1: {}}
+    for event in events:
+        if event["data"]["type"] != "stored":
+            continue
+        assert event["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+        rank = event["attention_dp_rank"]
+        group = event["layer_group_id"]
+        for block in event["data"]["blocks"]:
+            if belongs_to_request(block):
+                hashes[rank].setdefault(group, set()).add(block["block_hash"])
+    assert hashes[0], "The pinned rank did not store its request"
+    assert all(len(values) == 4 for values in hashes[0].values())
+    if dkv_enabled:
+        assert hashes[0] == hashes[
+            1], "DKV lifecycle block hashes differ by rank"
+    else:
+        assert not hashes[1], "Ordinary V2 ADP stored a rank-0 request on rank 1"
+    output_path.write_text(
+        json.dumps(
+            {
+                "dkv_enabled": dkv_enabled,
+                "request_compute_rank": 0,
+                "quiet_observation_seconds": 2,
+                "created_ranks": sorted(created),
+                "stored_hashes_by_rank_and_layer_group": {
+                    rank: {
+                        group: sorted(values)
+                        for group, values in groups.items()
+                    }
+                    for rank, groups in hashes.items()
+                },
+                "events": events,
+                "scope": "Replicated lifecycle keys; not KV tensor contents",
+            },
+            indent=2))
+
+
+@skip_single_gpu
+@pytest.mark.post_merge
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(600)
+def test_llm_api_attention_dp_v2_kv_events(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    _check_v2_attention_dp_stored_events(False, tmp_path / "adp-events.json")
+
+
+@skip_single_gpu
+@pytest.mark.post_merge
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(600)
+def test_llm_api_dkv_v2_kv_events(tmp_path: Path,
+                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    _check_v2_attention_dp_stored_events(True, tmp_path / "dkv-events.json")

@@ -3158,22 +3158,80 @@ class TestDkvRuntimeValidation:
     """PyExecutor rejects DKV on a KV manager or transceiver it cannot drive."""
 
     @staticmethod
-    def _make_executor(is_kv_manager_v2, kv_cache_transceiver):
+    def _make_executor(manager_type=None, kv_cache_transceiver=None):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm.mapping import Mapping
+
         executor = PyExecutor.__new__(PyExecutor)
-        executor._is_kv_manager_v2 = is_kv_manager_v2
-        executor.kv_cache_manager = Mock()
+        manager_type = manager_type or KVCacheManagerV2
+        executor.kv_cache_manager = manager_type.__new__(manager_type)
+        executor.kv_cache_manager.enable_block_reuse = True
         executor.kv_cache_transceiver = kv_cache_transceiver
+        executor.is_encoder_decoder = False
+        executor.is_benchmark_disagg = False
+        executor._mm_encoder_item_scheduling_enabled = False
+        executor.attention_dp_enable_balance = False
+        executor.dist = types.SimpleNamespace(
+            mapping=Mapping(world_size=2, tp_size=2, moe_ep_size=2, enable_attention_dp=True)
+        )
         return executor
 
-    @pytest.mark.parametrize("transceiver", [None, Mock(spec=KvCacheTransceiver)])
-    def test_accepts_v2_manager(self, transceiver):
-        self._make_executor(True, transceiver)._validate_dkv_runtime()
+    def test_accepts_v2_manager(self):
+        self._make_executor()._validate_dkv_runtime()
+
+    def test_accepts_deepseek_v4_manager(self):
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+            DeepseekV4CacheManager,
+        )
+
+        self._make_executor(DeepseekV4CacheManager)._validate_dkv_runtime()
 
     def test_rejects_v1_manager(self):
-        with pytest.raises(ValueError, match="requires KVCacheManagerV2"):
-            self._make_executor(False, None)._validate_dkv_runtime()
+        with pytest.raises(ValueError, match="not supported with dkv_config yet"):
+            self._make_executor(types.SimpleNamespace)._validate_dkv_runtime()
 
-    def test_rejects_cpp_transceiver(self):
-        executor = self._make_executor(True, Mock(spec=BindKvCacheTransceiver))
-        with pytest.raises(ValueError, match="Python cache transceiver"):
+    def test_rejects_unreviewed_v2_subclass(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+        class OtherCacheManager(KVCacheManagerV2):
+            pass
+
+        with pytest.raises(ValueError, match="OtherCacheManager is not supported"):
+            self._make_executor(OtherCacheManager)._validate_dkv_runtime()
+
+    @pytest.mark.parametrize("transceiver_type", [BindKvCacheTransceiver, KvCacheTransceiver])
+    def test_rejects_transceiver(self, transceiver_type):
+        executor = self._make_executor(kv_cache_transceiver=Mock(spec=transceiver_type))
+        with pytest.raises(ValueError, match="DKV requires the Python KvCacheTransceiverV2"):
             executor._validate_dkv_runtime()
+
+    @pytest.mark.parametrize(
+        "feature",
+        [
+            "is_encoder_decoder",
+            "is_benchmark_disagg",
+            "_mm_encoder_item_scheduling_enabled",
+            "attention_dp_enable_balance",
+        ],
+    )
+    def test_rejects_runtime_feature(self, feature):
+        executor = self._make_executor()
+        setattr(executor, feature, True)
+        with pytest.raises(ValueError, match="not supported with dkv_config yet"):
+            executor._validate_dkv_runtime()
+
+    def test_warns_when_reuse_disabled(self):
+        executor = self._make_executor()
+        executor.kv_cache_manager.enable_block_reuse = False
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning:
+            executor._validate_dkv_runtime()
+        assert "reuse is disabled" in warning.call_args.args[0]
+
+    def test_warns_when_expert_parallel_size_differs(self):
+        from tensorrt_llm.mapping import Mapping
+
+        executor = self._make_executor()
+        executor.dist.mapping = Mapping(world_size=2, tp_size=2, enable_attention_dp=True)
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning:
+            executor._validate_dkv_runtime()
+        assert "expert parallel size" in warning.call_args.args[0]

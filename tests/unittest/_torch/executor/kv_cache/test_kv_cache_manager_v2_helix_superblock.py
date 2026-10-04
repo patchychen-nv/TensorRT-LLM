@@ -222,6 +222,7 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         # is_draft=True skips the module-level draft-token relocation call;
         # with zero reserve tokens the rewind math is unchanged.
         is_draft=True,
+        dkv_group_size=None,
         _kv_reserve_draft_tokens=0,
         # No scheduler ran, so nothing recorded a generation allocation; the
         # rewind falls back to the reserve width.

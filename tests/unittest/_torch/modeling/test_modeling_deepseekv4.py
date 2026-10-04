@@ -192,6 +192,7 @@ def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks(monkeypatch) -> None:
     )
 
     class LlmArgs:
+        dkv_config = None
         kv_cache_config = KvCacheConfig(dtype="fp8_ds_mla")
 
     defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())

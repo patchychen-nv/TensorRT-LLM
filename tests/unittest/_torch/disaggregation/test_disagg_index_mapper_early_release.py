@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -153,6 +154,42 @@ class TestIndexMapperSlotReuse:
         )
 
         return IndexMapper(max_batch_size=2, max_beam_width=1)
+
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_dkv_remote_release_matches_transfer_admission(self, index_mapper, failed):
+        index_mapper.add_new_sequence(42)
+        request = create_mock_request(42)
+        request.is_dummy = False
+        request.is_child = False
+        request.py_dkv_compute_rank = 1
+        active = [] if failed else [request]
+        if failed:
+            request.state = LlmRequestState.GENERATION_COMPLETE
+        kv = MagicMock()
+        kv.release_index_slot.side_effect = index_mapper.remove_sequence
+        transfers = AsyncTransferManager(create_mock_resource_manager(kv_cache_manager=kv))
+        transceiver = MagicMock()
+        coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=transfers,
+            kv_cache_manager=kv,
+            dist=MagicMock(rank=0),
+            effects=MagicMock(),
+            registry=MagicMock(
+                contains=lambda req: req in active,
+                canceled_request_ids=lambda: (),
+            ),
+            enable_attention_dp=True,
+            force_terminate_ctx_for_partial_reuse=False,
+            is_local=lambda req: False,
+        )
+
+        coordinator.send_completed_context([request])
+
+        assert _has_sequence(index_mapper, 42) == failed
+        assert (42 in transfers.requests_in_transfer()) != failed
+        assert kv.release_index_slot.call_count == int(not failed)
+        transceiver.respond_and_send_async.assert_not_called()
 
     def test_add_and_remove(self, index_mapper):
         """Verify add_new_sequence / remove_sequence bookkeeping via get_index."""
