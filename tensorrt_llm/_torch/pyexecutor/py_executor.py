@@ -2603,9 +2603,11 @@ class PyExecutor:
                  gpu_forward_time_ms, dkv_measurement))
 
     def _dkv_measurement_snapshot(self) -> Optional[dict]:
-        """This rank's opt-in replicated-KV experiment counters, or None when not collected."""
-        if getattr(self, "dkv_enabled", False) is not True:
-            return None
+        """This rank's opt-in KV experiment counters, or None when not collected.
+
+        Plain attention DP exports them as well, so a control run without DKV reports the same
+        counters as the run it is compared with.
+        """
         snapshot = getattr(self.kv_cache_manager,
                            "get_dkv_measurement_snapshot", None)
         result = snapshot() if callable(snapshot) else None

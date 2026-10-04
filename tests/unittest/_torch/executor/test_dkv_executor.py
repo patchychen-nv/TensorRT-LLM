@@ -483,15 +483,25 @@ def test_dkv_rejects_rank_local_balancing() -> None:
 @pytest.mark.parametrize(
     "dkv_enabled, manager, expected",
     [
-        (False, SimpleNamespace(get_dkv_measurement_snapshot=lambda: {"rank": 1}), None),
+        (False, SimpleNamespace(get_dkv_measurement_snapshot=lambda: {"rank": 1}), {"rank": 1}),
         (True, SimpleNamespace(get_dkv_measurement_snapshot=lambda: {"rank": 1}), {"rank": 1}),
+        (False, SimpleNamespace(get_dkv_measurement_snapshot=lambda: None), None),
         (True, SimpleNamespace(get_dkv_measurement_snapshot=lambda: None), None),
         (True, SimpleNamespace(), None),
+        (False, None, None),
         (True, Mock(), None),
     ],
-    ids=["dkv-off", "collected", "not-collected", "no-accessor", "fabricating-double"],
+    ids=[
+        "adp-control-collected",
+        "dkv-collected",
+        "adp-not-collected",
+        "dkv-not-collected",
+        "no-accessor",
+        "no-cache-manager",
+        "fabricating-double",
+    ],
 )
-def test_measurement_snapshot_is_exported_only_when_dkv_collects_a_dict(
+def test_measurement_snapshot_is_exported_whenever_the_manager_collects_a_dict(
     dkv_enabled: bool, manager, expected
 ) -> None:
     executor = PyExecutor.__new__(PyExecutor)
