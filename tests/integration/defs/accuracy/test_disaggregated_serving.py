@@ -771,6 +771,62 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
+    @pytest.mark.post_merge
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(60000)
+    @skip_pre_hopper
+    def test_dkv_context(self):
+        """DKV context TP2 to ordinary generation TP2 over Python NIXL."""
+        kv_cache_config = {
+            "enable_block_reuse": False,
+            "enable_swa_scratch_reuse": False,
+            "use_kv_cache_manager_v2": True,
+            "block_reuse_config": {
+                "policy": "per_request"
+            },
+        }
+        transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "dkv_config": {},
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": transceiver_config,
+        }
+        server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                extra_env={"TRTLLM_DKV_DEBUG": "1"},
+                request_timeout_s=120,
+                request_max_retries=0,
+        ) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     @skip_no_hopper

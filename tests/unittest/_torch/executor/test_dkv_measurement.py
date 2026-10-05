@@ -600,3 +600,33 @@ def test_dkv_state_reads_as_off_for_partial_managers_and_spec_doubles() -> None:
     manager = _manager()
     assert _dkv_group_size_of(manager) == 2
     assert _dkv_measurement_of(manager) is manager._dkv_measurement
+
+
+def _load_runner():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[3] / "integration/defs/dkv/dkv_measurement_runner.py"
+    spec = importlib.util.spec_from_file_location("dkv_measurement_runner_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_runner_reads_each_ranks_newest_snapshot_from_the_exported_rows() -> None:
+    runner = _load_runner()
+    first = _snapshot(0)
+    newer = {**_snapshot(0), "counters": {**_snapshot(0)["counters"], "request_count": 5}}
+    rows = [
+        {"iter": 1},
+        {"attentionDpRank": 0, "dkvMeasurement": first},
+        {"attentionDpRank": 1, "dkvMeasurement": _snapshot(1)},
+        {"attentionDpRank": 0, "dkvMeasurement": None},
+        {"attentionDpRank": 0, "dkvMeasurement": newer},
+    ]
+    snapshots = runner._latest_snapshots(rows)
+    assert [snapshot["rank"] for snapshot in snapshots] == [0, 1]
+    assert snapshots[0] is newer
+    assert runner._request_counts(snapshots) == [5, 1]
+    assert runner._latest_snapshots([{"iter": 1}]) == []

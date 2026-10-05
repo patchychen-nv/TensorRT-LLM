@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -23,6 +25,7 @@ from tensorrt_llm.inputs.multimodal import (MultimodalInput,
 from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, DkvConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1
 from tensorrt_llm.sampling_params import SamplingParams
@@ -1091,3 +1094,262 @@ def test_llm_api_attention_dp_kv_events():
 
         check_events(llm, requests, sampling_params, scheduling_params,
                      attention_dp_rank)
+
+
+def _v2_event_llm(dkv_enabled: bool, event_buffer_max_size: int) -> LLM:
+    """Two attention-DP ranks over a 32-block pool whose KV events are buffered for polling."""
+    return LLM(model=llama_model_path,
+               tensor_parallel_size=2,
+               enable_attention_dp=True,
+               disable_overlap_scheduler=True,
+               enable_chunked_prefill=False,
+               enable_autotuner=False,
+               cuda_graph_config=None,
+               max_batch_size=2,
+               max_num_tokens=256,
+               max_seq_len=256,
+               num_postprocess_workers=0,
+               dkv_config=DkvConfig() if dkv_enabled else None,
+               kv_cache_config=KvCacheConfig(
+                   use_kv_cache_manager_v2=True,
+                   block_reuse_config=BlockReuseConfig(policy="per_request"),
+                   enable_block_reuse=True,
+                   enable_swa_scratch_reuse=False,
+                   event_buffer_max_size=event_buffer_max_size,
+                   free_gpu_memory_fraction=0.4,
+                   max_tokens=1024,
+                   tokens_per_block=32,
+                   host_cache_size=0))
+
+
+def _check_v2_attention_dp_stored_events(dkv_enabled: bool,
+                                         output_path: Path) -> None:
+    cache_salt = "dkv-lifecycle"
+    prompt = list(range(42, 171))
+    expected_blocks = {
+        tuple(prompt[offset:offset + 32])
+        for offset in range(0, 128, 32)
+    }
+
+    def belongs_to_request(block: dict) -> bool:
+        return tuple(token["token_id"]
+                     for token in block["tokens"]) in expected_blocks
+
+    events = []
+    expected_ranks = {0, 1} if dkv_enabled else {0}
+    with _v2_event_llm(dkv_enabled, event_buffer_max_size=1024) as llm:
+        llm.generate(prompt,
+                     sampling_params=SamplingParams(max_tokens=1,
+                                                    temperature=0,
+                                                    ignore_eos=True),
+                     scheduling_params=SchedulingParams(
+                         attention_dp_rank=0, attention_dp_relax=False),
+                     cache_salt=cache_salt,
+                     use_tqdm=False)
+        deadline = time.monotonic() + 15
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            latest = [event for event in llm.get_kv_cache_events(0.2) if event]
+            if latest:
+                quiet_since = time.monotonic()
+                events.extend(latest)
+            created = {
+                event["attention_dp_rank"]
+                for event in events if event["data"]["type"] == "created"
+            }
+            stored = {
+                event["attention_dp_rank"]
+                for event in events
+                if event["data"]["type"] == "stored" and any(
+                    belongs_to_request(block)
+                    for block in event["data"]["blocks"])
+            }
+            if (created == {0, 1} and expected_ranks <= stored
+                    and time.monotonic() - quiet_since >= 2):
+                break
+        else:
+            output_path.write_text(json.dumps({"events": events}, indent=2))
+            pytest.fail(
+                f"Missing event streams: created={created}, stored={stored}; "
+                f"raw events: {output_path}")
+
+    output_path.write_text(json.dumps({"events": events}, indent=2))
+    hashes = {0: {}, 1: {}}
+    for event in events:
+        if event["data"]["type"] != "stored":
+            continue
+        assert event["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+        rank = event["attention_dp_rank"]
+        group = event["layer_group_id"]
+        for block in event["data"]["blocks"]:
+            if belongs_to_request(block):
+                hashes[rank].setdefault(group, set()).add(block["block_hash"])
+    assert hashes[0], "The pinned rank did not store its request"
+    assert all(len(values) == 4 for values in hashes[0].values())
+    if dkv_enabled:
+        assert hashes[0] == hashes[
+            1], "DKV lifecycle block hashes differ by rank"
+    else:
+        assert not hashes[1], "Ordinary V2 ADP stored a rank-0 request on rank 1"
+    output_path.write_text(
+        json.dumps(
+            {
+                "dkv_enabled": dkv_enabled,
+                "request_compute_rank": 0,
+                "quiet_observation_seconds": 2,
+                "created_ranks": sorted(created),
+                "stored_hashes_by_rank_and_layer_group": {
+                    rank: {
+                        group: sorted(values)
+                        for group, values in groups.items()
+                    }
+                    for rank, groups in hashes.items()
+                },
+                "events": events,
+                "scope": "Replicated lifecycle keys; not KV tensor contents",
+            },
+            indent=2))
+
+
+# Prompt ``i`` of the pressure test holds the token ids 100 * i .. 100 * i + 128: four full blocks of
+# 32 tokens and one token more, so a block's first token id names the request that owns it.
+_PRESSURE_REQUESTS = 40
+_PRESSURE_STRIDE = 100
+_PRESSURE_BLOCK = 32
+
+
+def _serve_pressure_requests(dkv_enabled: bool,
+                             output_path: Path) -> dict[int, list[dict]]:
+    """Serve more distinct prompts than the pool keeps and return each rank's events in order.
+
+    Request ``i`` is pinned to rank ``i % 2``. The raw events are written to ``output_path``.
+    """
+    events: list[dict] = []
+    sampling = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
+    with _v2_event_llm(dkv_enabled, event_buffer_max_size=8192) as llm:
+        for index in range(_PRESSURE_REQUESTS):
+            start = _PRESSURE_STRIDE * index
+            llm.generate(list(range(start, start + 129)),
+                         sampling_params=sampling,
+                         scheduling_params=SchedulingParams(
+                             attention_dp_rank=index % 2,
+                             attention_dp_relax=False),
+                         use_tqdm=False)
+        quiet_since = time.monotonic()
+        deadline = quiet_since + 30
+        while (time.monotonic() < deadline
+               and time.monotonic() - quiet_since < 2):
+            latest = [event for event in llm.get_kv_cache_events(0.2) if event]
+            if latest:
+                quiet_since = time.monotonic()
+                events.extend(latest)
+    output_path.write_text(json.dumps({"events": events}, indent=2))
+    by_rank: dict[int, list[dict]] = {0: [], 1: []}
+    for event in events:
+        by_rank[event["attention_dp_rank"]].append(event)
+    for rank, rank_events in by_rank.items():
+        rank_events.sort(key=lambda event: event["event_id"])
+        assert [event["event_id"]
+                for event in rank_events] == list(range(len(rank_events))), (
+                    f"Rank {rank} lost events; raw events: {output_path}")
+    return by_rank
+
+
+def _prompt_block_owner(block: dict) -> int | None:
+    """The request whose prompt holds this stored block, or None for any other block."""
+    tokens = tuple(token["token_id"] for token in block["tokens"])
+    if len(tokens) != _PRESSURE_BLOCK:
+        return None
+    index, offset = divmod(tokens[0], _PRESSURE_STRIDE)
+    if (offset % _PRESSURE_BLOCK or index >= _PRESSURE_REQUESTS
+            or tokens != tuple(range(tokens[0], tokens[0] + _PRESSURE_BLOCK))):
+        return None
+    return index
+
+
+def _stored_prompt_blocks(events: list[dict]) -> dict[int, int]:
+    """Map the hash of every stored prompt block to the request that owns it."""
+    owners = {}
+    for event in events:
+        if event["data"]["type"] == "stored":
+            for block in event["data"]["blocks"]:
+                owner = _prompt_block_owner(block)
+                if owner is not None:
+                    owners[block["block_hash"]] = owner
+    return owners
+
+
+def _count_removals_after_stores(rank: int, events: list[dict]) -> int:
+    """Check that each removed block was stored before it, and count the removed blocks."""
+    live: set[tuple[int | None, int]] = set()
+    removed = 0
+    for event in events:
+        data = event["data"]
+        group = event["layer_group_id"]
+        if data["type"] == "stored":
+            live.update(
+                (group, block["block_hash"]) for block in data["blocks"])
+        elif data["type"] == "removed":
+            hashes = {(group, block_hash)
+                      for block_hash in data["block_hashes"]}
+            assert hashes <= live, f"Rank {rank} removed blocks it never stored"
+            live -= hashes
+            removed += len(hashes)
+    return removed
+
+
+@skip_single_gpu
+@pytest.mark.post_merge
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(900)
+def test_llm_api_dkv_v2_kv_events_under_pressure(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DKV replicas emit identical events while evicting; deduplicated, they match plain ADP."""
+    monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    dkv = _serve_pressure_requests(True, tmp_path / "dkv-pressure-events.json")
+    adp = _serve_pressure_requests(False, tmp_path / "adp-pressure-events.json")
+
+    for rank in (0, 1):
+        assert _count_removals_after_stores(rank, dkv[rank]) > 0, (
+            "The pool kept every block, so nothing was evicted")
+        _count_removals_after_stores(rank, adp[rank])
+    replica_events = [[(event["event_id"], event["layer_group_id"],
+                        event["data"]) for event in dkv[rank]]
+                      for rank in (0, 1)]
+    assert replica_events[0] == replica_events[1], (
+        "DKV replicas disagree on the stored and removed events")
+
+    dkv_blocks = [_stored_prompt_blocks(dkv[rank]) for rank in (0, 1)]
+    adp_blocks = [_stored_prompt_blocks(adp[rank]) for rank in (0, 1)]
+    for rank in (0, 1):
+        assert set(adp_blocks[rank].values()) == {
+            index
+            for index in range(_PRESSURE_REQUESTS) if index % 2 == rank
+        }, f"Ordinary ADP rank {rank} stored requests it did not run"
+    # Every replica stores every request once; the logical set is the union over the ADP ranks.
+    logical_blocks = {**adp_blocks[0], **adp_blocks[1]}
+    assert len(logical_blocks) == 4 * _PRESSURE_REQUESTS
+    assert dkv_blocks[0] == dkv_blocks[1] == logical_blocks
+
+
+@skip_single_gpu
+@pytest.mark.post_merge
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(600)
+def test_llm_api_attention_dp_v2_kv_events(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    _check_v2_attention_dp_stored_events(False, tmp_path / "adp-events.json")
+
+
+@skip_single_gpu
+@pytest.mark.post_merge
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(600)
+def test_llm_api_dkv_v2_kv_events(tmp_path: Path,
+                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_DKV_DEBUG", "1")
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    _check_v2_attention_dp_stored_events(True, tmp_path / "dkv-events.json")
