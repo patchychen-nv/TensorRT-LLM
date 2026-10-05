@@ -49,7 +49,8 @@ from typing import List
 
 import pytest
 import torch
-from test_mamba_transfer import _create_transceivers, _run_concurrent
+from test_mamba_transfer import _create_transceivers
+from utils.collectives import run_concurrent
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -655,10 +656,10 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
         for req_idx, req in enumerate(ctx_reqs):
             for rank in _ctx_ranks(req_idx):
                 ctx_tcs[rank].respond_and_send_async(req)
-        _run_concurrent(
+        run_concurrent(
             ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True)
         )
-        _run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
+        run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
 
         # Transfer-size metric must include the fixed-size KDA state — the actual
         # transferred bytes must cover the computed payload size: per rank,
