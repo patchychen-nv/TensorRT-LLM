@@ -11,8 +11,9 @@ import bisect
 import itertools
 import random
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,9 @@ class WorkloadResult:
     prompt_tokens: int
     cached_tokens: int
     latency_s: float
+
+
+_WARMUP_SEED_OFFSET = 1_000_003
 
 
 def _tokens(rng: random.Random, count: int, vocab: int) -> list[int]:
@@ -101,6 +105,125 @@ def multi_turn_workload(
     return requests
 
 
+def chat_workload(
+    *,
+    sessions: int,
+    turns: tuple[int, int],
+    first_tokens: Sequence[int],
+    turn_tokens: Sequence[int],
+    vocab: int,
+    seed: int = 0,
+    interleave: Literal["rounds", "random"] = "rounds",
+) -> list[WorkloadRequest]:
+    """Conversations of different length whose every turn re-sends the whole history.
+
+    A session draws its first-turn length from ``first_tokens``, its per-turn growth from
+    ``turn_tokens`` and its number of turns from the inclusive range ``turns``. ``rounds`` orders the
+    requests turn by turn across the sessions, the order a closed-loop client submits them in;
+    ``random`` interleaves the sessions at random and keeps the turns of one session in order.
+    """
+    low, high = turns
+    if not first_tokens or not turn_tokens:
+        raise ValueError("first_tokens and turn_tokens need at least one length")
+    if min(sessions, low, *first_tokens, *turn_tokens) < 1 or high < low:
+        raise ValueError("sessions, turns and token counts must be positive and turns ordered")
+    rng = random.Random(seed)
+    plans: list[list[list[int]]] = []
+    for _ in range(sessions):
+        history = _tokens(rng, rng.choice(first_tokens), vocab)
+        growth = rng.choice(turn_tokens)
+        plan = [list(history)]
+        for _ in range(rng.randint(low, high) - 1):
+            history = history + _tokens(rng, growth, vocab)
+            plan.append(list(history))
+        plans.append(plan)
+    if interleave == "random":
+        order = [session for session, plan in enumerate(plans) for _ in plan]
+        rng.shuffle(order)
+    else:
+        order = [
+            session
+            for turn in range(max(map(len, plans)))
+            for session, plan in enumerate(plans)
+            if turn < len(plan)
+        ]
+    served = [0] * sessions
+    requests = []
+    for session in order:
+        requests.append(
+            WorkloadRequest(
+                len(requests), session, plans[session][served[session]], served[session]
+            )
+        )
+        served[session] += 1
+    return requests
+
+
+def history_hit_ceiling(requests: Sequence[WorkloadRequest]) -> int:
+    """Prompt tokens a cache that keeps everything serves when each turn extends the previous one.
+
+    Every request after the first of its session can match the whole prompt of the session's
+    previous request, so a lifecycle visible to all ranks reaches exactly this many hits.
+    """
+    previous: dict[int, int] = {}
+    total = 0
+    for request in sorted(requests, key=lambda r: (r.session, r.turn)):
+        total += previous.get(request.session, 0)
+        previous[request.session] = len(request.prompt)
+    return total
+
+
+def prefix_bodies(requests: Sequence[WorkloadRequest], prefix_tokens: int) -> list[list[int]]:
+    """The shared prefix of every Zipf session that occurs in ``requests``, in session order."""
+    bodies: dict[int, list[int]] = {}
+    for request in requests:
+        bodies.setdefault(request.session, request.prompt[:prefix_tokens])
+    return [bodies[session] for session in sorted(bodies)]
+
+
+def warmup_prompts(*, count: int, tokens: int, vocab: int, seed: int = 0) -> list[list[int]]:
+    """Random prompts for warming kernels up, drawn apart from the workload's own seed stream."""
+    rng = random.Random(seed + _WARMUP_SEED_OFFSET)
+    return [_tokens(rng, tokens, vocab) for _ in range(count)]
+
+
+def summarize_results(results: Sequence[WorkloadResult]) -> dict:
+    """Totals, hits per turn and latency percentiles of the results of one or more runs.
+
+    The latencies include the wait behind earlier requests, so they only indicate an order of size.
+    """
+    by_turn: dict[int, dict[str, int]] = {}
+    for result in results:
+        row = by_turn.setdefault(
+            result.turn, {"requests": 0, "eligible_tokens": 0, "cached_tokens": 0}
+        )
+        row["requests"] += 1
+        row["eligible_tokens"] += result.prompt_tokens - 1
+        row["cached_tokens"] += result.cached_tokens
+    eligible = sum(row["eligible_tokens"] for row in by_turn.values())
+    cached = sum(row["cached_tokens"] for row in by_turn.values())
+    latencies = sorted(result.latency_s for result in results)
+
+    def percentile(fraction: float) -> float | None:
+        return (
+            latencies[min(len(latencies) - 1, int(fraction * len(latencies)))]
+            if latencies
+            else None
+        )
+
+    return {
+        "requests": len(results),
+        "prompt_tokens": sum(result.prompt_tokens for result in results),
+        "eligible_tokens": eligible,
+        "cached_tokens": cached,
+        "cached_over_eligible": cached / eligible if eligible else None,
+        "by_turn": by_turn,
+        "requests_with_cached_tokens": sum(1 for result in results if result.cached_tokens > 0),
+        "latency_p50_s": percentile(0.5),
+        "latency_p99_s": percentile(0.99),
+    }
+
+
 def trace_workload(rows: Sequence[dict]) -> list[WorkloadRequest]:
     """Requests from recorded rows ``{"arrival_s", "session", "prompt"}``, ordered by arrival."""
     ordered = sorted(rows, key=lambda row: row["arrival_s"])
@@ -121,6 +244,7 @@ def run_workload(
     requests: Sequence[WorkloadRequest],
     *,
     concurrency: int,
+    completed_turns: Mapping[int, int] | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[WorkloadResult]:
@@ -128,14 +252,16 @@ def run_workload(
 
     ``submit(request)`` starts a request and returns a callable that waits for it and returns the
     number of prompt tokens served from cache. A request waits for the previous turn of its session
-    to finish and, when it has an arrival offset, for that offset to pass.
+    to finish and, when it has an arrival offset, for that offset to pass. ``completed_turns`` maps a
+    session to the number of its turns an earlier call already served, so one workload can be run
+    in several consecutive parts.
     """
     if concurrency < 1:
         raise ValueError("concurrency must be positive")
     started = clock()
     pending = sorted(requests, key=lambda request: (request.arrival_s, request.index))
     in_flight: list[tuple[WorkloadRequest, float, Callable[[], int]]] = []
-    done_turns: dict[int, int] = {}
+    done_turns: dict[int, int] = dict(completed_turns or {})
     results: dict[int, WorkloadResult] = {}
 
     def finish(entry) -> None:

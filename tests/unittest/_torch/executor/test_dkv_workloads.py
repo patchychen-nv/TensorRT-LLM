@@ -57,6 +57,109 @@ def test_multi_turn_prompts_extend_the_previous_turn_of_their_session() -> None:
     assert len({tuple(prompt[:20]) for prompt in last.values()}) == 3
 
 
+_CHAT = dict(sessions=6, turns=(2, 4), first_tokens=[8, 16], turn_tokens=[2, 4], vocab=500)
+
+
+def test_chat_sessions_resend_their_history_and_differ_in_length() -> None:
+    requests = _WORKLOADS.chat_workload(seed=3, **_CHAT)
+    assert requests == _WORKLOADS.chat_workload(seed=3, **_CHAT)
+    assert requests != _WORKLOADS.chat_workload(seed=4, **_CHAT)
+    by_session: dict[int, list] = {}
+    for request in requests:
+        by_session.setdefault(request.session, []).append(request)
+    assert len(by_session) == 6
+    for turns in by_session.values():
+        assert [request.turn for request in turns] == list(range(len(turns)))
+        assert 2 <= len(turns) <= 4
+        assert len(turns[0].prompt) in (8, 16)
+        growth = {len(b.prompt) - len(a.prompt) for a, b in zip(turns, turns[1:], strict=False)}
+        assert len(growth) == 1 and growth <= {2, 4}
+        for before, after in zip(turns, turns[1:], strict=False):
+            assert after.prompt[: len(before.prompt)] == before.prompt
+    assert [request.index for request in requests] == list(range(len(requests)))
+    assert len({len(turns[0].prompt) for turns in by_session.values()}) == 2
+
+
+def test_chat_rounds_go_turn_by_turn_and_random_order_keeps_each_session_in_order() -> None:
+    rounds = _WORKLOADS.chat_workload(seed=3, **_CHAT)
+    shuffled = _WORKLOADS.chat_workload(seed=3, interleave="random", **_CHAT)
+    assert [request.turn for request in rounds] == sorted(request.turn for request in rounds)
+    assert sorted(map(repr, (r.prompt for r in rounds))) == sorted(
+        map(repr, (r.prompt for r in shuffled))
+    )
+    assert [(r.session, r.turn) for r in shuffled] != [(r.session, r.turn) for r in rounds]
+    last: dict[int, int] = {}
+    for request in shuffled:
+        assert request.turn == last.get(request.session, -1) + 1
+        last[request.session] = request.turn
+
+
+def test_the_history_hit_ceiling_does_not_depend_on_the_order_of_the_requests() -> None:
+    rounds = _WORKLOADS.chat_workload(seed=3, **_CHAT)
+    shuffled = _WORKLOADS.chat_workload(seed=3, interleave="random", **_CHAT)
+    previous: dict[int, int] = {}
+    expected = 0
+    for request in rounds:
+        expected += previous.get(request.session, 0)
+        previous[request.session] = len(request.prompt)
+    assert _WORKLOADS.history_hit_ceiling(rounds) == expected > 0
+    assert _WORKLOADS.history_hit_ceiling(shuffled) == expected
+    assert _WORKLOADS.history_hit_ceiling([]) == 0
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        dict(sessions=0),
+        dict(turns=(3, 2)),
+        dict(turns=(0, 2)),
+        dict(first_tokens=[]),
+        dict(turn_tokens=[0]),
+    ],
+)
+def test_chat_workload_rejects_degenerate_arguments(changes: dict) -> None:
+    with pytest.raises(ValueError):
+        _WORKLOADS.chat_workload(**{**_CHAT, **changes})
+
+
+def test_prefix_bodies_and_warmup_prompts() -> None:
+    requests = _WORKLOADS.zipf_prefix_workload(50, seed=1, **_ZIPF)
+    bodies = _WORKLOADS.prefix_bodies(requests, 64)
+    sessions = sorted({request.session for request in requests})
+    assert len(bodies) == len(sessions)
+    for session, body in zip(sessions, bodies, strict=True):
+        assert all(
+            request.prompt[:64] == body for request in requests if request.session == session
+        )
+    warm = _WORKLOADS.warmup_prompts(count=3, tokens=10, vocab=100, seed=2)
+    assert warm == _WORKLOADS.warmup_prompts(count=3, tokens=10, vocab=100, seed=2)
+    assert warm != _WORKLOADS.warmup_prompts(count=3, tokens=10, vocab=100, seed=3)
+    assert [len(prompt) for prompt in warm] == [10, 10, 10]
+    assert len({tuple(prompt) for prompt in warm}) == 3
+
+
+def test_summarize_results_counts_hits_per_turn() -> None:
+    result = _WORKLOADS.WorkloadResult
+    results = [
+        result(0, 0, 0, 11, 0, 0.5),
+        result(1, 1, 0, 21, 0, 1.5),
+        result(2, 0, 1, 31, 10, 2.5),
+        result(3, 1, 1, 41, 20, 3.5),
+    ]
+    summary = _WORKLOADS.summarize_results(results)
+    assert summary["requests"] == 4 and summary["prompt_tokens"] == 104
+    assert summary["eligible_tokens"] == 100 and summary["cached_tokens"] == 30
+    assert summary["cached_over_eligible"] == pytest.approx(0.3)
+    assert summary["by_turn"] == {
+        0: {"requests": 2, "eligible_tokens": 30, "cached_tokens": 0},
+        1: {"requests": 2, "eligible_tokens": 70, "cached_tokens": 30},
+    }
+    assert summary["requests_with_cached_tokens"] == 2
+    assert summary["latency_p50_s"] == 2.5 and summary["latency_p99_s"] == 3.5
+    empty = _WORKLOADS.summarize_results([])
+    assert empty["cached_over_eligible"] is None and empty["latency_p50_s"] is None
+
+
 def test_trace_workload_orders_by_arrival_and_counts_turns_per_session() -> None:
     rows = [
         {"arrival_s": 2.0, "session": 7, "prompt": [1, 2]},
@@ -143,6 +246,25 @@ def test_run_workload_rejects_a_workload_that_can_never_make_progress() -> None:
         _WORKLOADS.run_workload(lambda request: (lambda: 0), [orphan], concurrency=1)
     with pytest.raises(ValueError, match="concurrency"):
         _WORKLOADS.run_workload(lambda request: (lambda: 0), [], concurrency=0)
+
+
+def test_a_workload_can_run_in_consecutive_parts() -> None:
+    requests = _WORKLOADS.multi_turn_workload(
+        sessions=2, turns=4, first_tokens=4, turn_tokens=2, vocab=100, seed=0
+    )
+    first, second = requests[:4], requests[4:]
+    served: dict[int, int] = {}
+    results = _WORKLOADS.run_workload(lambda r: (lambda: 0), first, concurrency=2)
+    for result in results:
+        served[result.session] = result.turn + 1
+    assert served == {0: 2, 1: 2}
+    again = _WORKLOADS.run_workload(
+        lambda r: (lambda: 0), second, concurrency=2, completed_turns=served
+    )
+    assert [result.turn for result in again] == [2, 2, 3, 3]
+    assert served == {0: 2, 1: 2}
+    with pytest.raises(RuntimeError, match="blocked"):
+        _WORKLOADS.run_workload(lambda r: (lambda: 0), second, concurrency=2)
 
 
 @pytest.mark.parametrize(

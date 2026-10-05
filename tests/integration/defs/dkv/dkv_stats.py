@@ -13,11 +13,20 @@ def pool_free_pages(snapshot: dict) -> int:
     return sum(pool["free"] for level in snapshot["pools_by_level"] for pool in level)
 
 
-def latest_free_pages_by_rank(rows: list[dict]) -> dict[int, int]:
-    """The free pages each rank reported in its newest snapshot among ``rows``."""
-    latest: dict[int, tuple[int, dict]] = {}
+def _newest_by_rank(rows: list[dict]) -> dict[int, dict]:
+    newest: dict[int, tuple[int, dict]] = {}
     for row in rows:
         snapshot = row.get("dkvMeasurement")
-        if snapshot is not None and row["iter"] >= latest.get(snapshot["rank"], (-1, None))[0]:
-            latest[snapshot["rank"]] = (row["iter"], snapshot)
-    return {rank: pool_free_pages(snapshot) for rank, (_, snapshot) in sorted(latest.items())}
+        if snapshot is not None and row["iter"] >= newest.get(snapshot["rank"], (-1, None))[0]:
+            newest[snapshot["rank"]] = (row["iter"], snapshot)
+    return {rank: snapshot for rank, (_, snapshot) in sorted(newest.items())}
+
+
+def latest_snapshots(rows: list[dict]) -> list[dict]:
+    """The newest measurement snapshot each rank exported among ``rows``, in rank order."""
+    return list(_newest_by_rank(rows).values())
+
+
+def latest_free_pages_by_rank(rows: list[dict]) -> dict[int, int]:
+    """The free pages each rank reported in its newest snapshot among ``rows``."""
+    return {rank: pool_free_pages(snapshot) for rank, snapshot in _newest_by_rank(rows).items()}
