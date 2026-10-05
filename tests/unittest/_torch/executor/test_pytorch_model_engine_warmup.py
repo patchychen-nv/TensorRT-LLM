@@ -100,6 +100,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         checkpoint_format="HF",
         trust_remote_code=False,
         disable_overlap_scheduler=True,
+        dkv_config=None,
         kv_cache_config=KvCacheConfig(),
         enable_layerwise_nvtx_marker=False,
         cuda_graph_config=None,

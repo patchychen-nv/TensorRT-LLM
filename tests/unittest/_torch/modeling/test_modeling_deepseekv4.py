@@ -204,6 +204,14 @@ def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks(monkeypatch) -> None:
     }
 
 
+def test_deepseek_v4_defaults_accept_a_plain_dict_without_enabling_dkv(monkeypatch) -> None:
+    monkeypatch.setattr("tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 90)
+
+    assert DeepseekV4ForCausalLM.get_model_defaults({"dkv_config": {}}) == (
+        DeepseekV4ForCausalLM.get_model_defaults(None)
+    )
+
+
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
     weights = {
         "layers.0.ffn.experts.0.w1.weight": torch.tensor([[-1, 2], [3, -4]], dtype=torch.int8),

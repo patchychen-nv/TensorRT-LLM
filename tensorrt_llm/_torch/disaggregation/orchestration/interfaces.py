@@ -7,9 +7,20 @@ behavior only through these Protocols; ``PyExecutor`` implements them with
 thin adapters (see ``pyexecutor/disagg_adapter.py``).
 """
 
-from typing import Collection, List, Optional, Protocol, Sequence
+from dataclasses import dataclass
+from typing import Collection, List, Literal, Optional, Protocol, Sequence
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse
+
+
+@dataclass(frozen=True)
+class DkvTransferEvent:
+    """A compute rank's physically retired context transfer for S-control."""
+
+    request_id: int
+    compute_rank: int
+    outcome: Literal["completed", "failed", "timed_out"]
+    error_message: str = ""
 
 
 class ExecutorEffects(Protocol):
@@ -27,13 +38,14 @@ class ExecutorEffects(Protocol):
     def stage_transfer_response(
         self,
         request_id: int,
-        response: LlmResponse,
+        response: Optional[LlmResponse],
         terminate_after_publish: Optional[LlmRequest],
     ) -> None:
         """Queue a response for the executor's rank-synchronized flush.
 
         ``terminate_after_publish`` names a request that must be terminated
         only after that flush has published the response.
+        A DKV replica may stage termination without producing a response.
         """
         ...
 

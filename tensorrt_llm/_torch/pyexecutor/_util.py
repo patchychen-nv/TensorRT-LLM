@@ -45,6 +45,7 @@ from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
+from ..distributed.communicator import Distributed, ReduceOp
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -806,6 +807,7 @@ class KvCacheCreator:
     # Paired-reuse protocol flag. ``build_managers`` resolves it once and hands
     # it to both constructors; the managers must not re-derive it.
     _joint_kv_cache_reuse = False
+    _dkv_group_size: Optional[int] = None
 
     def __init__(
         self,
@@ -842,6 +844,8 @@ class KvCacheCreator:
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
         self._llm_args = llm_args
+        self._dkv_group_size = (mapping.tp_size
+                                if llm_args.dkv_config is not None else None)
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -973,6 +977,8 @@ class KvCacheCreator:
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
+        if self._dkv_group_size is not None:
+            extra_kwargs["dkv_group_size"] = self._dkv_group_size
         if not is_draft:
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
@@ -1351,8 +1357,10 @@ class KvCacheCreator:
         # With ADP enabled, _create_dummy_context_requests produces tp_size
         # copies so each rank gets work during the estimation warmup. But the
         # scheduler distributes them evenly (1 per rank), so each rank's KV
-        # cache only needs capacity for its own share, not all of them.
-        if self._mapping.enable_attention_dp and self._mapping.tp_size > 1:
+        # cache only needs capacity for its own share. DKV holds every copy's
+        # KV on each rank, so its estimate must retain the global workload.
+        if (self._mapping.enable_attention_dp and self._mapping.tp_size > 1
+                and self._dkv_group_size is None):
             num_cache_blocks = (num_cache_blocks + self._mapping.tp_size -
                                 1) // self._mapping.tp_size
 
@@ -1802,6 +1810,7 @@ class KvCacheCreator:
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            dkv_group_size=self._dkv_group_size,
         )
 
         if not self._skip_est:
@@ -2515,6 +2524,19 @@ class KvCacheCreator:
             return kv_cache_config
         return kv_cache_config.model_copy(update=dropped)
 
+    def _get_synchronized_ctx_mla_kv_len_cap(self) -> Optional[int]:
+        """Use the smallest context workspace capacity in the DKV group."""
+        cap = self._fp8_ctx_mla_kv_len_cap
+        if self._dkv_group_size is None:
+            return cap
+        # None means unbounded. All ranks participate even if their local
+        # estimate did not require a workspace reservation. Use an integer
+        # sentinel so tensor-backed reductions have the same dtype on all ranks.
+        unbounded = (1 << 63) - 1
+        cap = Distributed.get(self._mapping).tp_allreduce(
+            unbounded if cap is None else cap, op=ReduceOp.MIN)
+        return None if cap == unbounded else int(cap)
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
@@ -2598,7 +2620,8 @@ class KvCacheCreator:
         # The estimation build reserves nothing and runs throwaway fresh-prefill dummies, so leave the
         # attribute unset there (PyExecutor._get_ctx_mla_kv_len_cap does not cap during warmup).
         if not estimating_kv_cache and kv_cache_manager is not None:
-            kv_cache_manager.fp8_ctx_mla_kv_len_cap = self._fp8_ctx_mla_kv_len_cap
+            kv_cache_manager.fp8_ctx_mla_kv_len_cap = (
+                self._get_synchronized_ctx_mla_kv_len_cap())
 
         if (not estimating_kv_cache and self._kv_connector_manager is not None
                 and self._draft_model_engine is not None):
@@ -2794,7 +2817,8 @@ def _create_kv_cache_manager(
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False,
-        max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
+        max_cuda_graph_batch_size: Optional[int] = None,
+        dkv_group_size: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2966,6 +2990,8 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        if dkv_group_size is not None:
+            manager_extra_kwargs["dkv_group_size"] = dkv_group_size
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         # Vocab size also enables multimodal event decoding and its per-block
@@ -3527,19 +3553,20 @@ def create_kv_cache_compression_manager(
 def compute_max_num_sequences(mapping: Mapping,
                               max_batch_size: int,
                               disable_overlap_scheduler: bool,
-                              enable_overlap_headroom: bool = False) -> int:
+                              enable_overlap_headroom: bool = False,
+                              dkv_enabled: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
     ``enable_overlap_headroom`` is intentionally opt-in; see
     ``should_enable_overlap_headroom``. Pipeline parallelism already sizes the
-    pool by ``pp_size``.
+    pool by ``pp_size``. DKV reserves one permanent local forward-dummy slot.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
     else:
         num_micro_batches = (2 if enable_overlap_headroom
                              and not disable_overlap_scheduler else 1)
-    return max_batch_size * num_micro_batches
+    return max_batch_size * num_micro_batches + int(dkv_enabled)
 
 
 def resolve_max_num_sequences(model_engine,
@@ -3554,12 +3581,13 @@ def resolve_max_num_sequences(model_engine,
     engine_seats = getattr(model_engine, "max_num_seq_slots", None)
     if engine_seats is not None:
         return engine_seats
-    return compute_max_num_sequences(mapping,
-                                     max_batch_size,
-                                     llm_args.disable_overlap_scheduler,
-                                     enable_overlap_headroom=getattr(
-                                         model_engine,
-                                         "_enable_overlap_headroom", False))
+    return compute_max_num_sequences(
+        mapping,
+        max_batch_size,
+        llm_args.disable_overlap_scheduler,
+        enable_overlap_headroom=getattr(model_engine,
+                                        "_enable_overlap_headroom", False),
+        dkv_enabled=getattr(llm_args, "dkv_config", None) is not None)
 
 
 def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
@@ -3898,7 +3926,8 @@ def create_py_executor_instance(
     # filtering, so its budget should be based on max_batch_size, not
     # max_num_sequences (which includes the pp_size multiplier).
     v2_scheduler_capacity = max_batch_size
-    if v2_scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
+    if (v2_scheduler_capacity == 1 and mapping.enable_attention_dp
+            and kv_cache_manager and llm_args.dkv_config is None):
         v2_scheduler_capacity += 1
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
@@ -3926,6 +3955,8 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             # A disaggregated generation worker must not replay context locally.
             enable_recompute_pause=not is_disagg,
+            dkv_group_size=mapping.tp_size
+            if llm_args.dkv_config is not None else None,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

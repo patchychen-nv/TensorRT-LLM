@@ -1832,11 +1832,12 @@ class AttentionDpConfig(StrictBaseModel):
 
 
 class DkvConfig(StrictBaseModel):
-    """Configuration for DKV (layer-split distributed KV storage).
+    """Configuration for DKV (replicated KV lifecycle across the attention-DP group).
 
-    DKV stores KV per layer across the attention-DP / TP group with a
-    group-replicated KV lifecycle, for prefill. The DKV group is the
-    attention-DP / TP group; its size always equals tp_size and is not
+    Every rank of the attention-DP / TP group runs the KV cache lifecycle of
+    every request, while only the request's compute rank runs the forward
+    pass, sampling and KV send. Only prefill is supported. The DKV group is
+    the attention-DP / TP group; its size always equals tp_size and is not
     separately configurable.
     """
     attention_mode: Literal["dp", "sp"] = Field(
@@ -1849,9 +1850,8 @@ class DkvConfig(StrictBaseModel):
     @model_validator(mode='after')
     def validate_dkv_config(self) -> 'DkvConfig':
         if self.attention_mode == "sp":
-            raise NotImplementedError(
-                "dkv_config.attention_mode='sp' (DKVSEP) is not implemented yet"
-            )
+            raise ValueError("attention_mode='sp' (DKVSEP) is not supported "
+                             "with dkv_config yet")
         return self
 
 
@@ -5692,8 +5692,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
     dkv_config: Optional[DkvConfig] = Field(
         default=None,
-        description="Enable DKV: layer-split KV storage across the "
-        "attention-DP/TP group with a group-replicated KV lifecycle. "
+        description="Enable DKV: every rank of the attention-DP/TP group "
+        "runs the KV cache lifecycle of every request, so prefix reuse is "
+        "visible group-wide; only the compute rank runs the forward pass. "
         "Prefill only. Disabled when unset.",
         status="prototype")
 
@@ -6452,33 +6453,97 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.dkv_config is None:
             return self
         if self.dkv_config.attention_mode == "dp" and not self.enable_attention_dp:
-            raise ValueError("dkv_config with attention_mode='dp' requires "
-                             "enable_attention_dp=True")
-        if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
             raise ValueError(
-                "dkv_config requires kv_cache_config.use_kv_cache_manager_v2=True"
+                "enable_attention_dp=False is not supported with dkv_config "
+                "yet; attention_mode='dp' requires enable_attention_dp=True")
+        if self.kv_cache_config.use_kv_cache_manager_v2 is False:
+            raise ValueError(
+                "KV cache manager V1 is not supported with dkv_config yet; "
+                "dkv_config requires the KV cache manager V2: set "
+                "kv_cache_config.use_kv_cache_manager_v2 to True or 'auto'")
+        if self.kv_cache_config.use_kv_cache_manager_v2 == "auto":
+            # DKV runs only on the V2 manager. Resolve the sentinel here so the
+            # per-model preference applied at model load cannot pick V1.
+            self.kv_cache_config.use_kv_cache_manager_v2 = True
+        unsupported = (
+            (self.tensor_parallel_size < 2, "tensor_parallel_size < 2"),
+            (self.pipeline_parallel_size > 1, "pipeline_parallel_size > 1"),
+            (self.context_parallel_size > 1, "context_parallel_size > 1"),
+            (self.cp_config is not None, "cp_config"),
+            (self.speculative_config is not None, "speculative_config"),
+            (self.guided_decoding_backend
+             is not None, "guided_decoding_backend"),
+            (self.max_beam_width > 1, "max_beam_width > 1"),
+            (self.enable_lora, "enable_lora"),
+            (self.lora_config is not None, "lora_config"),
+            (self.kv_connector_config is not None, "kv_connector_config"),
+            (not self.disable_overlap_scheduler, "overlap scheduler"),
+            (self.kv_cache_config.enable_swa_scratch_reuse,
+             "kv_cache_config.enable_swa_scratch_reuse"),
+            (self.kv_cache_config.enable_kv_pool_rebalance,
+             "kv_cache_config.enable_kv_pool_rebalance"),
+            (self.kv_cache_config.disk_prefetch_num_reqs
+             > 0, "kv_cache_config.disk_prefetch_num_reqs > 0"),
+        )
+        for enabled, feature in unsupported:
+            if enabled:
+                raise ValueError(
+                    f"{feature} is not supported with dkv_config yet")
+        adp_config = self.attention_dp_config
+        if adp_config is not None:
+            unsupported_adp = (
+                (adp_config.enable_balance, "enable_balance"),
+                (adp_config.enable_kv_cache_aware_routing,
+                 "enable_kv_cache_aware_routing"),
+                (adp_config.kv_cache_routing_conversation_affinity,
+                 "kv_cache_routing_conversation_affinity"),
+                (adp_config.kv_cache_routing_account_for_in_transfer,
+                 "kv_cache_routing_account_for_in_transfer"),
             )
+            for enabled, feature in unsupported_adp:
+                if enabled:
+                    raise ValueError(
+                        f"attention_dp_config.{feature} is not supported "
+                        "with dkv_config yet")
+        reuse_policy = self.kv_cache_config.block_reuse_config.policy
+        if reuse_policy == "per_conversation" or (
+                self.kv_cache_config.enable_block_reuse
+                and reuse_policy != "per_request"):
+            remedy = "use 'per_request'"
+            if reuse_policy != "per_conversation":
+                # Reuse across ranks yields invalid outputs, so a deployment
+                # that needs correct outputs should turn reuse off instead.
+                remedy += (" (outputs of requests that reuse a prefix computed "
+                           "on another rank are not valid), or set "
+                           "kv_cache_config.enable_block_reuse=False")
+            raise ValueError(
+                f"kv_cache_config.block_reuse_config.policy={reuse_policy!r} "
+                f"is not supported with dkv_config yet; {remedy}")
         if not self.kv_cache_config.enable_block_reuse:
-            raise ValueError(
-                "dkv_config requires kv_cache_config.enable_block_reuse=True "
-                "(DKV is designed to run with prefix reuse enabled)")
-        if self.attention_dp_config is not None and \
-                self.attention_dp_config.kv_cache_routing_account_for_in_transfer:
-            # In-transfer requests are not filtered per compute rank, so under
-            # DKV (where every rank holds owner-layer KV for a transferring
-            # request) they would be double-counted into per-rank load.
-            raise ValueError(
-                "dkv_config does not support "
-                "attention_dp_config.kv_cache_routing_account_for_in_transfer")
-        if not self.disable_overlap_scheduler:
-            raise NotImplementedError(
-                "dkv_config: the overlap scheduler is not supported yet, "
-                "set disable_overlap_scheduler=True")
-        if self.cache_transceiver_config is not None and \
-                self.cache_transceiver_config.transceiver_runtime != "PYTHON":
-            raise ValueError(
-                "dkv_config only supports the V2 cache transceiver: set "
-                "cache_transceiver_config.transceiver_runtime='PYTHON'")
+            logger.warning(
+                "dkv_config is enabled with KV block reuse disabled; "
+                "prefix cache hit-rate metrics are not meaningful.")
+        transceiver_config = self.cache_transceiver_config
+        # A transceiver is created only when a backend is set.
+        if (transceiver_config is not None
+                and transceiver_config.backend is not None):
+            backend, _ = transceiver_config._resolve_default_backend()
+            if backend != "NIXL":
+                raise ValueError(
+                    "dkv_config requires cache_transceiver_config.backend='NIXL'"
+                )
+            if transceiver_config.transceiver_runtime not in ("PYTHON", "auto"):
+                raise ValueError(
+                    "dkv_config requires the PYTHON cache transceiver runtime")
+            if transceiver_config.enable_pipelined_transfer:
+                raise ValueError(
+                    "enable_pipelined_transfer is not supported with dkv_config yet"
+                )
+            if transceiver_config.kv_transfer_timeout_ms is None:
+                raise ValueError(
+                    "dkv_config requires a finite kv_transfer_timeout_ms")
+            # Replicated transfer completion depends on V2 session retirement.
+            transceiver_config.transceiver_runtime = "PYTHON"
         return self
 
     @model_validator(mode="after")

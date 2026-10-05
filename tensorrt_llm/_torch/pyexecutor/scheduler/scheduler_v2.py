@@ -43,6 +43,7 @@ class ScheduleAction(enum.Enum):
     SCHEDULED = "scheduled"  # success — payload contains tokens etc.
     SKIP = "skip"  # skip this request, continue the loop
     STOP = "stop"  # stop the scheduling loop
+    STOP_RANK = "stop_rank"  # stop admitting work for one compute rank
 
 
 class _RecomputePauseState:
@@ -62,6 +63,8 @@ class BudgetTracker:
     ``remaining_tokens`` / ``commit`` / ``peft_pages_needed`` without knowing the underlying pool
     topology.
     """
+
+    stop_action = ScheduleAction.STOP
 
     def __init__(
         self,
@@ -146,6 +149,80 @@ class BudgetTracker:
         self._seen_peft_task_ids.add(lora_task_id)
 
 
+class _DkvRankBudget(BudgetTracker):
+    """BudgetTracker interface over one compute rank's accounting."""
+
+    stop_action = ScheduleAction.STOP_RANK
+
+    def __init__(self, budget: "DkvBudgetTracker", rank: int) -> None:
+        self._budget = budget
+        self._rank = rank
+        self.max_num_tokens = budget.max_num_tokens
+        self.max_num_requests = budget.max_batch_size
+
+    @property
+    def num_tokens(self) -> int:
+        return self._budget.rank_tokens[self._rank]
+
+    @property
+    def num_requests(self) -> int:
+        return self._budget.rank_requests[self._rank]
+
+    @property
+    def requests_full(self) -> bool:
+        return self._budget.rank_stopped[self._rank] or super().requests_full
+
+    def commit(self, req: LlmRequest, num_tokens: int, peft_pages: int) -> None:
+        self._budget.rank_tokens[self._rank] += num_tokens
+        self._budget.rank_requests[self._rank] += 1
+        if peft_pages > 0:
+            self.commit_peft(req, peft_pages)
+
+    def peft_pages_needed(self, req: LlmRequest) -> Optional[int]:
+        return self._budget._peft_budget.peft_pages_needed(req)
+
+    def commit_peft(self, req: LlmRequest, peft_pages: int) -> None:
+        self._budget._peft_budget.commit_peft(req, peft_pages)
+
+    def pre_claim_peft(self, req: LlmRequest) -> None:
+        self._budget._peft_budget.pre_claim_peft(req)
+
+
+class DkvBudgetTracker:
+    """Per-compute-rank budgets with shared, replicated KV admission."""
+
+    def __init__(
+        self,
+        max_num_tokens: Optional[int],
+        max_batch_size: int,
+        group_size: int,
+        peft_cache_manager=None,
+    ) -> None:
+        if group_size < 1:
+            raise ValueError("DKV group size must be positive")
+        self.max_num_tokens = max_num_tokens
+        self.max_batch_size = max_batch_size
+        self.rank_tokens = [0] * group_size
+        self.rank_requests = [0] * group_size
+        self.rank_stopped = [False] * group_size
+        self.rank_attended_kv = [0] * group_size
+        self._peft_budget = BudgetTracker(None, 0, peft_cache_manager)
+        self._views = [_DkvRankBudget(self, rank) for rank in range(group_size)]
+
+    def view(self, rank: int) -> BudgetTracker:
+        if not isinstance(rank, int) or not 0 <= rank < len(self._views):
+            raise ValueError(f"Invalid DKV compute rank {rank!r} for group size {len(self._views)}")
+        return self._views[rank]
+
+    @property
+    def all_ranks_full(self) -> bool:
+        return all(view.requests_full for view in self._views)
+
+    def stop_rank(self, rank: int) -> None:
+        self.view(rank)
+        self.rank_stopped[rank] = True
+
+
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
 
@@ -168,7 +245,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
+        dkv_group_size: Optional[int] = None,
     ) -> None:
+        if dkv_group_size is not None and dkv_group_size < 1:
+            raise ValueError("DKV group size must be positive")
+        self.max_batch_size = max_batch_size
+        self.dkv_group_size = dkv_group_size
+        self.dkv_dual_ledger_enabled = (
+            dkv_group_size is not None and os.environ.get("TRTLLM_DKV_DUAL_LEDGER", "1") == "1"
+        )
+        # Times each request had to release its KV because an iteration scheduled nothing.
+        self._dkv_stall_recoveries: dict[int, int] = {}
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
@@ -264,6 +351,20 @@ class KVCacheV2Scheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        if self.dkv_group_size is not None:
+            unsupported_states = {
+                LlmRequestState.ENCODER_INIT.value,
+                LlmRequestState.DISAGG_GENERATION_INIT.value,
+                LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value,
+                LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE.value,
+                LlmRequestState.GENERATION_IN_PROGRESS.value,
+            }
+            for req in active_requests:
+                if not req.is_dummy and req.state_value in unsupported_states:
+                    raise RuntimeError(
+                        f"DKV prefill-only scheduler cannot schedule request {req.py_request_id} "
+                        f"in state {req.state_value}"
+                    )
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
         (
@@ -302,11 +403,34 @@ class KVCacheV2Scheduler(RequestScheduler):
         scheduled_beam_width = 0
         has_chunking = False
 
-        budget = BudgetTracker(
-            self.max_num_tokens,
-            self.max_num_requests,
-            self.peft_cache_manager,
+        dkv_budget = (
+            DkvBudgetTracker(
+                self.max_num_tokens,
+                self.max_batch_size,
+                self.dkv_group_size,
+                self.peft_cache_manager,
+            )
+            if self.dkv_dual_ledger_enabled
+            else None
         )
+        budget = BudgetTracker(self.max_num_tokens, self.max_num_requests, self.peft_cache_manager)
+        # Only the DKV ledgers route a dummy request to a budget of its own.
+        dummy_budget = BudgetTracker(None, len(active_requests)) if dkv_budget is not None else None
+
+        def budget_for(req: LlmRequest) -> BudgetTracker:
+            if dkv_budget is None:
+                return budget
+            if req.is_dummy:
+                return dummy_budget
+            return dkv_budget.view(req.py_dkv_compute_rank)
+
+        def all_requests_full() -> bool:
+            return dkv_budget.all_ranks_full if dkv_budget is not None else budget.requests_full
+
+        def stop_rank(req: LlmRequest) -> None:
+            if dkv_budget is None:
+                raise RuntimeError("DKV invariant violation: rank budgets are not replicated")
+            dkv_budget.stop_rank(req.py_dkv_compute_rank)
 
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
@@ -345,7 +469,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # still-active adapter.
         for req in requests_list:
             if req.state_value == self._gen_to_complete_state_value:
-                budget.pre_claim_peft(req)
+                budget_for(req).pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
@@ -361,6 +485,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
 
             req_state_value = req.state_value
+            b = budget_for(req)
 
             # Disagg gen init bypasses both state gating and budget.requests_full
             # (same as C++ / V1 scheduler), but the V2 scheduler owns inline KV
@@ -374,11 +499,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             # no free slots remain, so the request is skipped and retried next
             # iteration. PEFT budget is still checked and committed.
             if req_state_value == self._disagg_gen_init_state_value:
-                peft_pages = budget.peft_pages_needed(req)
+                peft_pages = b.peft_pages_needed(req)
                 if peft_pages is None:
                     break
 
-                action, tokens = self._try_schedule_disagg_gen_init(req, budget)
+                action, tokens = self._try_schedule_disagg_gen_init(req, b)
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -391,14 +516,17 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # and delay KV transfer initiation. IndexMapper slot availability
                 # (via prepare_context) is the real capacity guard.
                 if peft_pages > 0:
-                    budget.commit_peft(req, peft_pages)
+                    b.commit_peft(req, peft_pages)
                 req_it += 1
                 continue
 
             # Budget check for non-disagg requests (disagg bypasses this
             # because it doesn't participate in the forward pass).
-            if budget.requests_full:
+            if all_requests_full():
                 break
+            if b.requests_full:
+                req_it += 1
+                continue
 
             if not (
                 req_state_value >= self._no_schedule_until_state_value
@@ -418,12 +546,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
 
             else:
-                peft_pages = budget.peft_pages_needed(req)
+                peft_pages = b.peft_pages_needed(req)
                 if peft_pages is None:
                     break
                 action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
                     req,
-                    budget,
+                    b,
                     requests_list,
                     req_it,
                     req_it_end,
@@ -435,11 +563,15 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
                 if action is ScheduleAction.STOP:
                     break
+                if action is ScheduleAction.STOP_RANK:
+                    stop_rank(req)
+                    req_it += 1
+                    continue
                 if action is ScheduleAction.SKIP:
                     req_it += 1
                     continue
                 scheduled_gen.append(req)
-                budget.commit(req, tokens, peft_pages)
+                b.commit(req, tokens, peft_pages)
 
             req_it += 1
 
@@ -458,14 +590,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
 
         for req in pending_ctx:
-            if budget.requests_full:
+            if all_requests_full():
                 break
+            b = budget_for(req)
+            if b.requests_full:
+                continue
             # A radix probe cannot affect admission once the chunk token budget
             # is exhausted. Keep scanning: an encoder request may still fit.
             if (
                 self.chunking_enabled
                 and req.state_value == self._context_init_state_value
-                and not self._has_context_chunk_budget(budget)
+                and not self._has_context_chunk_budget(b)
             ):
                 continue
             # Probe context requests before peft_pages_needed and before
@@ -489,24 +624,36 @@ class KVCacheV2Scheduler(RequestScheduler):
                         "block is already contributed by a request that runs this iteration"
                     )
                     continue
-            peft_pages = budget.peft_pages_needed(req)
+            peft_pages = b.peft_pages_needed(req)
             if peft_pages is None:
                 continue
             if req.state_value == self._encoder_init_state_value:
-                action, tokens = self._try_schedule_encoder(req, budget)
+                action, tokens = self._try_schedule_encoder(req, b)
                 if action is ScheduleAction.STOP:
                     break
+                if action is ScheduleAction.STOP_RANK:
+                    stop_rank(req)
+                    continue
                 scheduled_encoder.append(req)
-                budget.commit(req, tokens, peft_pages)
+                b.commit(req, tokens, peft_pages)
             else:
-                action, tokens, chunking_flag = self._try_schedule_context(req, budget)
+                first_chunk = req.is_first_context_chunk
+                action, tokens, chunking_flag = self._try_schedule_context(req, b)
                 if action is ScheduleAction.STOP:
                     break
+                if action is ScheduleAction.STOP_RANK:
+                    stop_rank(req)
+                    continue
                 if action is ScheduleAction.SKIP:
                     continue
+                if dkv_budget is not None and not req.is_dummy:
+                    if not self._commit_dkv_attended_kv(req, dkv_budget):
+                        self._rollback_context_admission(req, first_chunk)
+                        stop_rank(req)
+                        continue
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
-                budget.commit(req, tokens, peft_pages)
+                b.commit(req, tokens, peft_pages)
                 # Register the block only once the request has cleared its
                 # budget and is committed. Registering earlier, inside the check
                 # above, would let a request that then fails to schedule defer
@@ -566,6 +713,23 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"secondary cache tier for suspend/resume offload. {remedy}"
                 )
 
+        if (
+            self.dkv_group_size is not None
+            and not (scheduled_encoder or scheduled_ctx or scheduled_gen or disagg_candidates)
+            and not inflight_request_ids
+            and not any(self._has_pending_connector_load(req) for req in requests_list)
+        ):
+            for req in reversed(requests_list):
+                if (
+                    not req.is_dummy
+                    and req.state_value == self._context_init_state_value
+                    and not req.is_first_context_chunk
+                    and req.py_request_id in self.kv_cache_manager.kv_cache_map
+                ):
+                    self._rollback_context_admission(req, first_chunk=True)
+                    self._record_dkv_stall_recovery(req, requests_list)
+                    break
+
         return (
             scheduled_encoder,
             scheduled_ctx,
@@ -575,6 +739,57 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         )
+
+    def _commit_dkv_attended_kv(self, req: LlmRequest, budget: DkvBudgetTracker) -> bool:
+        """Keep the first context per rank and bound the remaining MLA workspace."""
+        cap = getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None)
+        rank = req.py_dkv_compute_rank
+        begin = req.context_current_position
+        if req.is_first_context_chunk:
+            begin = max(begin, req.estimated_reusable_tokens)
+        attended = min(begin + req.context_chunk_size, req.orig_prompt_len)
+        cumulative = budget.rank_attended_kv[rank] + attended
+        if cap is not None and budget.rank_requests[rank] > 0 and cumulative > cap:
+            return False
+        budget.rank_attended_kv[rank] = cumulative
+        return True
+
+    def _record_dkv_stall_recovery(
+        self, req: LlmRequest, active_requests: list[LlmRequest]
+    ) -> None:
+        """Count repeated stall recoveries of one request and warn on each doubling.
+
+        A request that keeps having to restart means the KV pool cannot hold the active context
+        requests together, so the count makes that visible instead of silently looping.
+        """
+        active_ids = {request.py_request_id for request in active_requests}
+        self._dkv_stall_recoveries = {
+            request_id: count
+            for request_id, count in self._dkv_stall_recoveries.items()
+            if request_id in active_ids
+        }
+        count = self._dkv_stall_recoveries.get(req.py_request_id, 0) + 1
+        self._dkv_stall_recoveries[req.py_request_id] = count
+        if count & (count - 1) == 0:
+            logger.warning(
+                f"DKV stall recovery #{count}: request {req.py_request_id} released its KV cache "
+                "and restarts its context because no request could be scheduled; the KV cache "
+                "is likely too small for the active context requests"
+            )
+
+    def _rollback_context_admission(self, req: LlmRequest, first_chunk: bool) -> None:
+        """Release first-chunk claims or undo a continuation's unexecuted resize."""
+        if first_chunk:
+            for manager in (
+                self.kv_cache_manager,
+                self.draft_kv_cache_manager,
+                self.cross_kv_cache_manager,
+            ):
+                if manager is not None and req.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(req)
+            rewind_context_after_cache_drop(req, self.tokens_per_block)
+        else:
+            self.kv_cache_manager.revert_allocate_context(req)
 
     # ---- Prefix-aware skip ----
 
@@ -706,7 +921,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         req_tokens = req.encoder_output_len
         if not budget.can_fit_tokens(req_tokens):
-            return ScheduleAction.STOP, 0
+            return budget.stop_action, 0
         assert self.max_context_length is None or req_tokens <= self.max_context_length, (
             f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
         )
@@ -754,14 +969,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
             # Failed admission must not retain prefix-reuse holds. Suspension
             # alone cannot release them when the last cache tier is full.
-            for manager in (
-                self.kv_cache_manager,
-                self.draft_kv_cache_manager,
-                self.cross_kv_cache_manager,
-            ):
-                if manager is not None and req.py_request_id in manager.kv_cache_map:
-                    manager.free_resources(req)
-            rewind_context_after_cache_drop(req, self.tokens_per_block)
+            self._rollback_context_admission(req, first_chunk=True)
 
         return result
 
@@ -777,7 +985,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self.enable_prefix_aware_scheduling:
             req_tokens = pre_prepare_context_tokens + draft_len
             if not budget.can_fit_tokens(req_tokens):
-                return ScheduleAction.STOP, 0, False
+                return budget.stop_action, 0, False
             assert (
                 self.max_context_length is None
                 or pre_prepare_context_tokens <= self.max_context_length
@@ -796,7 +1004,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             req_tokens = context_tokens + draft_len
 
             if not budget.can_fit_tokens(req_tokens):
-                return ScheduleAction.STOP, 0, False
+                return budget.stop_action, 0, False
 
             assert self.max_context_length is None or context_tokens <= self.max_context_length, (
                 f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
@@ -1271,7 +1479,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_tokens = beam_width + get_draft_token_length(req)
 
         if not budget.can_fit_tokens(req_tokens):
-            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+            return budget.stop_action, 0, scheduled_beam_width, req_it_end
 
         if scheduled_beam_width == 0:
             scheduled_beam_width = beam_width
