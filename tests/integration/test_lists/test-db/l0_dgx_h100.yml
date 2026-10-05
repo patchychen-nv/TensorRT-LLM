@@ -361,6 +361,8 @@ l0_dgx_h100:
   - dkv/test_dkv_serve.py::test_dkv_context_serve_answers_completions[deepseek-v3-lite] TIMEOUT (45)
   - dkv/test_dkv_measurement.py::test_dkv_prefix_measurement_validity TIMEOUT (30)
   - dkv/test_dkv_workload.py::test_dkv_workload_reuse_smoke TIMEOUT (20)
+  - dkv/test_dkv_phase6.py::test_dkv_phase6_modes_on_tinyllama[chat] TIMEOUT (30)
+  - dkv/test_dkv_phase6.py::test_dkv_phase6_modes_on_tinyllama[primed-zipf] TIMEOUT (30)
   - dkv/test_dkv_host_tier.py::test_dkv_host_tier_spills_and_onboards_replicated_prefixes[tiny-llama] TIMEOUT (20)
   - dkv/test_dkv_host_tier.py::test_dkv_host_tier_spills_and_onboards_replicated_prefixes[deepseek-v3-lite] TIMEOUT (40)
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_v2_kv_events TIMEOUT (15)

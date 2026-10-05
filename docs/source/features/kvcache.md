@@ -595,6 +595,42 @@ pages. Reports explicitly mark timing as perturbed and output correctness as
 unvalidated. These experiments establish metadata visibility and scheduling
 load; they do not measure layer-split throughput or validate generated text.
 
+**Workload experiments.** `tests/integration/defs/dkv/dkv_phase6_runner.py` places
+one deterministic workload under ordinary attention DP (`adp`), attention DP with
+the KV-aware router (`adp_kv:<beta>`) and DKV (`dkv`, whose router is always the
+default one). For every mode it reports the prefix hit rate, the context tokens that
+still had to be computed, the load of every rank and the logical duplicate storage,
+with the validity controls above. The `chat` workload is conversations whose every
+turn re-sends the whole history; `zipf` is requests that share one of a few
+prefixes, and `--prime` sends every prefix alone once first. A report also states
+the hit ceiling of a cache that keeps everything and that every rank can read, which
+DKV reaches whenever nothing is evicted.
+
+```bash
+python tests/integration/defs/dkv/dkv_phase6_runner.py run --group 2 \
+  --model "$LLM_MODELS_ROOT/llama-models-v2/TinyLlama-1.1B-Chat-v1.0" \
+  --tokens-per-block 32 --workload chat --modes adp,adp_kv:1,dkv \
+  --out "/scratch/$USER/dkv-phase6"
+python tests/integration/defs/dkv/dkv_phase6_runner.py report "/scratch/$USER/dkv-phase6"
+```
+
+`run` starts one process per mode on one node. A group that spans nodes starts
+`worker` on every task of the job behind `trtllm-llmapi-launch`, once per mode. A
+run's capacity is `--kv-max-tokens` or, with `--kv-quota-gib`, a byte quota per
+rank. For an equal-capacity comparison with evictions, pass the `result.json` of the
+`adp` run to the DKV run as `--adp-reference`; its report then states whether the
+usable pages of one replica match those of all ADP ranks together, and
+`--capacity-tolerance-pages` declares a gap that is accepted. `summary` puts runs
+of one workload side by side and `check` lists every run and flags the incomplete
+ones.
+
+DeepSeek-V4 reuses a prefix only where a stored sequence ended. A shared prefix
+followed by a different suffix never hits, whereas the history of a conversation
+and a prefix that was sent alone do, so use `chat`, or `zipf --prime`, on that
+model. Multi-turn runs on it are listed as invalid by the no-eviction check, because
+blocks are also removed as a conversation grows; the number of capacity-dropped
+pages, which stays zero, shows that nothing was evicted.
+
 **Consistency checks.** The checker always rejects inconsistent enable flags and
 inconsistent process-level settings (the dual-ledger switch, `TLLM_METRICS_ALL_RANKS`,
 and the KV manager backend) at construction. Set `TRTLLM_DKV_DEBUG=1` on every
