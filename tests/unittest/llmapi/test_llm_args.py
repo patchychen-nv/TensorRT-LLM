@@ -44,7 +44,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
-                                          DFlashDecodingConfig,
+                                          DFlashDecodingConfig, DkvConfig,
                                           DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
@@ -5035,3 +5035,280 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.cpu_only
+class TestDkvConfig:
+    """DKV accepts only the replicated prefill configuration."""
+
+    @staticmethod
+    def _dkv_args(**kwargs) -> TorchLlmArgs:
+        config = dict(
+            model="/tmp/dummy_model",
+            tensor_parallel_size=2,
+            enable_attention_dp=True,
+            disable_overlap_scheduler=True,
+            dkv_config=DkvConfig(),
+            kv_cache_config=KvCacheConfig(block_reuse_config=BlockReuseConfig(
+                policy="per_request")))
+        config.update(kwargs)
+        return TorchLlmArgs(**config)
+
+    @pytest.mark.parametrize("setting", ["auto", True])
+    def test_kv_cache_manager_resolves_to_v2(self, setting) -> None:
+        args = self._dkv_args(
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=setting,
+                                          block_reuse_config=BlockReuseConfig(
+                                              policy="per_request")))
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+        # Without DKV, 'auto' with no model preference resolves to V1; under
+        # DKV the model-load resolution must keep V2.
+        assert _resolve_kv_cache_manager_v2_auto(args) is True
+
+    def test_default_kv_cache_config_survives_model_defaults(self) -> None:
+        args = self._dkv_args()
+        apply_model_defaults_to_llm_args(
+            args, {"kv_cache_config": {
+                "tokens_per_block": 64
+            }})
+        assert args.kv_cache_config.tokens_per_block == 64
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_explicit_v1_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="KV cache manager V2"):
+            self._dkv_args(kv_cache_config=KvCacheConfig(
+                use_kv_cache_manager_v2=False))
+
+    @pytest.mark.parametrize("runtime", ["PYTHON", "auto"])
+    def test_transceiver_resolves_to_python(self, runtime) -> None:
+        args = self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime=runtime))
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    @pytest.mark.parametrize("runtime", ["CPP", None])
+    def test_cpp_transceiver_is_rejected(self, runtime) -> None:
+        with pytest.raises(ValueError, match="PYTHON cache transceiver"):
+            self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime=runtime))
+
+    @pytest.mark.parametrize("backend", ["UCX", "MOONCAKE", "MPI"])
+    def test_non_nixl_transceiver_is_rejected(self, backend) -> None:
+        with pytest.raises(ValueError, match="backend='NIXL'"):
+            self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+                backend=backend, transceiver_runtime="PYTHON"))
+
+    def test_default_transceiver_backend_is_validated(self,
+                                                      monkeypatch) -> None:
+        for backend in ("NIXL", "UCX", "MOONCAKE", "MPI"):
+            monkeypatch.delenv(f"TRTLLM_USE_{backend}_KVCACHE", raising=False)
+        args = self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+            backend="DEFAULT"))
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        monkeypatch.setenv("TRTLLM_USE_UCX_KVCACHE", "1")
+        with pytest.raises(ValueError, match="backend='NIXL'"):
+            self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+                backend="DEFAULT"))
+
+    def test_pipelined_transfer_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="enable_pipelined_transfer"):
+            self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", enable_pipelined_transfer=True))
+
+    def test_transfer_without_deadline_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="finite kv_transfer_timeout_ms"):
+            self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", kv_transfer_timeout_ms=None))
+
+    def test_transceiver_without_backend_is_not_checked(self) -> None:
+        # No backend means no transceiver is created, so the runtime is moot.
+        args = self._dkv_args(cache_transceiver_config=CacheTransceiverConfig(
+            transceiver_runtime="CPP"))
+        assert args.cache_transceiver_config.backend is None
+
+    @pytest.mark.parametrize("kwargs, feature", [
+        ({
+            "tensor_parallel_size": 1
+        }, "tensor_parallel_size"),
+        ({
+            "pipeline_parallel_size": 2
+        }, "pipeline_parallel_size"),
+        ({
+            "context_parallel_size": 2
+        }, "context_parallel_size"),
+        ({
+            "cp_config": {}
+        }, "cp_config"),
+        ({
+            "speculative_config": {
+                "decoding_type": "MTP",
+                "max_draft_len": 1
+            }
+        }, "speculative_config"),
+        ({
+            "guided_decoding_backend": "xgrammar"
+        }, "guided_decoding_backend"),
+        ({
+            "max_beam_width": 2
+        }, "max_beam_width"),
+        ({
+            "enable_lora": True
+        }, "enable_lora"),
+        ({
+            "lora_config": {}
+        }, "lora_config"),
+        ({
+            "kv_connector_config": {
+                "connector": "lmcache"
+            }
+        }, "kv_connector_config"),
+        ({
+            "disable_overlap_scheduler": False
+        }, "overlap scheduler"),
+    ])
+    def test_unsupported_config(self, kwargs, feature) -> None:
+        with pytest.raises(ValueError,
+                           match=feature +
+                           ".*not supported with dkv_config yet"):
+            self._dkv_args(**kwargs)
+
+    @pytest.mark.parametrize("feature", [
+        "enable_balance", "enable_kv_cache_aware_routing",
+        "kv_cache_routing_conversation_affinity",
+        "kv_cache_routing_account_for_in_transfer"
+    ])
+    def test_unsupported_attention_dp_config(self, feature) -> None:
+        with pytest.raises(ValueError,
+                           match=feature +
+                           ".*not supported with dkv_config yet"):
+            self._dkv_args(attention_dp_config={feature: True})
+
+    @pytest.mark.parametrize("feature, value", [
+        ("enable_swa_scratch_reuse", True),
+        ("enable_kv_pool_rebalance", True),
+        ("disk_prefetch_num_reqs", 1),
+    ])
+    def test_unsupported_kv_config(self, feature, value) -> None:
+        with pytest.raises(ValueError,
+                           match=feature +
+                           ".*not supported with dkv_config yet"):
+            self._dkv_args(kv_cache_config={
+                "block_reuse_config": {
+                    "policy": "per_request"
+                },
+                feature: value,
+            })
+
+    @pytest.mark.parametrize("policy, reuse, accepted", [
+        ("all_reusable", True, False),
+        ("all_reusable", False, True),
+        ("per_request", True, True),
+        ("per_request", False, True),
+        ("per_conversation", True, False),
+        ("per_conversation", False, False),
+    ])
+    def test_block_reuse_policy(self, policy, reuse, accepted) -> None:
+        config = KvCacheConfig(
+            enable_block_reuse=reuse,
+            block_reuse_config=BlockReuseConfig(policy=policy))
+        if accepted:
+            with patch.object(llm_args_mod.logger, "warning") as warning:
+                args = self._dkv_args(kv_cache_config=config)
+            assert args.kv_cache_config.enable_block_reuse is reuse
+            if not reuse:
+                assert any("hit-rate metrics are not meaningful" in call.args[0]
+                           for call in warning.call_args_list)
+        else:
+            with pytest.raises(
+                    ValueError,
+                    match="policy=.*not supported with dkv_config yet"):
+                self._dkv_args(kv_cache_config=config)
+
+    def test_reuse_policy_error_offers_disabling_reuse_only_when_that_helps(
+            self) -> None:
+        with pytest.raises(
+                ValueError,
+                match=r"use 'per_request'.*enable_block_reuse=False"):
+            self._dkv_args(kv_cache_config=KvCacheConfig(
+                block_reuse_config=BlockReuseConfig(policy="all_reusable")))
+        with pytest.raises(ValueError, match="use 'per_request'") as caught:
+            self._dkv_args(kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                block_reuse_config=BlockReuseConfig(policy="per_conversation")))
+        assert "enable_block_reuse" not in str(caught.value)
+
+    def test_attention_dp_is_required(self) -> None:
+        with pytest.raises(ValueError, match="enable_attention_dp=True"):
+            self._dkv_args(enable_attention_dp=False)
+
+    def test_sequence_parallel_attention_is_rejected(self) -> None:
+        with pytest.raises(ValueError,
+                           match="not supported with dkv_config yet"):
+            DkvConfig(attention_mode="sp")
+
+    @pytest.mark.parametrize("dkv_enabled", [False, True])
+    def test_deepseek_v4_defaults(self, dkv_enabled) -> None:
+        from tensorrt_llm._torch.models.modeling_deepseekv4 import \
+            DeepseekV4ForCausalLM
+
+        args = (self._dkv_args() if dkv_enabled else TorchLlmArgs(
+            model="/tmp/dummy_model"))
+        with patch(
+                "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version",
+                return_value=100):
+            defaults = DeepseekV4ForCausalLM.get_model_defaults(args)
+        assert defaults["kv_cache_config"][
+            "enable_swa_scratch_reuse"] is not dkv_enabled
+        if dkv_enabled:
+            assert defaults["kv_cache_config"]["block_reuse_config"] == {
+                "policy": "per_request"
+            }
+        apply_model_defaults_to_llm_args(args, defaults)
+        assert args.kv_cache_config.enable_swa_scratch_reuse is not dkv_enabled
+
+    def test_deepseek_v4_defaults_preserve_explicit_values(self) -> None:
+        from tensorrt_llm._torch.models.modeling_deepseekv4 import \
+            DeepseekV4ForCausalLM
+
+        args = self._dkv_args(
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+                                          enable_swa_scratch_reuse=False,
+                                          block_reuse_config=BlockReuseConfig(
+                                              policy="all_reusable")))
+        with patch(
+                "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version",
+                return_value=100):
+            defaults = DeepseekV4ForCausalLM.get_model_defaults(args)
+        apply_model_defaults_to_llm_args(args, defaults)
+        assert args.kv_cache_config.block_reuse_config.policy == "all_reusable"
+        assert not args.kv_cache_config.enable_swa_scratch_reuse
+
+    @pytest.mark.parametrize("kv_config, feature", [
+        ({
+            "enable_swa_scratch_reuse": True
+        }, "enable_swa_scratch_reuse"),
+        ({
+            "block_reuse_config": {
+                "policy": "all_reusable"
+            }
+        }, "block_reuse_config"),
+    ])
+    def test_deepseek_v4_defaults_do_not_override_invalid_user_values(
+            self, kv_config, feature) -> None:
+        from tensorrt_llm._torch.models.modeling_deepseekv4 import \
+            DeepseekV4ForCausalLM
+
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            tensor_parallel_size=2,
+                            enable_attention_dp=True,
+                            disable_overlap_scheduler=True,
+                            kv_cache_config=kv_config)
+        args.dkv_config = DkvConfig()
+        with patch(
+                "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version",
+                return_value=100):
+            defaults = DeepseekV4ForCausalLM.get_model_defaults(args)
+        with pytest.raises(ValueError,
+                           match=feature +
+                           ".*not supported with dkv_config yet"):
+            apply_model_defaults_to_llm_args(args, defaults)

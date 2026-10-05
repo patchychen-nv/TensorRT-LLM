@@ -20,8 +20,8 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Optional,
+                    Sequence, Set, Tuple, Union)
 
 import torch
 
@@ -197,6 +197,8 @@ def _merge_kv_cache_pool_pointers(
 
 
 class BaseResourceManager(ABC):
+
+    dkv_scope: Literal["lifecycle", "forward"] = "lifecycle"
 
     @abstractmethod
     def get_max_resource_count(self) -> int:
@@ -3044,10 +3046,17 @@ class ResourceManager:
             kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(
+            self,
+            scheduled_batch: ScheduledRequests,
+            forward_batch: Optional[ScheduledRequests] = None) -> None:
+        """Prepare lifecycle resources globally and forward resources locally."""
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
-                resource_manager.prepare_resources(scheduled_batch)
+                batch = (forward_batch if forward_batch is not None
+                         and resource_manager.dkv_scope == "forward" else
+                         scheduled_batch)
+                resource_manager.prepare_resources(batch)
         # After every manager, so context_current_position / context_chunk_size
         # are final. See maybe_fit_token_budget.
         self.maybe_fit_token_budget(scheduled_batch)
@@ -3065,15 +3074,20 @@ class ResourceManager:
         scheduled_batch: ScheduledRequests,
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
-    ):
+        *,
+        forward_batch: Optional[ScheduledRequests] = None,
+    ) -> None:
+        """Update resources using the same global/local scope as preparation."""
         for resource_type, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
+                batch = (forward_batch if forward_batch is not None
+                         and resource_manager.dkv_scope == "forward" else
+                         scheduled_batch)
                 if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
-                    resource_manager.update_resources(scheduled_batch,
-                                                      attn_metadata,
+                    resource_manager.update_resources(batch, attn_metadata,
                                                       kv_cache_dtype_byte_size)
                 else:
-                    resource_manager.update_resources(scheduled_batch)
+                    resource_manager.update_resources(batch)
 
     def free_resources(self, request: LlmRequest):
         for resource_type, resource_manager in reversed(

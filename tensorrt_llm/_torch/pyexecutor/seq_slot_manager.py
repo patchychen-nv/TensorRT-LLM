@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from tensorrt_llm.logger import logger
 
 from .llm_request import LlmRequest
@@ -6,6 +9,8 @@ from .scheduler import ScheduledRequests
 
 
 class SeqSlotManager(BaseResourceManager):
+
+    dkv_scope = "forward"
 
     def __init__(self, max_num_sequences: int):
         self.slot_manager = SlotManager(max_num_sequences)

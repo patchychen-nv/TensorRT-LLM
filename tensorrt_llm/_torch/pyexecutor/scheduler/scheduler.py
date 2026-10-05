@@ -261,6 +261,32 @@ class ScheduledRequests:
     def all_requests(self) -> RequestList:
         return self.context_requests + self.generation_requests
 
+    def local_view(
+        self, is_local: Callable[[LlmRequest], bool] | None = None
+    ) -> "ScheduledRequests":
+        """Return a DKV forward view without changing request classification.
+
+        The view owns its lists and shares the selected request objects. Global
+        lifecycle work remains on the original batch.
+        """
+        if self.encoder_requests or self.scheduled_mm_encoder_items:
+            raise ValueError("DKV local views do not support encoder requests")
+
+        def selected(request: LlmRequest) -> bool:
+            return request.py_dkv_is_local if is_local is None else is_local(request)
+
+        local = ScheduledRequests()
+        local.context_requests_chunking = [
+            request for request in self.context_requests_chunking if selected(request)
+        ]
+        local.context_requests_last_chunk = [
+            request for request in self.context_requests_last_chunk if selected(request)
+        ]
+        local.generation_requests = [
+            request for request in self.generation_requests if selected(request)
+        ]
+        return local
+
     def append_encoder_request(self, request: LlmRequest) -> None:
         self.encoder_requests.append(request)
 

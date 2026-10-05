@@ -43,6 +43,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
+from tensorrt_llm.llmapi._dkv import _validate_dkv_request
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
@@ -79,6 +80,8 @@ from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
+from .dkv import (DkvControlDigest, DkvControlPayload, DkvInvariantChecker,
+                  digest_request_ids, sync_dkv_control, sync_dkv_sample_results)
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
@@ -92,7 +95,9 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             hard_kill_on_rank_crash, propagate_hard_kill,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
-from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import (_CUDA_GRAPH_DUMMY_RESERVED_WINDOW,
+                                           CUDA_GRAPH_DUMMY_REQUEST_ID,
+                                           KVCacheManagerV2)
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
 from .kv_cache_stats import append_kv_cache_iteration_stats
@@ -398,6 +403,11 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+
+    # Whether the DKV replicated-KV lifecycle is active; __init__ sets the real value. Methods read
+    # it as ``getattr(self, "dkv_enabled", False) is True``: unit tests call them on stubs that
+    # lack the attribute, and a test double that fabricates it must not enter the DKV path.
+    dkv_enabled: bool = False
 
     def __init__(
             self,
@@ -1000,7 +1010,8 @@ class PyExecutor:
                 "KV cache iteration stats are reported every "
                 f"{math.lcm(self._kv_iter_stats_interval, self.iter_perf_stats_interval)} "
                 "iterations.")
-        self._adp_iter_stats = ADPIterStatsBuffer()
+        self._adp_iter_stats = ADPIterStatsBuffer(
+            measurement_provider=self._dkv_measurement_snapshot)
         # Per-loop CPU wall and GPU forward time captured by the profile_step
         # closure (see _profiler). Populated whenever enable_iter_perf_stats or
         # print_iter_log is on so the /metrics serializer can read them
@@ -1010,7 +1021,8 @@ class PyExecutor:
         # under steady state — see ping-pong comment in _profiler).
         self._latest_host_step_time_ms: Optional[float] = None
         self._latest_prev_device_step_time_ms: Optional[float] = None
-        self._emit_initial_stats()
+        if not self.dkv_enabled:
+            self._emit_initial_stats()
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1039,6 +1051,17 @@ class PyExecutor:
                 key="disagg_transfer_window_bypass")
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
+        self._dkv_invariant_checker: DkvInvariantChecker | None = None
+        self._dkv_forward_dummies: list[LlmRequest] = []
+        self._dkv_sampler_errors: list[tuple[str, tuple[int, ...]]] = []
+        self._dkv_fatal_messages: list[str] = []
+        self._dkv_freed_request_ids: list[int] = []
+        self._dkv_commit_reason: str | None = None
+        if self.dkv_enabled:
+            self._validate_dkv_runtime()
+            self._initialize_dkv_invariant_checker()
+            self._initialize_dkv_forward_dummies()
+            self._emit_initial_stats()
         # True while the benchmark disagg fill phase is in progress (waiting
         # for all benchmark requests to complete KV transfer before the first
         # forward pass).  Cleared by _check_benchmark_disagg_gate when the
@@ -1960,10 +1983,15 @@ class PyExecutor:
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
 
     def _has_pending_connector_transfers(self) -> bool:
+        """Keep polling connector work and replicated DKV sends until drained."""
+        transfers = getattr(self, "async_transfer_manager", None)
+        if (getattr(self, "dkv_enabled", False) is True
+                and transfers is not None
+                and transfers.has_any_inflight_requests()):
+            return True
         connector = getattr(self, "kv_connector_manager", None)
         if connector is None:
             return False
-        transfers = getattr(self, "async_transfer_manager", None)
         return (connector.has_pending_loads()
                 or (transfers is not None
                     and transfers.has_any_inflight_requests()))
@@ -2061,7 +2089,8 @@ class PyExecutor:
             "%m-%d-%Y %H:%M:%S.%f")
 
         stats.num_new_active_requests = num_new_active_requests
-        stats.num_active_requests = len(self.active_requests)
+        stats.num_active_requests = len(
+            self._dkv_local_requests(self.active_requests))
         stats.new_active_requests_queue_latency_ms = new_active_requests_queue_latency_ms
         stats.inflight_batching_stats = InflightBatchingStats()
         # staticBatchingStats is not used in pytorch path
@@ -2564,7 +2593,8 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           dkv_measurement: Optional[dict] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -2590,6 +2620,8 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
+            dkv_measurement: Opt-in replicated-KV experiment counters of the
+                row's rank. Surfaces as ``dkvMeasurement`` in the stats JSON.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
@@ -2651,6 +2683,7 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] dkv_measurement: Optional[dict]
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -2658,7 +2691,18 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, dkv_measurement))
+
+    def _dkv_measurement_snapshot(self) -> Optional[dict]:
+        """This rank's opt-in KV experiment counters, or None when not collected.
+
+        Plain attention DP exports them as well, so a control run without DKV reports the same
+        counters as the run it is compared with.
+        """
+        snapshot = getattr(self.kv_cache_manager,
+                           "get_dkv_measurement_snapshot", None)
+        result = snapshot() if callable(snapshot) else None
+        return result if isinstance(result, dict) else None
 
     def _process_iter_stats(
         self,
@@ -2735,6 +2779,8 @@ class PyExecutor:
                 req_stats,
                 kv_iter_stats=self._latest_kv_iter_stats,
                 is_rank0=self.dist.rank == 0,
+                dkv_enabled=getattr(self, "dkv_enabled", False) is True,
+                dkv_measurement=self._dkv_measurement_snapshot(),
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
@@ -3695,8 +3741,234 @@ class PyExecutor:
                          speculation_permanently_disabled=self.
                          speculation_permanently_disabled)
 
+    @contextmanager
+    def _dkv_commit_window(
+        self, reason: Literal["activation", "responses", "control", "fatal"]
+    ) -> Iterator[None]:
+        """Allow replicated request release only at a lockstep commit point."""
+        if getattr(self, "dkv_enabled", False) is not True:
+            yield
+            return
+        previous = self._dkv_commit_reason
+        self._dkv_commit_reason = reason
+        try:
+            yield
+        finally:
+            self._dkv_commit_reason = previous
+
+    def _check_dkv_free_window(self, request: LlmRequest) -> None:
+        if (getattr(self, "dkv_enabled", False) is True and not request.is_dummy
+                and self._dkv_invariant_checker.enabled
+                and self._dkv_commit_reason
+                not in ("activation", "responses", "control", "fatal")):
+            raise RuntimeError(
+                f"DKV invariant violation: request {request.py_request_id} freed "
+                "outside a replicated commit window")
+
+    def _stage_dkv_sampler_error(self, message: str,
+                                 requests: Iterable[LlmRequest]) -> None:
+        """Charge only the originating rank and defer failure to S-sample."""
+        request_ids = tuple(
+            dict.fromkeys(request.py_request_id for request in requests
+                          if not request.is_dummy and request.py_dkv_is_local))
+        budget_fatal = self._error_budget.consume(message)
+        if request_ids:
+            self._dkv_sampler_errors.append((message, request_ids))
+        if budget_fatal or not request_ids:
+            self._dkv_fatal_messages.append(message)
+
+    def _sync_dkv_control(self) -> None:
+        """Agree on health and release pending responses before scheduling."""
+        index_mapper_used, free_pages = (
+            self.kv_cache_manager.get_dkv_control_digest())
+        transfer_events = ()
+        in_transfer_ids = ()
+        if self.kv_cache_transceiver is not None:
+            transfer_events = self.disagg.collect_dkv_transfer_events()
+            self._dkv_fatal_messages.extend(
+                self.disagg.take_dkv_fatal_messages())
+            in_transfer_ids = self.async_transfer_manager.requests_in_transfer()
+        payload = DkvControlPayload(
+            digest=DkvControlDigest(
+                iter_counter=self.iter_counter,
+                free_pages=free_pages,
+                index_mapper_used=index_mapper_used,
+                active_request_count=len(self.active_requests),
+                in_transfer_count=len(in_transfer_ids),
+                in_transfer_digest=digest_request_ids(in_transfer_ids)),
+            fatal_messages=tuple(self._dkv_fatal_messages),
+            has_pending_responses=bool(self._pending_transfer_responses
+                                       or self._pending_response_terminations),
+            debug_enabled=self._dkv_invariant_checker.enabled,
+            freed_request_ids=tuple(sorted(self._dkv_freed_request_ids)),
+            transfer_events=transfer_events)
+        control = sync_dkv_control(self.dist, payload)
+        self._dkv_fatal_messages.clear()
+        self._dkv_freed_request_ids.clear()
+        with self._dkv_commit_window("control"):
+            if control.fatal_messages:
+                message = "; ".join(control.fatal_messages)
+                self._fatal_error = RuntimeError(f"Fatal DKV error: {message}")
+                if (self.kv_cache_transceiver is not None and
+                        self.async_transfer_manager.has_any_inflight_requests()
+                    ):
+                    # The fabric may still read these pages. The supervisor
+                    # must stop every rank before any request can free them.
+                    raise self._fatal_error
+                self._handle_errors(message,
+                                    charge_budget=False,
+                                    fatal_is_collective_aligned=True)
+            else:
+                transfer_pending = (self.disagg.commit_dkv_transfer_events(
+                    control.transfer_events)
+                                    if control.transfer_events else False)
+                if control.has_pending_responses or transfer_pending:
+                    self._flush_pending_transfer_responses()
+
+    def _check_dkv_iteration_end(self, include_freed: bool = False) -> None:
+        """Compare the replicated per-request state of every rank (debug only).
+
+        Covers the KV fingerprint of every cache including the resident
+        dummies, the in-flight transfer set and request progress. All ranks
+        reach this call at the end of the same iteration.
+        """
+        checker = self._dkv_invariant_checker
+        if not checker.enabled:
+            return
+        in_transfer = (self.async_transfer_manager.requests_in_transfer()
+                       if self.kv_cache_transceiver is not None else ())
+        records: dict[str, object] = {
+            "end of iteration kv state":
+            self.kv_cache_manager.get_dkv_state_fingerprint(),
+            "end of iteration in transfer":
+            tuple(sorted(in_transfer)),
+            "end of iteration active":
+            [(request.py_request_id, request.state_value,
+              request.context_current_position)
+             for request in self.active_requests],
+        }
+        if include_freed:
+            records["end of iteration freed"] = tuple(
+                sorted(self._dkv_freed_request_ids))
+        checker.check_many(self.iter_counter, records)
+
+    def _sync_dkv_samples(self, scheduled_batch: ScheduledRequests,
+                          forward_batch: ScheduledRequests) -> None:
+        """Replicate sampler failures before healthy requests commit their KV."""
+        global_requests = scheduled_batch.all_requests()
+        errors = sync_dkv_sample_results(self.dist, global_requests,
+                                         forward_batch.all_requests(),
+                                         self._dkv_sampler_errors)
+        self._dkv_sampler_errors.clear()
+        requests_by_id = {
+            request.py_request_id: request
+            for request in global_requests
+        }
+        failed_ids: set[int] = set()
+        for error in errors:
+            requests = [
+                requests_by_id[request_id] for request_id in error.request_ids
+                if request_id not in failed_ids
+            ]
+            failed_ids.update(error.request_ids)
+            if requests:
+                self._handle_errors(error.message,
+                                    requests=requests,
+                                    charge_budget=False)
+        if failed_ids:
+            for batch in (scheduled_batch, forward_batch):
+                batch.context_requests_chunking = [
+                    request for request in batch.context_requests_chunking
+                    if request.py_request_id not in failed_ids
+                ]
+                batch.context_requests_last_chunk = [
+                    request for request in batch.context_requests_last_chunk
+                    if request.py_request_id not in failed_ids
+                ]
+                batch.generation_requests = [
+                    request for request in batch.generation_requests
+                    if request.py_request_id not in failed_ids
+                ]
+
+    def _dkv_local_requests(self,
+                            requests: list[LlmRequest]) -> list[LlmRequest]:
+        """Use compute-rank ownership for per-rank request metrics."""
+        if getattr(self, "dkv_enabled", False) is not True:
+            return requests
+        return [
+            request for request in requests
+            if request.py_dkv_is_local and not request.is_dummy
+        ]
+
+    def _initialize_dkv_forward_dummies(self) -> None:
+        """Reserve identical KV lifetimes and one local forward slot."""
+        if self.is_warmup or self._dkv_forward_dummies:
+            raise RuntimeError(
+                "DKV forward dummies must be reserved once, outside warmup")
+        dummy_base = (CUDA_GRAPH_DUMMY_REQUEST_ID -
+                      2 * _CUDA_GRAPH_DUMMY_RESERVED_WINDOW)
+        self._dkv_forward_dummies = self.kv_cache_manager.add_dummy_requests(
+            request_ids=[
+                dummy_base - rank for rank in range(self.dist.tp_size)
+            ],
+            token_nums=None,
+            is_gen=True,
+            prepare_resource=True,
+        )
+        if not self._dkv_forward_dummies:
+            raise RuntimeError("Cannot reserve the DKV forward dummy KV pages")
+        for rank, request in enumerate(self._dkv_forward_dummies):
+            request.py_dkv_compute_rank = rank
+            request.py_dkv_is_local = rank == self.dist.tp_rank
+            request.is_attention_dp_dummy = True
+            request.py_skip_gen_alloc_revert = True
+        local_dummy_batch = ScheduledRequests()
+        local_dummy_batch.generation_requests = [
+            self._dkv_forward_dummies[self.dist.tp_rank]
+        ]
+        self.resource_manager.resource_managers[
+            ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
+                local_dummy_batch)
+
+    def _dkv_forward_batch(
+            self, scheduled_batch: ScheduledRequests) -> ScheduledRequests:
+        """Derive local work, padding idle compute ranks outside the lifecycle."""
+        if getattr(self, "dkv_enabled", False) is not True:
+            return scheduled_batch
+        forward_batch = scheduled_batch.local_view()
+        if scheduled_batch.batch_size and not forward_batch.batch_size:
+            forward_batch.generation_requests.append(
+                self._dkv_forward_dummies[self.dist.tp_rank])
+        self.num_scheduled_requests = len(
+            self._dkv_local_requests(forward_batch.all_requests()))
+        self.num_dummy_requests = sum(
+            request.is_dummy for request in forward_batch.all_requests())
+        self.num_unscheduled_requests = (
+            len(self._dkv_local_requests(self.active_requests)) -
+            self.num_scheduled_requests)
+        return forward_batch
+
     @nvtx_range("_can_queue")
-    def _can_queue(self, scheduled_batch):
+    def _can_queue(
+            self,
+            scheduled_batch: ScheduledRequests,
+            forward_batch: Optional[ScheduledRequests] = None
+    ) -> tuple[bool, bool]:
+
+        if getattr(self, "dkv_enabled", False) is True:
+            if forward_batch is None:
+                raise RuntimeError(
+                    "DKV invariant violation: the forward batch is required")
+            can_queue = scheduled_batch.batch_size > 0
+            if self._dkv_invariant_checker.enabled:
+                sizes = self.dist.tp_allgather_int64([forward_batch.batch_size
+                                                      ])[:, 0].tolist()
+                if not all((size > 0) == can_queue for size in sizes):
+                    raise RuntimeError(
+                        f"DKV invariant violation: forward participation "
+                        f"differs: global={scheduled_batch.batch_size}, "
+                        f"local sizes={sizes}")
+            return can_queue, forward_batch.batch_size > 0
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
@@ -3848,7 +4120,9 @@ class PyExecutor:
                 self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
-            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False))
+            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False),
+            is_local=(lambda request: request.py_dkv_is_local) if getattr(
+                self, "dkv_enabled", False) is True else None)
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:
@@ -3935,11 +4209,13 @@ class PyExecutor:
 
         self._handle_control_request()
 
-        self.disagg.prepare_context_schedulable(new_requests)
-        self.disagg.poll_gen_transfers()
-        self.disagg.check_transfer_timeouts()
+        if getattr(self, "dkv_enabled", False) is not True:
+            self.disagg.prepare_context_schedulable(new_requests)
+            self.disagg.poll_gen_transfers()
+            self.disagg.check_transfer_timeouts()
 
-        iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
+        iter_stats = self._init_iter_stats_if_sampled(
+            len(self._dkv_local_requests(new_requests)))
 
         self._pad_attention_dp_dummy_request()
 
@@ -4017,6 +4293,19 @@ class PyExecutor:
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
         )
 
+        if getattr(self, "dkv_enabled", False) is True:
+            self._dkv_invariant_checker.check_many(
+                self.iter_counter, {
+                    "scheduling decisions": {
+                        "scheduled":
+                        [(req.py_request_id, req.py_dkv_compute_rank,
+                          req.context_current_position, req.context_chunk_size)
+                         for req in scheduled_batch.all_requests()],
+                        "kv_trace":
+                        self.kv_cache_manager.consume_dkv_trace(),
+                    }
+                })
+
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.
         self._pad_empty_attention_dp_batch(scheduled_batch)
@@ -4033,7 +4322,8 @@ class PyExecutor:
             # into the transfer window this iteration.
             self.disagg.receive_gen_init(admitted_disagg_gen_init_requests)
 
-            self.disagg.poll_progress_when_idle()
+            if getattr(self, "dkv_enabled", False) is not True:
+                self.disagg.poll_progress_when_idle()
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the
@@ -4441,6 +4731,9 @@ class PyExecutor:
             self._build_step_scope_label(scheduled_batch, phase))
 
     def _executor_loop(self):
+        dkv_enabled = getattr(self, "dkv_enabled", False) is True
+        if dkv_enabled:
+            self._validate_dkv_loop_features()
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -4461,7 +4754,10 @@ class PyExecutor:
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
-                self.disagg.handle_errors_synced()
+                if dkv_enabled:
+                    self._sync_dkv_control()
+                else:
+                    self.disagg.handle_errors_synced()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
@@ -4472,9 +4768,14 @@ class PyExecutor:
                     # wait for its own timeout. Scheduling shutdown is
                     # model-parallel synchronized, so every ADP rank reaches
                     # this collective together.
-                    self._flush_pending_transfer_responses()
+                    with self._dkv_commit_window("control"):
+                        self._flush_pending_transfer_responses()
+                    if dkv_enabled:
+                        self._check_dkv_iteration_end(include_freed=True)
                     self._event_loop_completed = True
                     break
+
+                forward_batch = self._dkv_forward_batch(scheduled_batch)
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
@@ -4511,14 +4812,14 @@ class PyExecutor:
                 gpu_forward_end = None
                 gpu_forward_events_from_perf_pool = False
 
-                can_queue, _ = self._can_queue(scheduled_batch)
+                can_queue, _ = self._can_queue(scheduled_batch, forward_batch)
                 self._release_unused_connector_reservations(
                     scheduled_batch if can_queue else None)
 
                 if can_queue:
                     self._prepare_disagg_gen_transmission_complete(
                         scheduled_batch)
-                    if self.kv_cache_transceiver:
+                    if self.kv_cache_transceiver and not dkv_enabled:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
@@ -4526,7 +4827,11 @@ class PyExecutor:
 
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    if dkv_enabled:
+                        self.resource_manager.prepare_resources(
+                            scheduled_batch, forward_batch=forward_batch)
+                    else:
+                        self.resource_manager.prepare_resources(scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -4577,8 +4882,13 @@ class PyExecutor:
                                 self.guided_decoder.rollback_draft_tokens()
 
                     scheduled_batch_stats = (
-                        self._collect_scheduled_batch_stats(scheduled_batch)
+                        self._collect_scheduled_batch_stats(forward_batch)
                         if iter_stats is not None else None)
+                    if dkv_enabled and scheduled_batch_stats is not None:
+                        scheduled_batch_stats.num_paused_requests = len(
+                            self._dkv_local_requests(
+                                scheduled_batch.paused_requests +
+                                scheduled_batch.recompute_paused_requests))
                     self._commit_kv_cache_stats(scheduled_batch)
 
                     # GPU and CPU timing for perf metrics
@@ -4594,7 +4904,7 @@ class PyExecutor:
                     # trtllm-serve /start_profile expose per-iteration
                     # boundaries with a consistent category and label
                     # format.
-                    with self._step_scope(scheduled_batch):
+                    with self._step_scope(forward_batch):
                         if scheduled_batch.encoder_requests:
                             self._submit_encoder_step(
                                 scheduled_batch.encoder_requests)
@@ -4604,7 +4914,7 @@ class PyExecutor:
                                 gpu_forward_end) as fwd_timing:
                             if self.dwdp_manager is not None:
                                 self.dwdp_manager.prefetch_first_layers()
-                            batch_outputs = self._forward_step(scheduled_batch)
+                            batch_outputs = self._forward_step(forward_batch)
 
                         self._maybe_prefetch_next_iter_mm_encoders(
                             scheduled_batch)
@@ -4617,11 +4927,11 @@ class PyExecutor:
                         with self.perf_manager.record_perf_events(
                                 None, gpu_sample_end) as sample_timing:
                             sample_state = self._sample_async(
-                                scheduled_batch, batch_outputs)
+                                forward_batch, batch_outputs)
 
                     if self.perf_manager.enabled:
                         self.perf_manager.save_timing_to_requests(
-                            scheduled_batch.all_requests(), gpu_forward_start,
+                            forward_batch.all_requests(), gpu_forward_start,
                             gpu_forward_end, gpu_sample_end,
                             fwd_timing.start_time, fwd_timing.end_time,
                             sample_timing.start_time, sample_timing.end_time)
@@ -4651,6 +4961,9 @@ class PyExecutor:
                             sample_state,
                             iteration_id=self.iter_counter)
 
+                    if dkv_enabled:
+                        self._sync_dkv_samples(scheduled_batch, forward_batch)
+
                     if self._is_kv_manager_v2:
                         # Finalize V2 context KV before disagg transfer/response
                         # handling can terminate the request.
@@ -4665,40 +4978,51 @@ class PyExecutor:
                     # Compute GPU times after _handle_responses creates metric entries
                     # (safe in non-overlap mode: no next iteration to overwrite events)
                     self.perf_manager.compute_batch_gpu_times(
-                        scheduled_batch.all_requests())
+                        forward_batch.all_requests())
                     attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                             None)
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
+                    if dkv_enabled:
+                        self.resource_manager.update_resources(
+                            scheduled_batch,
+                            attn_metadata,
+                            kv_cache_dtype_byte_size,
+                            forward_batch=forward_batch)
+                    else:
+                        self.resource_manager.update_resources(
+                            scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
-                # Drain timeout buffer outside ``if can_queue`` so the synced
-                # collective fires every iter regardless of future restructuring.
-                self.disagg.handle_timeouts_synced()
+                if (dkv_enabled and not can_queue and self.canceled_req_ids):
+                    self._handle_canceled_requests()
+                    finished_requests = self._handle_responses()
 
-                self.disagg.check_transfer_timeouts(
-                    only_with_context_sends=True)
+                if not dkv_enabled:
+                    # Keep the ADP timeout vote outside ``if can_queue``.
+                    # DKV polls and publishes transfer events at S-control.
+                    self.disagg.handle_timeouts_synced()
+                    self.disagg.check_transfer_timeouts(
+                        only_with_context_sends=True)
 
                 self._kv_connector_terminate_requests()
 
-                # This is the one ADP-synchronized response flush for a
-                # completed executor-loop pass. It is deliberately outside
-                # ``if can_queue``: non-fatal errors can be buffered on an
-                # idle pass, and every ADP rank must enter the tp_gather in
-                # the same order. Keep it after all per-pass error handling
-                # so a response is not needlessly delayed to the next pass.
-                self._flush_pending_transfer_responses()
+                # Plain ADP drains rank-local errors on every pass. DKV
+                # drains only after S-control agrees that a response is pending.
+                if not dkv_enabled:
+                    self._flush_pending_transfer_responses()
 
-                if self.enable_iter_perf_stats and sample_state is not None:
+                if self.enable_iter_perf_stats and (sample_state is not None or
+                                                    (dkv_enabled
+                                                     and can_queue)):
                     iter_stats = self._take_pending_new_active_requests(
                         iter_stats)
                     self._process_iter_stats(
-                        finished_requests, self.active_requests,
-                        BatchState(scheduled_requests=scheduled_batch,
+                        self._dkv_local_requests(finished_requests),
+                        self._dkv_local_requests(self.active_requests),
+                        BatchState(scheduled_requests=forward_batch,
                                    sample_state=sample_state,
                                    iter_stats=iter_stats,
                                    iter_id=self.iter_counter,
@@ -4717,6 +5041,9 @@ class PyExecutor:
 
                 if not can_queue:
                     self.disagg.pace_idle()
+
+                if dkv_enabled:
+                    self._check_dkv_iteration_end()
 
                 self.iter_counter += 1
 
@@ -5777,6 +6104,117 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
+    def _validate_dkv_runtime(self) -> None:
+        """Validate the resolved model, resource managers and runtime features."""
+        from ..attention.backends.sparse.deepseek_v4.cache_manager import \
+            DeepseekV4CacheManager
+        from ..disaggregation.transceiver import KvCacheTransceiverV2
+
+        if type(self.kv_cache_manager) not in (KVCacheManagerV2,
+                                               DeepseekV4CacheManager):
+            raise ValueError(
+                f"{type(self.kv_cache_manager).__name__} is not supported with "
+                "dkv_config yet; use KVCacheManagerV2 or DeepseekV4CacheManager."
+            )
+        if self.is_encoder_decoder:
+            raise ValueError(
+                "Encoder-decoder models are not supported with dkv_config yet.")
+        if self.is_benchmark_disagg:
+            raise ValueError(
+                "Benchmark disaggregation is not supported with dkv_config yet."
+            )
+        if self._mm_encoder_item_scheduling_enabled:
+            raise ValueError(
+                "Multimodal encoder scheduling is not supported with dkv_config yet."
+            )
+        transceiver = self.kv_cache_transceiver
+        if transceiver is not None:
+            if type(transceiver) is not KvCacheTransceiverV2:
+                raise ValueError(
+                    "DKV requires the Python KvCacheTransceiverV2 with NIXL.")
+            if transceiver.pipeline_transfer_enabled:
+                raise ValueError(
+                    "Pipelined transfer is not supported with dkv_config yet.")
+            if transceiver._ctx_need_tp_sync or transceiver._ctx_need_pp_sync:
+                raise ValueError(
+                    "DKV context transfer status must not use TP or PP collectives."
+                )
+            if transceiver._fp4_mla_bridge_enabled:
+                raise ValueError(
+                    "The FP4 MLA transfer bridge is not supported with dkv_config yet."
+                )
+            if (transceiver.kv_transfer_timeout_ms is None
+                    or transceiver.kv_transfer_timeout_ms <= 0):
+                raise ValueError(
+                    "DKV requires a finite positive kv_transfer_timeout_ms.")
+        if self.attention_dp_enable_balance:
+            raise ValueError(
+                "Attention-DP balancing is not supported with dkv_config yet.")
+        if self.kv_cache_manager.enable_block_reuse:
+            logger.warning_once(
+                "DKV block reuse is enabled. A request that reuses a prefix "
+                "computed for a request owned by another rank reads KV content "
+                "its own rank never computed, so its output is not valid. "
+                "Disable kv_cache_config.enable_block_reuse when outputs must "
+                "be correct.",
+                key="dkv_block_reuse_enabled")
+        else:
+            logger.warning(
+                "DKV block reuse is disabled at runtime; prefix-hit metrics "
+                "will not measure cache reuse.")
+        mapping = self.dist.mapping
+        if mapping.moe_ep_size != mapping.tp_size:
+            logger.warning(
+                f"DKV MoE expert parallel size ({mapping.moe_ep_size}) differs "
+                f"from the attention-DP group size ({mapping.tp_size}).")
+
+    def _validate_dkv_loop_features(self) -> None:
+        """Reject features whose control flow is not replicated, before the first iteration."""
+        spec_resource_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        unsupported = {
+            "benchmark disaggregation":
+            self.is_benchmark_disagg,
+            "multimodal encoder scheduling":
+            self._mm_encoder_item_scheduling_enabled,
+            "a KV cache connector":
+            self.kv_connector_manager is not None,
+            "guided decoding":
+            self.guided_decoder is not None,
+            "a drafter":
+            self.drafter is not None,
+            "a speculation gate":
+            self.speculation_gate is not None,
+            "a speculative-decoding resource manager":
+            spec_resource_manager is not None,
+        }
+        active = [name for name, enabled in unsupported.items() if enabled]
+        if active:
+            raise RuntimeError(
+                f"dkv_config is not supported with {', '.join(active)}")
+
+    def _initialize_dkv_invariant_checker(self) -> None:
+        """Check DKV startup configuration before entering the event loop."""
+        self._dkv_invariant_checker = DkvInvariantChecker(
+            self.dist,
+            startup_settings={
+                "dual_ledger":
+                self.scheduler.dkv_dual_ledger_enabled,
+                "metrics_all_ranks":
+                os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1",
+                **self.kv_cache_manager.get_dkv_startup_settings(),
+            })
+        self._dkv_invariant_checker.check_many(
+            -1, {
+                "startup configuration": {
+                    "kv_cache":
+                    self.kv_cache_manager.get_dkv_config_fingerprint(),
+                    "checker_enabled": self._dkv_invariant_checker.enabled,
+                    "dual_ledger_enabled":
+                    self.scheduler.dkv_dual_ledger_enabled,
+                }
+            })
+
     def _warn_if_kv_block_budget_unchecked(self) -> None:
         """Warn when beam search runs against a pool no admission check covers.
 
@@ -5823,8 +6261,32 @@ class PyExecutor:
                     f"beam_width={request.py_beam_width}).")
 
     def _validate_request(self, request: LlmRequest):
-        # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
+        if getattr(self, "dkv_enabled", False) is True and not request.is_dummy:
+            has_multimodal_input = bool(request.py_multimodal_data) or any(
+                value is not None for value in (
+                    request.multimodal_embedding,
+                    request.multimodal_hashes,
+                    request.multimodal_positions,
+                    request.multimodal_lengths,
+                    request.mrope_rotary_cos_sin,
+                    request.mrope_position_deltas,
+                ))
+            if disagg_params is not None:
+                has_multimodal_input |= (
+                    disagg_params.multimodal_embedding_handles is not None
+                    or disagg_params.mrope_position_ids_handle is not None
+                    or disagg_params.mrope_position_deltas_handle is not None)
+            _validate_dkv_request(
+                max_tokens=request.max_new_tokens,
+                is_generation_only=request.is_generation_only_request,
+                n=request.sampling_config.num_return_sequences or 1,
+                best_of=request.sampling_config.beam_width,
+                has_multimodal_input=has_multimodal_input,
+                is_generation_first=(disagg_params is not None
+                                     and disagg_params.schedule_style
+                                     == DisaggScheduleStyle.GENERATION_FIRST))
+        # Validate context-side pipelined-transfer constraints.
         if (self.kv_cache_transceiver is not None
                 and self.kv_cache_transceiver.pipeline_transfer_enabled
                 and disagg_params is not None and request.llm_request_type
@@ -6139,7 +6601,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        dkv_measurement=record.dkv_measurement)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]
@@ -6178,6 +6641,11 @@ class PyExecutor:
                     all_rank_states, new_requests,
                     self.max_num_active_requests)
 
+            if self.dkv_enabled:
+                self._dkv_invariant_checker.check(
+                    self.iter_counter, "prefix probes",
+                    self.adp_router.dkv_prefix_matches)
+
             all_new_flat = [
                 req for reqs in all_ranks_new_requests.values() for req in reqs
             ]
@@ -6189,18 +6657,28 @@ class PyExecutor:
                 all_ranks_new_requests[self.dist.tp_rank])
 
             if self.dkv_enabled:
-                # DKV: tag each request with its compute rank and keep the WHOLE
-                # global set (every rank activates every request for the
-                # replicated KV lifecycle). Forward is filtered by is_local
-                # later. Iterate ranks in sorted order so the flattened list is
-                # identical on every rank (determinism).
-                for rank in sorted(all_ranks_new_requests):
-                    for item in all_ranks_new_requests[rank]:
-                        item.py_dkv_compute_rank = rank
-                new_requests = [
-                    item for rank in sorted(all_ranks_new_requests)
-                    for item in all_ranks_new_requests[rank]
-                ]
+                compute_ranks = {}
+                for rank, routed_items in all_ranks_new_requests.items():
+                    if type(rank
+                            ) is not int or not 0 <= rank < self.dist.tp_size:
+                        raise RuntimeError(f"Invalid DKV compute rank: {rank}")
+                    for item in routed_items:
+                        identity = id(item)
+                        if identity in compute_ranks:
+                            raise RuntimeError(
+                                "DKV routing must assign every new request exactly once."
+                            )
+                        compute_ranks[identity] = rank
+                if (len(compute_ranks) != len(new_requests)
+                        or set(compute_ranks)
+                        != {id(item)
+                            for item in new_requests}):
+                    raise RuntimeError(
+                        "DKV routing must assign every new request exactly once."
+                    )
+                # Routing assigns labels; shared KV admission follows queue order.
+                for item in new_requests:
+                    item.dkv_compute_rank = compute_ranks[id(item)]
             else:
                 # ADP: keep only this rank's requests (the narrowing point).
                 new_requests = all_ranks_new_requests[self.dist.tp_rank]
@@ -6214,11 +6692,18 @@ class PyExecutor:
                                 _should_exclude_last_generation_logits())
 
         if self.dkv_enabled:
-            # merge propagated py_dkv_compute_rank; derive is_local here (we know
-            # tp_rank). Covers children too (they are in the merged list).
             for req in merged:
+                if not req.is_dummy and req.py_dkv_compute_rank is None:
+                    raise RuntimeError(
+                        f"DKV request {req.py_request_id} has no compute rank.")
                 req.py_dkv_is_local = (
                     req.py_dkv_compute_rank == self.dist.tp_rank)
+            self._dkv_invariant_checker.check_many(
+                self.iter_counter, {
+                    "global request order":
+                    [(req.py_request_id, req.py_dkv_compute_rank)
+                     for req in merged]
+                })
 
         return merged
 
@@ -6296,9 +6781,15 @@ class PyExecutor:
                         ))
                 return False
             except Exception as e:
-                self._handle_errors(str(e),
-                                    requests=[request],
-                                    charge_budget=False)
+                if getattr(self, "dkv_enabled", False) is True:
+                    with self._dkv_commit_window("activation"):
+                        self._handle_errors(str(e),
+                                            requests=[request],
+                                            charge_budget=False)
+                else:
+                    self._handle_errors(str(e),
+                                        requests=[request],
+                                        charge_budget=False)
                 return True
 
         new_requests_cur_rank = self._fetch_new_requests(
@@ -6323,6 +6814,9 @@ class PyExecutor:
 
     def _balance_adp_requests(self, context_requests: list[LlmRequest],
                               generation_requests: list[LlmRequest]):
+        if getattr(self, "dkv_enabled", False) is True:
+            raise ValueError(
+                "Attention-DP balancing is not supported with dkv_config yet.")
         balanced_context_requests = context_requests
         num_scheduled_context_requests = len(context_requests)
         num_scheduled_generation_requests = len(generation_requests)
@@ -6695,8 +7189,10 @@ class PyExecutor:
 
         # Cap summed context attended-KV length so the context-MLA attention workspace stays within the
         # headroom the estimator reserved for it (a no-op for unaffected models).
-        scheduled_context_requests = self._cap_context_by_total_kv_len(
-            scheduled_context_requests)
+        if not (getattr(self, "dkv_enabled", False) is True
+                and self.scheduler.dkv_dual_ledger_enabled):
+            scheduled_context_requests = self._cap_context_by_total_kv_len(
+                scheduled_context_requests)
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = scheduled_encoder_requests
@@ -7168,6 +7664,8 @@ class PyExecutor:
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """Pad an idle attention-DP rank with a role-matched dummy request."""
+        if getattr(self, "dkv_enabled", False) is True:
+            return
         if not self.enable_attention_dp:
             return
 
@@ -7329,6 +7827,8 @@ class PyExecutor:
         precisely because it is short of KV cache. Not reached under pipeline
         parallelism, which does not call `_prepare_and_schedule_batch`.
         """
+        if getattr(self, "dkv_enabled", False) is True:
+            return
         if not self.enable_attention_dp:
             return
         if scheduled_batch is None or scheduled_batch.batch_size != 0:
@@ -7839,6 +8339,10 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(
                 f"Encountered an error in forward function: {error_msg}")
+            if getattr(self, "dkv_enabled", False) is True:
+                # Peers may still be inside model collectives. The event-loop
+                # failure handler propagates a hard kill across the group.
+                raise
             self._handle_errors(error_msg)
             return None
 
@@ -7915,6 +8419,13 @@ class PyExecutor:
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
         self._maybe_record_hang_diagnostic_phase("sampling", scheduled_batch)
+        if (getattr(self, "dkv_enabled", False) is True
+                and (self._dkv_sampler_errors
+                     or all(req.is_dummy
+                            for req in scheduled_batch.all_requests()))):
+            self._maybe_record_hang_diagnostic_phase("sampling_skipped",
+                                                     scheduled_batch)
+            return None
         try:
             if batch_outputs is not None:
                 num_context_logits_prefix_sum = [0]
@@ -7954,7 +8465,11 @@ class PyExecutor:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
-            self._handle_errors(error_msg)
+            if getattr(self, "dkv_enabled", False) is True:
+                self._stage_dkv_sampler_error(error_msg,
+                                              scheduled_batch.all_requests())
+            else:
+                self._handle_errors(error_msg)
 
     @nvtx_range("_setup_sampler_step")
     @torch.inference_mode()
@@ -7965,12 +8480,18 @@ class PyExecutor:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
-            self._handle_errors(error_msg)
+            if getattr(self, "dkv_enabled", False) is True:
+                self._stage_dkv_sampler_error(error_msg,
+                                              requests.all_requests())
+            else:
+                self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
     def _update_requests(self,
-                         sample_state: SampleState,
+                         sample_state: SampleState | None,
                          resource_manager: Optional[ResourceManager] = None):
+        if getattr(self, "dkv_enabled", False) is True and sample_state is None:
+            return
         try:
             self.sampler.update_requests(sample_state, resource_manager)
             self._accumulate_spec_dec_stats(sample_state)
@@ -7978,7 +8499,10 @@ class PyExecutor:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
-            self._handle_errors(error_msg)
+            if getattr(self, "dkv_enabled", False) is True:
+                self._stage_dkv_sampler_error(error_msg, sample_state.requests)
+            else:
+                self._handle_errors(error_msg)
 
     def _accumulate_spec_dec_stats(self, sample_state: SampleState) -> None:
         """Accumulate per-request spec-decode acceptance stats for one step.
@@ -8050,6 +8574,10 @@ class PyExecutor:
         guided-decoder) that should not affect server health, and for the
         cleanup phase of an already-classified fatal error.
 
+        DKV callers must synchronize errors and use ``charge_budget=False``.
+        Local sampler failures are staged for S-sample; fatal shutdown is
+        applied only at the aligned S-control boundary.
+
         .. note::
             The ``charge_budget=False`` path reuses the full
             ``_handle_errors`` machinery (queue drain, response
@@ -8071,13 +8599,22 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
+        dkv_enabled = getattr(self, "dkv_enabled", False) is True
+        if dkv_enabled and charge_budget:
+            raise RuntimeError(
+                "DKV request errors must be synchronized before _handle_errors; "
+                "stage local sampler errors for S-sample instead.")
+        if (dkv_enabled and self._fatal_error is not None
+                and not fatal_is_collective_aligned):
+            raise RuntimeError(
+                "DKV fatal errors require the S-control collective boundary.")
         multi_rank_adp = (self.enable_attention_dp
                           and self.dist.world_size != 1)
-        # ``fatal_is_collective_aligned`` is set only by the synchronized caller
-        # (the coordinator's handle_errors_synced, through fail_fatal after its
-        # world allreduce), which
-        # guarantees every ADP rank enters the fatal path in the same collective
-        # order. Do NOT infer it from ``self._fatal_error is not None``: a
+        # ``fatal_is_collective_aligned`` is set only by synchronized callers,
+        # such as the coordinator's fail_fatal after its world allreduce or
+        # DKV's S-control boundary. Every ADP rank must enter the fatal path in
+        # the same collective order. Do NOT infer alignment from
+        # ``self._fatal_error is not None``: a
         # rank-local setter would then route into a tp_gather while peers are
         # elsewhere, recreating the desync this path exists to prevent.
 
@@ -8105,16 +8642,29 @@ class PyExecutor:
             # enters the same number of collectives (attention-DP /
             # gather-all modes use collective gathers internally).
             waiting_responses: List[Tuple[int, LlmResponse]] = []
+            queued_response_ids = (
+                {request.py_request_id
+                 for request in self.active_requests} | {
+                     request.py_request_id
+                     for request in self._pending_response_terminations
+                 } | {
+                     request_id
+                     for request_id, _ in self._pending_transfer_responses
+                 } if dkv_enabled else set())
             while self.waiting_queue:
                 item = self.waiting_queue.pop_request()
-                if (self.gather_all_responses
-                        or self.dist.rank == 0) and item.request is not None:
+                queue_response_owner = (self.dist.rank == 0 if dkv_enabled else
+                                        self.gather_all_responses
+                                        or self.dist.rank == 0)
+                if (queue_response_owner and item.request is not None and
+                    (not dkv_enabled or item.id not in queued_response_ids)):
                     waiting_responses.append(
                         (item.id,
                          LlmResponse(request_id=item.id,
                                      error_msg=error_msg,
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
+                    queued_response_ids.add(item.id)
             # Also drain executor_request_queue so items already queued
             # but not yet fetched by the main loop are not scheduled
             # after the CUDA context is corrupted.  Safe to use empty()
@@ -8125,14 +8675,18 @@ class PyExecutor:
                 item = raw_queue.get_nowait()
                 if item.is_shutdown_request:
                     continue
-                if ((self.gather_all_responses or self.dist.rank == 0)
-                        and item.request is not None):
+                queue_response_owner = (self.dist.rank == 0 if dkv_enabled else
+                                        self.gather_all_responses
+                                        or self.dist.rank == 0)
+                if (queue_response_owner and item.request is not None and
+                    (not dkv_enabled or item.id not in queued_response_ids)):
                     waiting_responses.append(
                         (item.id,
                          LlmResponse(request_id=item.id,
                                      error_msg=error_msg,
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
+                    queued_response_ids.add(item.id)
 
             if not multi_rank_adp:
                 if waiting_responses:
@@ -8148,9 +8702,24 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
+        if dkv_enabled:
+            failed_requests = list(
+                {request.py_request_id: request
+                 for request in failed_requests}.values())
+            if self._dkv_invariant_checker.enabled and not all(
+                    request.is_dummy or request.py_dkv_compute_rank is not None
+                    for request in failed_requests):
+                raise RuntimeError(
+                    "DKV invariant violation: a failed request has no "
+                    "compute-rank tag")
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
+            if dkv_enabled and (request.is_dummy or request.py_dkv_compute_rank
+                                is None or not request.py_dkv_is_local or
+                                (request.is_context_only_request
+                                 and request.py_dkv_context_response_sent)):
+                continue
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
                 error_msg=error_msg,
@@ -8181,7 +8750,7 @@ class PyExecutor:
                         "Skipping rank-local fatal response gather under ADP")
             else:
                 publish_immediately = True
-        elif multi_rank_adp:
+        elif multi_rank_adp or dkv_enabled:
             # Under attention DP, _enqueue_responses performs a tp_gather
             # that every rank must enter in the same order. Non-fatal errors
             # (e.g. a failed disagg KV transfer) are observed by a single
@@ -8190,14 +8759,31 @@ class PyExecutor:
             # tp_allgather(batch_size) — corrupting both sides. Buffer the
             # responses instead; every rank flushes the buffer together at
             # _flush_pending_transfer_responses.
-            self._pending_transfer_responses.extend(error_responses.items())
-            self._pending_response_terminations.extend(failed_requests)
+            if dkv_enabled:
+                pending_response_map = dict(self._pending_transfer_responses)
+                for request_id, response in error_responses.items():
+                    pending_response_map.setdefault(request_id, response)
+                self._pending_transfer_responses = list(
+                    pending_response_map.items())
+                pending_termination_map = {
+                    request.py_request_id: request
+                    for request in self._pending_response_terminations
+                }
+                for request in failed_requests:
+                    pending_termination_map.setdefault(request.py_request_id,
+                                                       request)
+                self._pending_response_terminations = list(
+                    pending_termination_map.values())
+            else:
+                self._pending_transfer_responses.extend(error_responses.items())
+                self._pending_response_terminations.extend(failed_requests)
             defer_termination = True
         else:
             # Without multi-rank ADP there is no rank-divergent collective, so
             # publish the error immediately.
             publish_immediately = True
 
+        pending_terminations = []
         if publish_immediately:
             # A fatal executor exits before the next normal flush; a non-ADP
             # executor has no rank-divergent collective. Both can publish the
@@ -8206,13 +8792,22 @@ class PyExecutor:
             self._pending_transfer_responses = []
             pending_terminations = self._pending_response_terminations
             self._pending_response_terminations = []
-            self._enqueue_responses(pending + list(error_responses.items()))
-            for request in pending_terminations:
-                self._terminate_request(request)
+            responses = pending + list(error_responses.items())
+            if dkv_enabled:
+                responses = list(dict(responses).items())
+            self._enqueue_responses(responses)
 
         if not defer_termination:
-            for request in failed_requests:
-                self._terminate_request(request)
+            requests_to_terminate = pending_terminations + failed_requests
+            if dkv_enabled:
+                requests_to_terminate = list({
+                    request.py_request_id: request
+                    for request in requests_to_terminate
+                }.values())
+            with (self._dkv_commit_window("fatal")
+                  if dkv_enabled else nullcontext()):
+                for request in requests_to_terminate:
+                    self._terminate_request(request)
 
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
@@ -8223,6 +8818,7 @@ class PyExecutor:
                 raise self._fatal_error
 
     def _terminate_request(self, request: LlmRequest) -> None:
+        self._check_dkv_free_window(request)
         connector = getattr(self, "kv_connector_manager", None)
         if connector is not None:
             connector.release_unstarted_prefix_loads(request)
@@ -8244,7 +8840,11 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
+        self._check_dkv_free_window(request)
         self.resource_manager.free_resources(request)
+        if (getattr(self, "dkv_enabled", False) is True and not request.is_dummy
+                and self._dkv_invariant_checker.enabled):
+            self._dkv_freed_request_ids.append(request.py_request_id)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
 
@@ -8289,6 +8889,8 @@ class PyExecutor:
                 or request.state
                 == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
             return True
+        if getattr(self, "dkv_enabled", False) is True:
+            return False
         return (self.kv_cache_transceiver is not None
                 and self.kv_cache_transceiver.has_inflight_transfer(request))
 
@@ -8298,6 +8900,13 @@ class PyExecutor:
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
+        if getattr(self, "dkv_enabled", False) is True:
+            in_transfer = (
+                request.py_request_id
+                in self.async_transfer_manager.requests_in_transfer())
+            return not (request.is_context_only_request and
+                        (in_transfer
+                         or self._is_request_in_transmission(request)))
         connector = getattr(self, "kv_connector_manager", None)
         if connector is not None:
             connector.release_unstarted_prefix_loads(request)
@@ -8335,7 +8944,15 @@ class PyExecutor:
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
         still_pending_canceled_ids = []
-        for request in self.active_requests:
+        candidates = self.active_requests
+        if getattr(self, "dkv_enabled", False) is True:
+            active_ids = {request.py_request_id for request in candidates}
+            transfers = self.async_transfer_manager.requests_in_transfer()
+            candidates = candidates + [
+                transfers[request_id] for request_id in sorted(transfers)
+                if request_id not in active_ids
+            ]
+        for request in candidates:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
                 continue
@@ -8494,7 +9111,9 @@ class PyExecutor:
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
+        dkv_enabled = getattr(self, "dkv_enabled", False) is True
         new_responses = []
+        published_context_requests = []
         requests_to_terminate = []
         # Requests terminated by the coordinator's context reap (DISAGG_CONTEXT_COMPLETE);
         # included in the return value for stats but not re-terminated here.
@@ -8516,7 +9135,7 @@ class PyExecutor:
                 continue
 
             # Check if a generation request needs cleanup due to KV cache transfer timeout.
-            if request.py_kv_transfer_timed_out:
+            if request.py_kv_transfer_timed_out and not dkv_enabled:
                 if self.disagg.inflight_cancel_active():
                     if (request.is_disagg_generation_transmission_in_progress
                             or request.state
@@ -8555,55 +9174,66 @@ class PyExecutor:
                     new_active_requests.append(request)
                     continue
 
-            request.draft_tokens = request.py_draft_tokens or []
-            request.decoding_iter = request.py_decoding_iter
+            dkv_replica = dkv_enabled and not request.py_dkv_is_local
+            request_done = request.is_finished if dkv_enabled else False
+            if not dkv_replica:
+                request.draft_tokens = request.py_draft_tokens or []
+                request.decoding_iter = request.py_decoding_iter
 
-            self.perf_manager.append_step_metrics(
-                request, self.iter_counter, batch_token_time=batch_token_time)
+                self.perf_manager.append_step_metrics(
+                    request,
+                    self.iter_counter,
+                    batch_token_time=batch_token_time)
 
-            # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
-            # independently of whether append_step_metrics early-returned.
-            # This is critical for E2E latency computation in tracing/Prometheus.
-            if request.return_perf_metrics and request.py_decoding_iter >= 1:
-                request.update_perf_metrics(self.iter_counter)
+                # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
+                # independently of whether append_step_metrics early-returned.
+                # This is critical for E2E latency computation in tracing/Prometheus.
+                if request.return_perf_metrics and request.py_decoding_iter >= 1:
+                    request.update_perf_metrics(self.iter_counter)
 
-            request_done = False
-            if request.is_finished:
-                # Guard the engine lookup -- minimal executors (unit tests)
-                # may have no engine.
-                route_capture = getattr(getattr(self, "model_engine", None),
-                                        "route_capture", None)
-                if route_capture is not None:
-                    route_capture.attach_routes(request)  # R3: append routes
-            should_emit = (request.py_decoding_iter == 1 or request.is_finished
-                           or request.py_decoding_iter % self.stream_interval
-                           == 0)
-            # The early-emit prototype issues the (non-terminal) iter-1
-            # response from `_emit_first_token_responses`; suppress it here.
-            if (not emit_first_iter and request.py_decoding_iter == 1
-                    and not request.is_finished):
-                should_emit = False
-            if should_emit:
-                if request.return_perf_metrics:
-                    # Response creation may finalize and copy scalar ctx GPU totals.
-                    self.perf_manager.compute_batch_gpu_times(
-                        [request], gpu_times_cache=gpu_times_cache)
-                response = request.create_response(False, self.dist.rank)
-                if response:
-                    request_done = request.is_finished
-                    response.result.cached_tokens = request.cached_tokens
-                    self._maybe_attach_ctx_usage(request, response)
-                    response.result.per_pos_drafted = request.py_per_pos_drafted
-                    response.result.per_pos_accepted = request.py_per_pos_accepted
-                    if request.py_total_draft_tokens > 0:
-                        # Backfills RequestPerfMetrics.speculative_decoding on
-                        # the client side; the C++ section is only populated
-                        # by updateNumTokensPerIteration, which the PyTorch
-                        # flow never calls.
-                        response.result.spec_dec_totals = (
-                            request.py_total_accepted_draft_tokens,
-                            request.py_total_draft_tokens)
-                    new_responses.append((req_id, response))
+                if request.is_finished:
+                    # Guard the engine lookup -- minimal executors (unit tests)
+                    # may have no engine.
+                    route_capture = getattr(getattr(self, "model_engine", None),
+                                            "route_capture", None)
+                    if route_capture is not None:
+                        route_capture.attach_routes(
+                            request)  # R3: append routes
+                should_emit = (request.py_decoding_iter == 1
+                               or request.is_finished
+                               or request.py_decoding_iter %
+                               self.stream_interval == 0)
+                # The early-emit prototype issues the (non-terminal) iter-1
+                # response from `_emit_first_token_responses`; suppress it here.
+                if (not emit_first_iter and request.py_decoding_iter == 1
+                        and not request.is_finished):
+                    should_emit = False
+                if (dkv_enabled and request.is_context_only_request
+                        and self.disagg.dkv_context_send_failed(request)):
+                    should_emit = False
+                if should_emit:
+                    if request.return_perf_metrics:
+                        # Response creation may finalize and copy scalar ctx GPU totals.
+                        self.perf_manager.compute_batch_gpu_times(
+                            [request], gpu_times_cache=gpu_times_cache)
+                    response = request.create_response(False, self.dist.rank)
+                    if response:
+                        request_done = request.is_finished
+                        response.result.cached_tokens = request.cached_tokens
+                        self._maybe_attach_ctx_usage(request, response)
+                        response.result.per_pos_drafted = request.py_per_pos_drafted
+                        response.result.per_pos_accepted = request.py_per_pos_accepted
+                        if request.py_total_draft_tokens > 0:
+                            # Backfills RequestPerfMetrics.speculative_decoding on
+                            # the client side; the C++ section is only populated
+                            # by updateNumTokensPerIteration, which the PyTorch
+                            # flow never calls.
+                            response.result.spec_dec_totals = (
+                                request.py_total_accepted_draft_tokens,
+                                request.py_total_draft_tokens)
+                        new_responses.append((req_id, response))
+                        if dkv_enabled and request.is_context_only_request:
+                            published_context_requests.append(request)
 
             if request_done:
                 # PP=1-only early termination; the coordinator's release_transfer
@@ -8625,12 +9255,16 @@ class PyExecutor:
         self.active_requests.extend(new_active_requests)
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
         self._enqueue_responses(new_responses)
-        for request in requests_to_terminate:
-            self._terminate_request(request)
+        for request in published_context_requests:
+            request.py_dkv_context_response_sent = True
+        with self._dkv_commit_window("responses"):
+            for request in requests_to_terminate:
+                self._terminate_request(request)
         # Under multi-rank ADP the coordinator defers the error response to
         # its synced drain; an in-place tp_allgather here would desync
         # (reached from per-rank-divergent gates).
-        self.disagg.fail_timed_out(timed_out_requests)
+        if not dkv_enabled:
+            self.disagg.fail_timed_out(timed_out_requests)
         return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,

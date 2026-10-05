@@ -989,15 +989,15 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
-        max_context_tokens = (
-            self._max_num_tokens if self._max_num_tokens is not None else max_tokens
-        )
+        max_context_tokens = self._get_context_token_capacity(self._max_num_tokens)
+        if max_context_tokens is None:
+            max_context_tokens = max_tokens
         context_tokens = min(max_tokens, max_context_tokens)
         generation_tokens = max_tokens - context_tokens
         generation_quota = (
             max_tokens * non_sliding_attn_size_per_token
             + generation_tokens * generation_swa_size_per_token
-            + self.max_batch_size * generation_swa_size_per_request
+            + self._get_generation_request_capacity() * generation_swa_size_per_request
         )
         context_extra_quota = context_tokens * context_swa_size_per_token
         padding = self._get_extra_quota_padding()
@@ -1044,21 +1044,24 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         padding = self._get_extra_quota_padding()
-        size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
+        size_per_batch = (
+            self._get_generation_request_capacity() * generation_swa_size_per_request + padding
+        )
         if quota < size_per_batch:
             return 0
         context_size_per_token = non_sliding_attn_size_per_token + context_swa_size_per_token
         if self._max_num_tokens is None:
             return (quota - size_per_batch) / context_size_per_token
 
-        context_limit_quota = self._max_num_tokens * context_size_per_token + size_per_batch
+        context_token_capacity = self._get_context_token_capacity(self._max_num_tokens)
+        context_limit_quota = context_token_capacity * context_size_per_token + size_per_batch
         if quota <= context_limit_quota:
             return (quota - size_per_batch) / context_size_per_token
 
         generation_size_per_token = non_sliding_attn_size_per_token + generation_swa_size_per_token
         if generation_size_per_token <= 0:
             return float("inf")
-        return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
+        return context_token_capacity + (quota - context_limit_quota) / generation_size_per_token
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
@@ -2027,9 +2030,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=use_fp8_ds_mla,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        dkv_group_size = kwargs.get("dkv_group_size") or 1
         return (
             non_sliding_attn_size_per_token + swa_size_per_token,
-            swa_size_per_request * max_batch_size,
+            swa_size_per_request * max_batch_size * dkv_group_size,
         )
 
     def _iter_guard_candidate_buffers(
@@ -2055,6 +2059,39 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             if buffer is None:
                 continue
             yield layer, attn, buffer
+
+    def _iter_fresh_page_fill_targets(
+        self, request_id: int, pool_id: int, base_pages: list[int], fresh_ordinals: list[int]
+    ) -> Iterable[tuple[torch.Tensor, list[int]]]:
+        """Resolve every V4 data/scale role with its attention page-index convention."""
+        kv_cache = self.kv_cache_map[request_id]
+        scratch = kv_cache.get_scratch_desc(pool_id)
+        buffers_handled = set()
+        for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
+            if self.layer_to_pool_mapping_dict[layer_id] != pool_id:
+                continue
+            targets = [(attn.role, self.get_buffers(layer, attn), _get_index_mode(attn))]
+            if self._use_nvfp4_compress and attn == DeepseekV4AttentionType.COMPRESS:
+                targets.append(
+                    (
+                        COMPRESS_BLOCK_SCALE_ROLE,
+                        self.get_compress_scale_buffers(layer),
+                        PageIndexMode.SHARED,
+                    )
+                )
+            for role, buffer, index_mode in targets:
+                key = (layer_id, role)
+                if key in buffers_handled:
+                    continue
+                buffers_handled.add(key)
+                converter = self.impl.get_page_index_converter(layer_id, role)
+                converted = converter(base_pages, index_mode, scratch)
+                pages = [
+                    converted[ordinal * converter.expansion + offset]
+                    for ordinal in fresh_ordinals
+                    for offset in range(converter.expansion)
+                ]
+                yield buffer, pages
 
     def _resolve_guard_candidate(
         self, candidate: Tuple[int, DeepseekV4AttentionType, torch.Tensor]

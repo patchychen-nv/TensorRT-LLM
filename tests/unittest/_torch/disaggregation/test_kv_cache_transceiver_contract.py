@@ -102,6 +102,59 @@ def test_v2_early_return_paths_are_typed() -> None:
     assert gen_status == GenTransferStatus([], [], [])
 
 
+@pytest.mark.parametrize("ever_sent", [False, True])
+def test_v2_attention_dp_context_poll_has_no_inner_collective(ever_sent) -> None:
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+    from tensorrt_llm.mapping import Mapping
+
+    v2 = object.__new__(KvCacheTransceiverV2)
+    v2._mapping = Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True)
+    v2._dist = Mock(tp_size=2)
+    for name in ("tp_allgather", "pp_allgather", "allgather"):
+        getattr(v2._dist, name).side_effect = AssertionError("Unexpected context collective")
+    v2._init_sync_policy()
+    assert v2._ctx_need_tp_sync is False
+    assert v2._ctx_need_pp_sync is False
+    v2._ever_had_send_session = ever_sent
+    v2._send_sessions = {}
+    v2._send_reqs = {}
+    v2._transfer_worker = Mock()
+
+    for _ in range(3):
+        assert v2.check_context_transfer_status(0) == CtxTransferStatus([], [])
+
+
+def test_v2_attention_dp_completion_does_not_wait_for_nonowner_session() -> None:
+    from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+    from tensorrt_llm.mapping import Mapping
+
+    v2 = object.__new__(KvCacheTransceiverV2)
+    v2._mapping = Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True)
+    v2._dist = Mock(tp_size=2)
+    for name in ("tp_allgather", "pp_allgather", "allgather"):
+        getattr(v2._dist, name).side_effect = AssertionError("Unexpected context collective")
+    v2._init_sync_policy()
+    v2._ever_had_send_session = True
+    v2._fp4_mla_bridge_enabled = False
+    session = Mock(
+        status=SessionStatus.TRANSFERRED,
+        is_completed=Mock(return_value=True),
+        wait_complete=Mock(return_value=WaitResult.COMPLETED),
+        has_transferring_tasks=Mock(return_value=False),
+        _enforce_physical_ownership=False,
+    )
+    request = SimpleNamespace(py_kv_send_session_retired=False)
+    v2._send_sessions = {7: session}
+    v2._send_reqs = {7: request}
+    v2._transfer_worker = Mock()
+
+    assert v2.check_context_transfer_status(0) == CtxTransferStatus([7], [])
+    assert not v2._send_sessions
+    assert request.py_kv_send_session_retired
+    session.close.assert_called_once()
+
+
 def test_send_lifecycle_reports_typed_completion() -> None:
     fake = FakeKvCacheTransceiver()
     req = _req(1)

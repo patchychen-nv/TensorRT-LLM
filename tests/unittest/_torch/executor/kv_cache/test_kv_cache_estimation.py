@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
+    DkvConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     MultimodalConfig,
@@ -359,7 +360,7 @@ def _make_creator(
 
     c._mapping = Mock(enable_attention_dp=enable_attention_dp, tp_size=tp_size, cp_config={})
 
-    c._llm_args = Mock(disable_overlap_scheduler=True)
+    c._llm_args = Mock(disable_overlap_scheduler=True, dkv_config=None)
 
     pretrained = SimpleNamespace(
         layer_types=layer_types,
@@ -432,6 +433,20 @@ def test_adp_reduces_blocks_to_per_rank_share():
     )
 
     assert adp._get_token_num_for_estimation() == baseline._get_token_num_for_estimation()
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_dkv_estimation_keeps_global_blocks(tp_size: int) -> None:
+    creator = _make_creator(
+        64,
+        [SimpleNamespace(input_token_ids=list(range(128))) for _ in range(tp_size)],
+        enable_attention_dp=True,
+        tp_size=tp_size,
+    )
+    creator._dkv_group_size = tp_size
+    creator._llm_args = SimpleNamespace(disable_overlap_scheduler=True, dkv_config=DkvConfig())
+
+    assert creator._get_token_num_for_estimation() == tp_size * 3 * 64
 
 
 def test_without_adp_all_blocks_counted():
@@ -1174,7 +1189,11 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     # A bare Mock would auto-create the attribute; real engines set it to
     # None unless the model opted into MM item scheduling.
     model_engine.mm_encoder_output_budget_bytes = None
-    llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=chunked_prefill)
+    llm_args = Mock(
+        cache_transceiver_config=None,
+        enable_chunked_prefill=chunked_prefill,
+        dkv_config=None,
+    )
 
     with patch.object(
         KvCacheCreator,

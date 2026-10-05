@@ -289,6 +289,19 @@ class TestStatsSerializer:
         assert d["schedulerMode"] == "overlap"
         assert d["gpuForwardTimeMS"] == 4.25
 
+    def test_serializer_emits_dkv_measurement_only_when_present(self):
+        """Slot 8 carries the rank's replicated-KV experiment counters."""
+        iter_stats = _make_mock_iteration_stats()
+        snapshot = {"rank": 1, "counters": {"request_count": 3}}
+        base = (iter_stats, None, None, 1, 12.5, None, "non_overlap", 4.25)
+
+        with_counters = json.loads(BaseWorker._stats_serializer((*base, snapshot)))
+        assert with_counters["dkvMeasurement"] == snapshot
+        assert with_counters["attentionDpRank"] == 1
+
+        for shape in (base, (*base, None)):
+            assert "dkvMeasurement" not in json.loads(BaseWorker._stats_serializer(shape))
+
     def test_serializer_with_v2_pool_group_stats(self):
         """KV cache manager V2 stats should include pool group breakdown."""
         iter_stats = _make_mock_iteration_stats()

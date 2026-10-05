@@ -40,7 +40,7 @@ from tensorrt_llm.metrics.enums import MetricNames
 from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
@@ -56,6 +56,7 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
+from ._dkv import _validate_dkv_request
 from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
@@ -818,6 +819,28 @@ class BaseLLM:
         if is_ctx_only:
             sampling_params.max_tokens = 1
             self._configure_bart_decoder_prefix(sampling_params)
+
+        if getattr(self.args, "dkv_config", None) is not None:
+            if isinstance(inputs, PreprocessedInputs):
+                has_multimodal_input = inputs.multimodal_params is not None
+            else:
+                has_multimodal_input = (isinstance(inputs, dict) and bool(
+                    inputs.get("multi_modal_data")))
+            if disaggregated_params is not None:
+                has_multimodal_input |= (
+                    disaggregated_params.multimodal_embedding_handles
+                    is not None or
+                    disaggregated_params.mrope_position_ids_handle is not None)
+            _validate_dkv_request(
+                max_tokens=sampling_params.max_tokens,
+                is_generation_only=is_gen_only,
+                n=sampling_params.n,
+                best_of=sampling_params.best_of,
+                has_multimodal_input=has_multimodal_input,
+                is_generation_first=(disaggregated_params is not None
+                                     and disaggregated_params.schedule_style
+                                     == DisaggScheduleStyle.GENERATION_FIRST),
+            )
 
         if isinstance(inputs, PreprocessedInputs):
             prompt_token_ids = inputs.prompt_token_ids

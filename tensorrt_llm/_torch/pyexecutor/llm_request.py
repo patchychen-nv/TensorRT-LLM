@@ -996,6 +996,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # (not computed) rather than forwarded on every rank.
         self.py_dkv_compute_rank = None
         self.py_dkv_is_local = False
+        # Only the compute rank records publication; this must not gate KV lifetime.
+        self.py_dkv_context_response_sent = False
+        self.py_dkv_measurement_prepared = False
         self.py_draft_logits = None
         self.py_target_probs = None
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS

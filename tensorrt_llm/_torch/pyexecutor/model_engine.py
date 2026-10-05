@@ -549,6 +549,7 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size,
             llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self._enable_overlap_headroom,
+            dkv_enabled=llm_args.dkv_config is not None,
         )
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
