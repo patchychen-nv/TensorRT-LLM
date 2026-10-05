@@ -644,6 +644,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     report.add_argument("directories", nargs="+")
     summary = commands.add_parser("summary", help="a column per label: LABEL=DIR[,DIR...]")
     summary.add_argument("groups", nargs="+")
+    capacity = commands.add_parser("capacity", help="pages, hits and evictions: LABEL=DIR[,DIR...]")
+    capacity.add_argument("groups", nargs="+")
     check = commands.add_parser("check", help="list the runs and flag the incomplete ones")
     check.add_argument("directories", nargs="+")
     args = parser.parse_args(argv)
@@ -680,6 +682,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "summary":
         print(tables.seed_summary(_parse_groups(args.groups)))
+        return 0
+    if args.command == "capacity":
+        print(tables.capacity_table(_parse_groups(args.groups)))
         return 0
     lines = tables.check_runs(tables.load_results(Path(path) for path in args.directories))
     print("\n".join(lines))

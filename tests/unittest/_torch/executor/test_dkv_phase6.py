@@ -223,6 +223,28 @@ def _report(
         },
         "validity": {"invalid_reasons": reasons or []},
         "capacity_comparison": None,
+        "capacity_by_rank": [
+            {
+                "pools_by_level": [
+                    [
+                        {
+                            "slot_sizes": [8],
+                            "total": 100,
+                            "free": 90,
+                            "evictable": 6,
+                            "available": 96,
+                        },
+                        {
+                            "slot_sizes": [64],
+                            "total": 20,
+                            "free": 10,
+                            "evictable": 6,
+                            "available": 16,
+                        },
+                    ]
+                ]
+            }
+        ],
     }
 
 
@@ -302,6 +324,23 @@ def test_the_seed_summary_has_a_column_per_label() -> None:
     assert "requests per rank, max / min" in text
 
 
+def test_the_capacity_table_lists_pages_hits_and_the_equal_capacity_verdict() -> None:
+    adp = _result("adp", hit=0.2, matched=18, drops=7)
+    dkv = _result("dkv", hit=0.45, matched=45, drops=11)
+    dkv["options"]["kv_quota_gib"] = 4.0
+    dkv["report"]["capacity_comparison"] = {
+        "equal_usable_capacity": True,
+        "tolerance_pages": 8,
+        "pools": [{"usable_gap_pages": -6}, {"usable_gap_pages": 2}],
+    }
+    text = _TABLES.capacity_table({"equal capacity": [adp, dkv]})
+    assert "| equal capacity | adp | n/a | 100 / 20 | 0.200 | 0.200 | 7 | 1.00 |" in text
+    assert "| equal capacity | dkv | 4.000 | 100 / 20 | 0.450 | 0.500 | 11 | 1.00 |" in text
+    assert "True (gaps [-6, 2], tolerance 8)" in text
+    plain = _TABLES.capacity_table({"a": [_result("adp")], "b": [_result("dkv")]})
+    assert plain.count("\n| ") >= 3 and "| - |" in plain
+
+
 @pytest.mark.parametrize(
     ("report", "problem"),
     [
@@ -329,6 +368,8 @@ def test_the_report_commands_read_a_results_directory(tmp_path: Path, capfd) -> 
     assert "| dkv | yes |" in capfd.readouterr().out
     assert _RUNNER.main(["check", str(tmp_path)]) == 0
     assert _RUNNER.main(["summary", f"a={tmp_path}", f"b={tmp_path}"]) == 0
+    assert _RUNNER.main(["capacity", f"a={tmp_path}"]) == 0
+    assert "| a | dkv |" in capfd.readouterr().out
     broken = _result("dkv")
     broken["report"] = _report(requests=1)
     (tmp_path / "dkv" / "result.json").write_text(json.dumps(broken))
