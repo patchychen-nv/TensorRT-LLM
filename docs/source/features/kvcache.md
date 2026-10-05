@@ -603,26 +603,35 @@ still had to be computed, the load of every rank and the logical duplicate stora
 with the validity controls above. The `chat` workload is conversations whose every
 turn re-sends the whole history; `zipf` is requests that share one of a few
 prefixes, and `--prime` sends every prefix alone once first. A report also states
-the hit ceiling of a cache that keeps everything and that every rank can read, which
-DKV reaches whenever nothing is evicted.
+the hit ceiling of a cache that keeps everything and that every rank can read. DKV
+reaches it exactly for conversations and primed prefixes when nothing is evicted; for
+an unprimed prefix it is an upper bound.
 
 ```bash
 python tests/integration/defs/dkv/dkv_phase6_runner.py run --group 2 \
   --model "$LLM_MODELS_ROOT/llama-models-v2/TinyLlama-1.1B-Chat-v1.0" \
-  --tokens-per-block 32 --workload chat --modes adp,adp_kv:1,dkv \
-  --out "/scratch/$USER/dkv-phase6"
+  --tokens-per-block 32 --workload chat --first-tokens 256,512 --turn-tokens 32,64 \
+  --warmup-tokens 256 --max-seq-len 1024 --max-num-tokens 1024 --concurrency 8 --warmup 4 \
+  --modes adp,adp_kv:1,dkv --out "/scratch/$USER/dkv-phase6"
 python tests/integration/defs/dkv/dkv_phase6_runner.py report "/scratch/$USER/dkv-phase6"
 ```
+
+The longest prompt, a warm-up prompt included, must fit `--max-seq-len`,
+`--max-num-tokens` and the context window of the model; the runner checks this
+before it loads the model.
 
 `run` starts one process per mode on one node. A group that spans nodes starts
 `worker` on every task of the job behind `trtllm-llmapi-launch`, once per mode. A
 run's capacity is `--kv-max-tokens` or, with `--kv-quota-gib`, a byte quota per
-rank. For an equal-capacity comparison with evictions, pass the `result.json` of the
-`adp` run to the DKV run as `--adp-reference`; its report then states whether the
-usable pages of one replica match those of all ADP ranks together, and
-`--capacity-tolerance-pages` declares a gap that is accepted. `summary` puts runs
-of one workload side by side and `check` lists every run and flags the incomplete
-ones.
+rank. For an equal-capacity comparison with evictions, give each ADP mode a quota of
+the DKV quota divided by the group size and pass the `result.json` of the `adp` run
+to the DKV run as `--adp-reference`; its report then states whether the usable pages
+of one replica match those of all ADP ranks together, and
+`--capacity-tolerance-pages` declares a gap that is accepted. The `capacity` command
+lists the pages, hit rates and evictions of such runs side by side; evictions are
+counted per replica under DKV, where every rank drops the same pages, and summed over
+the ranks under ADP. `summary` puts runs of one workload side by side and `check`
+lists every run and flags the incomplete ones.
 
 DeepSeek-V4 reuses a prefix only where a stored sequence ended. A shared prefix
 followed by a different suffix never hits, whereas the history of a conversation

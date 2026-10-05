@@ -44,9 +44,26 @@ def gate_label(report: Mapping) -> str:
     reasons = report["validity"]["invalid_reasons"]
     if not reasons:
         return "yes"
-    if reasons == REMOVALS_ONLY and report["storage"].get("last_tier_capacity_dropped_pages") == 0:
+    if reasons == REMOVALS_ONLY and _drops(report["storage"]) == 0:
         return "NO (removals only, no capacity drops)"
     return "NO"
+
+
+def _drops(storage: Mapping) -> int | None:
+    """Pages dropped for lack of capacity: per replica under DKV, summed over the ranks under ADP.
+
+    Replicas drop the same pages on every rank, so the sum over the ranks of a DKV run counts every
+    page as many times as there are ranks; the logical count is the one to set beside ADP's. It is
+    unknown (``None``) when the ranks of a DKV run disagree. A report without a logical count
+    predates it, and its physical count is all there is.
+    """
+    if "last_tier_capacity_dropped_pages_logical" in storage:
+        return storage["last_tier_capacity_dropped_pages_logical"]
+    return storage.get("last_tier_capacity_dropped_pages")
+
+
+def _phase_number(name: str) -> int:
+    return int(name.removeprefix("phase"))
 
 
 def _number(value: float | int | None, digits: int = 3) -> str:
@@ -106,7 +123,7 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
         if adp is not None and "global" in adp["report"]
         else None
     )
-    phases = sorted(results[0]["phases"])
+    phases = sorted({p for result in results for p in result["phases"]}, key=_phase_number)
     lines = [_workload_line(results[0]["options"]), ""]
     ceiling = results[0]["workload"].get("hit_ceiling_tokens")
     eligible = results[0]["client"].get("eligible_tokens")
@@ -116,12 +133,25 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
             f"matched tokens, {ceiling / eligible:.3f} of the eligible tokens.",
             "",
         ]
+    head = [
+        "mode",
+        "valid",
+        "token hit rate",
+        *[f"hit {p}" for p in phases],
+        "request hit rate",
+        "matched tokens",
+        "scheduled ctx tokens",
+        "ctx saved vs adp",
+        "client cached/eligible",
+    ]
     rows = []
     for result in results:
         report = result["report"]
         name = result["mode"]["name"]
         if "global" not in report:
-            rows.append([name, f"report error: {report.get('report_error')}"])
+            rows.append(
+                [name, f"report error: {report.get('report_error')}"] + ["-"] * (len(head) - 2)
+            )
             continue
         counters = report["global"]
         saved = None
@@ -134,7 +164,11 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
                 _number(counters["token_prefix_hit_rate"]),
                 *[
                     _number(
-                        result["phases"][p]["report"].get("global", {}).get("token_prefix_hit_rate")
+                        result["phases"]
+                        .get(p, {})
+                        .get("report", {})
+                        .get("global", {})
+                        .get("token_prefix_hit_rate")
                     )
                     for p in phases
                 ],
@@ -145,20 +179,7 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
                 _number(result["client"]["cached_over_eligible"]),
             ]
         )
-    lines += _table(
-        [
-            "mode",
-            "valid",
-            "token hit rate",
-            *[f"hit {p}" for p in phases],
-            "request hit rate",
-            "matched tokens",
-            "scheduled ctx tokens",
-            "ctx saved vs adp",
-            "client cached/eligible",
-        ],
-        rows,
-    )
+    lines += _table(head, rows)
     rows = []
     for result in results:
         report = result["report"]
@@ -176,7 +197,7 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
                 _number(load["iterations_measured"]),
                 _number(report["storage"].get("duplicate_storage_ratio")),
                 _number(report["storage"].get("removed_block_copies")),
-                _number(report["storage"].get("last_tier_capacity_dropped_pages")),
+                _number(_drops(report["storage"])),
             ]
         )
     lines += _table(
@@ -189,8 +210,8 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
             "per-iteration imbalance",
             "iterations",
             "duplicate storage ratio",
-            "removed block copies",
-            "capacity-dropped pages",
+            "removed block copies (summed over ranks)",
+            "capacity-dropped pages (per replica under DKV)",
         ],
         rows,
     )
@@ -271,8 +292,8 @@ _SUMMARY_ROWS: list[tuple[str, Callable[[Mapping], float | int | None], int]] = 
         3,
     ),
     (
-        "capacity-dropped pages (physical eviction)",
-        lambda r: r["storage"].get("last_tier_capacity_dropped_pages"),
+        "capacity-dropped pages (per replica under DKV, summed over the ranks under ADP)",
+        lambda r: _drops(r["storage"]),
         0,
     ),
 ]
@@ -317,11 +338,26 @@ def capacity_table(groups: Mapping[str, Sequence[Mapping]]) -> str:
     comparison reads: the DKV row says whether the usable pages of its replica match the ADP ranks
     together, and by how many pages each pool differs.
     """
+    head = [
+        "label",
+        "mode",
+        "quota GiB per rank",
+        "pages per rank (pools 0 / 1 / 2)",
+        "token hit rate",
+        "share of the ceiling",
+        "capacity-dropped pages (per replica under DKV)",
+        "requests per rank max / min",
+        "CV of ctx tokens",
+        "equal usable capacity",
+    ]
     rows = []
     for label, results in groups.items():
         for result in results:
             report = result["report"]
             if "global" not in report:
+                name = result["mode"]["name"]
+                error = f"report error: {report.get('report_error')}"
+                rows.append([label, name, error] + ["-"] * (len(head) - 3))
                 continue
             counters = report["global"]
             pools = report["capacity_by_rank"][0]["pools_by_level"][0]
@@ -344,29 +380,13 @@ def capacity_table(groups: Mapping[str, Sequence[Mapping]]) -> str:
                     " / ".join(str(pool["total"]) for pool in pools),
                     _number(counters["token_prefix_hit_rate"]),
                     _number(counters["matched_prefix_tokens"] / ceiling if ceiling else None),
-                    _number(report["storage"].get("last_tier_capacity_dropped_pages")),
+                    _number(_drops(report["storage"])),
                     _number(max(by_rank) / max(1, min(by_rank)), 2),
                     _number(_cv(tokens)),
                     verdict,
                 ]
             )
-    return "\n".join(
-        _table(
-            [
-                "label",
-                "mode",
-                "quota GiB per rank",
-                "pages per rank (pools 0 / 1 / 2)",
-                "token hit rate",
-                "share of the ceiling",
-                "capacity-dropped pages",
-                "requests per rank max / min",
-                "CV of ctx tokens",
-                "equal usable capacity",
-            ],
-            rows,
-        )
-    )
+    return "\n".join(_table(head, rows))
 
 
 def check_runs(results: Sequence[Mapping]) -> list[str]:
@@ -396,7 +416,7 @@ def check_runs(results: Sequence[Mapping]) -> list[str]:
             problems.append("client and counter hits differ")
         lines.append(
             f"{name}: requests {counters['request_count']}/{expected} "
-            f"complete={storage['complete']} drops={storage['last_tier_capacity_dropped_pages']} "
+            f"complete={storage['complete']} drops={_drops(storage)} "
             f"removed={storage['removed_block_copies']} matched={counters['matched_prefix_tokens']} "
             f"cached={result['client']['cached_tokens']} gate={gate_label(report)}"
             + (f" INCOMPLETE ({', '.join(problems)})" if problems else "")
