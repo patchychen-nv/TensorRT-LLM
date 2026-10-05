@@ -310,6 +310,65 @@ def seed_summary(groups: Mapping[str, Sequence[Mapping]]) -> str:
     return "\n".join(lines)
 
 
+def capacity_table(groups: Mapping[str, Sequence[Mapping]]) -> str:
+    """The pages, hit rate against the ceiling and evictions of runs under a capacity limit.
+
+    ``groups`` maps a label (a regime, a quota) to the results of its runs. An equal-capacity
+    comparison reads: the DKV row says whether the usable pages of its replica match the ADP ranks
+    together, and by how many pages each pool differs.
+    """
+    rows = []
+    for label, results in groups.items():
+        for result in results:
+            report = result["report"]
+            if "global" not in report:
+                continue
+            counters = report["global"]
+            pools = report["capacity_by_rank"][0]["pools_by_level"][0]
+            ceiling = result["workload"].get("hit_ceiling_tokens")
+            by_rank = report["load"]["request_count_by_rank"]
+            tokens = report["load"]["scheduled_context_tokens_by_rank"]
+            comparison = report.get("capacity_comparison")
+            verdict = "-"
+            if comparison is not None:
+                gaps = [pool["usable_gap_pages"] for pool in comparison["pools"]]
+                verdict = (
+                    f"{comparison['equal_usable_capacity']} (gaps {gaps}, "
+                    f"tolerance {comparison['tolerance_pages']})"
+                )
+            rows.append(
+                [
+                    label,
+                    result["mode"]["name"],
+                    _number(result["options"].get("kv_quota_gib")),
+                    " / ".join(str(pool["total"]) for pool in pools),
+                    _number(counters["token_prefix_hit_rate"]),
+                    _number(counters["matched_prefix_tokens"] / ceiling if ceiling else None),
+                    _number(report["storage"].get("last_tier_capacity_dropped_pages")),
+                    _number(max(by_rank) / max(1, min(by_rank)), 2),
+                    _number(_cv(tokens)),
+                    verdict,
+                ]
+            )
+    return "\n".join(
+        _table(
+            [
+                "label",
+                "mode",
+                "quota GiB per rank",
+                "pages per rank (pools 0 / 1 / 2)",
+                "token hit rate",
+                "share of the ceiling",
+                "capacity-dropped pages",
+                "requests per rank max / min",
+                "CV of ctx tokens",
+                "equal usable capacity",
+            ],
+            rows,
+        )
+    )
+
+
 def check_runs(results: Sequence[Mapping]) -> list[str]:
     """One line per run, ending in ``INCOMPLETE`` when the interval cannot be trusted.
 
