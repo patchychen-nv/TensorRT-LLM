@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # KV Cache System
 
 The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
@@ -370,6 +375,279 @@ subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequen
 receives each retained batch as `[delimiter, topic, seq, payload]`, terminated by a sentinel
 with an empty payload. Only the last ```buffer_steps``` batches are retained, so a replay
 can legitimately start above the requested sequence — that too is a gap.
+
+### Experimental DKV replicated lifecycle
+
+`dkv_config` enables a prototype that replicates KV cache metadata and request
+lifecycles across an attention-DP group. The group size is the tensor-parallel
+size. Each rank allocates storage for every request in the group, including
+requests assigned to another compute rank. Model execution, sampling, sequence
+slots, and request statistics use only the local compute-rank batch. An idle
+rank forwards its resident dummy so all ranks participate in model collectives.
+Only the compute rank constructs a response. A DKV context worker can send its
+computed KV to an ordinary generation worker. Distributed layer ownership and
+KV data movement between DKV replicas are not implemented yet.
+
+Two collectives keep the replicas aligned. **S-sample** is the single all-gather
+after sampling in every iteration that has a batch: each compute rank publishes
+the completion state and finish reasons of its requests (never token values)
+together with a digest of the global batch, so every rank commits the same state
+before KV is committed or released. **S-control** is the all-gather at the top of
+every iteration, idle ones included; it carries the capacity digest, fatal
+errors, pending-response flags, and transfer events.
+
+Use this mode only for development. The tests run the MPI executor proxy with
+`num_postprocess_workers=0`; a two-rank check also answered requests with
+postprocess workers and with the RPC orchestrator. Sampling completion and finish reasons are
+replicated before global KV commit and release. Sampler failures currently
+fail only the affected compute-rank requests after S-sample. Each originating
+rank charges its own error budget; a fatal decision is shared through the next
+S-control exchange before every rank shuts down together. Error responses are
+produced once, by the request's compute rank, and replicas release resources
+at the same commit point. Forward exceptions remain unrecoverable: another
+rank may be blocked in a model collective, so the existing crash handler
+terminates the group.
+
+S-control runs before scheduling on every iteration, including idle iterations.
+It compares the iteration number, active-request count, used index slots, free
+pages in every cache level and pool, and the count and digest of requests in
+transfer even when debug checks are disabled. S-sample likewise rejects a rank
+whose view of the global batch (request IDs, compute ranks, context positions)
+differs. A mismatch raises an error with the per-rank summaries on every rank
+in the same iteration. Pending error responses
+are flushed only when this exchange indicates that at least one rank has work
+or commits a transfer result that requires a response or termination.
+Cancellation uses replicated request state and is processed even when no batch
+can run. Context requests with replicated transfer ownership retain a pending
+cancellation until transfer completion or timeout. Transfer completion, failure,
+and timeout events share this exchange and are committed in request-ID order.
+
+The scheduler uses per-rank token and request budgets by default:
+`TRTLLM_DKV_DUAL_LEDGER=1`. Each compute rank has its own `max_num_tokens` and
+`max_batch_size`, while KV allocation remains global. Exhausting one rank's
+compute budget does not stop admission on other ranks; KV allocation failures
+retain the V2 scheduler's global stop/skip semantics. Setting the internal
+switch to `0` restores a single shared compute budget for diagnostics while
+retaining local execution and response ownership. If an iteration schedules
+nothing while started context requests hold KV pages, every rank releases the
+last started request and restarts its context; the repeat count of one request
+is tracked and a warning is logged each time it doubles, because the KV cache is
+then probably too small for the active context requests.
+
+DKV activates requests in waiting-queue order. Routing assigns compute-rank
+tags without reordering that global list. The default router balances new
+tokens, subtracting prefix matches from incoming prompts and cached tokens
+from active local requests. Prefix probes use the replicated local cache;
+the existing rank-state collective still carries load and iteration statistics.
+
+The initial validation configuration uses at least two ranks, a
+`max_batch_size` of at least two, non-chunked prefill, and one generated token
+per request:
+
+```yaml
+tensor_parallel_size: 2
+enable_attention_dp: true
+disable_overlap_scheduler: true
+enable_chunked_prefill: false
+max_batch_size: 2
+dkv_config:
+  attention_mode: dp
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: false
+  block_reuse_config:
+    policy: per_request
+```
+
+Generation-only requests, `max_tokens` other than one, multiple returned
+sequences, multimodal inputs, and generation-first disaggregation are rejected.
+Context transfer requires the NIXL backend and Python V2 transceiver; `auto`
+resolves to `PYTHON` under DKV. Pipelined transfer and the FP4 MLA ownership
+bridge are unsupported. Pipeline/context parallelism, speculative and guided
+decoding, LoRA, KV connectors, attention-DP balancing and cache-aware routing,
+SWA scratch reuse, pool rebalancing, and disk prefetch are also unsupported.
+The runtime accepts the base V2 manager and the DeepSeek-V4 manager; other V2
+subclasses have additional state that is not covered by this prototype.
+
+**Disaggregated context worker.** Add this configuration on the context worker,
+and configure a generation worker without `dkv_config` using the matching model
+and KV layout:
+
+```yaml
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_transfer_timeout_ms: 60000
+```
+
+Every context rank releases its index slot and enters the transfer lifecycle
+after the last context chunk. Only the compute rank sends KV and observes the
+transport result. The next S-control exchange commits that result on every
+rank, releases the transfer claim, and flushes the owner's response before
+freeing resources. Context polling does not add a transceiver TP collective.
+
+A finite transfer deadline is required. Expiration requests transport
+cancellation, but pages stay pinned until the transport confirms that it no
+longer reads them. A completion reported by the transport wins over a deadline
+that expired in the same poll. A send that still has no terminal result after
+twice the deadline, and any failure while polling send status on a compute rank,
+become a fatal error that S-control delivers to every rank, because the pages
+cannot be released while the fabric may read them. An exception raised only on
+the compute rank while committing a transfer, such as while building the
+response, is not replicated; it ends the rank's event loop and the executor's
+crash handler terminates the group. User cancellation during transfer follows the same shared
+completion path instead of freeing pages locally. A fatal executor error with
+outstanding transfer claims terminates the process group without freeing those
+pages in the request cleanup path; asynchronous transport may still reference
+them. Include the global volume of in-flight transfers in capacity planning.
+
+**Capacity.** For a group of size `G`, admission and index-table capacity cover
+the global request count, with another `G` index slots for resident forward
+dummies. Each rank reserves one additional sequence slot for its local dummy.
+These larger tables consume additional pinned host memory, which is logged
+during initialization. Physical KV memory remains bounded by
+each GPU's memory budget. If one rank can hold `P` blocks, the replicated group
+can hold approximately `P` distinct blocks, compared with up to `G * P` blocks
+in ordinary attention DP. Account for this capacity difference when comparing
+reuse rates; use an equal-capacity baseline or an interval without eviction.
+A host cache tier works under DKV: every replica offloads and onboards the same
+blocks, the capacity digest covers the free pages of every cache level, and a
+prefix that left the GPU pool but stays on the host still hits on the other ranks.
+A host cache that is too small drops the offloaded blocks, so size
+`host_cache_size` for the replicated working set of one rank. State whether
+measurements include host-resident blocks.
+
+The integration tests run groups of two, four and eight ranks. Eight ranks take two
+four-GPU nodes started with `trtllm-llmapi-launch`: ranks started that way do not see
+the environment a test sets, so the tests hand the DKV switches to every worker through
+the LLM's `env_overrides`.
+
+**Reuse and metrics.** Keep reuse disabled for numerical comparisons. Remote
+replicas hold matching KV metadata but do not receive the computed KV tensors;
+a remote prefix hit can therefore read invalid data, and the executor logs a
+warning at startup when reuse is enabled. Reuse-enabled runs are
+limited to metadata and cache-hit experiments, with
+`block_reuse_config.policy=per_request`; a configuration that needs correct
+outputs should set `kv_cache_config.enable_block_reuse=false` instead. Per-rank request and token statistics
+count only local real requests and exclude dummies. Replicated KV statistics
+must be read from one rank, even when `TLLM_METRICS_ALL_RANKS` is enabled.
+Stored-block events are likewise replicated; consumers should select one
+`attention_dp_rank` when counting logical cache insertions. In a closed-loop run
+with one client, ordinary attention DP can place every request on the same rank
+and then reaches the same hit rate; the replicated metadata matters when the
+requests of one prefix are served by different ranks, so compare the modes with
+requests pinned across ranks or under concurrent load.
+
+Numerical gates run sequential, rank-pinned requests with reuse disabled and
+compare complete generation logits. The prompt set is 14 real texts of different
+lengths spread over the ranks of the group, including four sentences with known answers; a
+control that cannot answer them, or prompts whose distributions are not far
+apart relative to the model's run-to-run noise, fail the gate because they could
+not tell a request that read another request's KV from a correct one. They
+repeat ordinary ADP first. For a model whose ADP runs reproduce, identical ADP
+logits require identical DKV logits; otherwise both controls and DKV must
+produce the same tokens and satisfy the fixed logits tolerance. A model whose ADP
+runs do not reproduce (DeepSeek-V4 today) is judged against its own noise: tokens
+must agree wherever the top-two logit margin is at least 0.5, and the
+total-variation distance of the softmax distributions between DKV and ADP may
+exceed the ADP run-to-run distance by at most 0.02 on average and 0.25 for any
+prompt. A continuation of several tokens is compared up to the first position
+where the three runs choose different tokens, and such a flip is accepted only
+where the top-two margin is inside the noise. The shared test policy also
+rejects missing requests, nonfinite logits, and inconsistent tensor shapes.
+For a reuse-enabled numerical experiment, partial-block reuse must be disabled
+and the complete prompt history must have no shared prefix as long as one KV
+block, including repeated requests.
+
+The disaggregated context-transfer test applies the same policy to a DKV context
+worker that sends its KV to an ordinary generation worker: the eight tokens that
+generation produces must match those it produces after an ordinary ADP context
+worker, on the same prompt set. Its timeouts, a cancellation race and the two
+requests that follow them run in the same job.
+
+DKV supports prefill only, so the aggregate gate never reads back the KV it stores:
+only the transfer gate can see a request whose KV is wrong. A mutation test keeps that
+gate honest. The sender of the context worker overwrites the transferred KV of one
+prompt, with zeros or with the KV of the previous request, before the transport reads
+it, and the gate must reject the run. The requests that break the policy on their own
+must then be that prompt and no other.
+
+The V2 event tests separately check a request pinned to rank 0: ordinary ADP
+stores it only on rank 0, while DKV emits matching stored-block hashes on both
+ranks, grouped by layer group. A second test serves more distinct prompts than the
+cache keeps: the DKV replicas then emit the same stored and removed events with the
+same event IDs, every removed block was stored before, and the stored prompt blocks
+of one replica equal the union over the ranks of ordinary ADP. Matching event hashes
+establish replicated prefix metadata and lifecycle, not equality of the KV tensors.
+
+**Measurement experiments.** The internal `TRTLLM_DKV_MEASUREMENT=1` observer
+records owner-local preparation, reuse, allocation failures, and scheduled
+context tokens. It is opt-in for both DKV and its ordinary ADP control, without
+adding public configuration or telemetry fields. Each rank's own manager
+counters are exported as `dkvMeasurement` on the iteration-stats row of that
+rank, read with `llm.get_stats()` (the rows of a rank that had no work in an
+iteration carry its latest counters); they ride on the attention-DP stats
+payload that is already gathered every iteration, so no collective is added.
+They are not the rank-0 KV statistics copied into ordinary ADP's per-rank
+iteration rows.
+
+Run the two-rank experiment in the GPU test environment, with outputs outside
+the source checkout:
+
+```bash
+python tests/integration/defs/dkv/dkv_measurement_runner.py \
+  --model "$LLM_MODELS_ROOT/llama-models-v2/TinyLlama-1.1B-Chat-v1.0" \
+  --work-dir "/scratch/$USER/dkv-measurements"
+```
+
+The runner compares cold, cross-rank, and local prefix reuse, then exceeds the
+cache capacity to check that polluted intervals are rejected. Reports (schema
+version 2) include per-rank and global matched-prefix lengths and hit rates, the
+cross-rank load imbalance inside each iteration averaged over the interval (and
+the variance of the interval totals, which can hide a persistent imbalance),
+prepare/resize failure attempts, actual pool capacities, and logical
+resident-block duplication. Request counters count each compute owner once;
+physical storage counters remain per rank, and removals and dropped pages are
+also given per replica (one rank's value under DKV when all ranks agree, the
+rank sum under ADP). Duplicate storage is a logical
+block ratio, not a byte ratio or proof of valid replicated KV data. The hit rate
+covers every cache tier listed in the report; no per-tier split is measured, so
+state whether a host tier was configured.
+
+Capacity-drop counts describe direct LRU victims dropped from the last cache
+tier; GPU-to-host offload is reported separately. Removed-block events are an
+additional conservative signal and are not substituted for physical drop
+counts. An accepted no-eviction interval requires complete events and statistics,
+fixed capacity, no reuse-state reset, and no failed prepare/resize attempts.
+Missing observations remain unknown and invalidate the measurement. Capacity
+comparisons use each pool's actual page sizes across all tiers and compare the
+usable (free plus evictable) pages of an idle pool, summed over the ADP ranks,
+with one DKV replica, so a replica's resident dummies do not count as capacity.
+The gap is reported per pool and may be allowed a declared tolerance in pages;
+unequal per-rank pool sizes between the modes are flagged.
+
+The runner uses `TRTLLM_KV_FRESH_PAGE_FILL=zero` so remote reuse reads initialized
+pages. Reports explicitly mark timing as perturbed and output correctness as
+unvalidated. These experiments establish metadata visibility and scheduling
+load; they do not measure layer-split throughput or validate generated text.
+
+**Consistency checks.** The checker always rejects inconsistent enable flags and
+inconsistent process-level settings (the dual-ledger switch, `TLLM_METRICS_ALL_RANKS`,
+and the KV manager backend) at construction. Set `TRTLLM_DKV_DEBUG=1` on every
+rank before starting the workers for the per-iteration checks. They compare the
+cache configuration (startup configuration), ordered request/compute-rank
+assignments (global request order), prefix-probe results (prefix probes), and
+scheduled requests, chunk sizes, and ordered KV operations (scheduling
+decisions). At the end of every iteration they also compare the KV fingerprint
+of every cache including the resident dummies, the set of requests in transfer,
+and the progress of every active request, and a mismatch names the first
+differing record of each rank. Debug traces retain KV
+operation order and logical state without requiring physical slot IDs to
+match. Free operations must occur in a replicated commit window; the freed
+request IDs are compared through S-control and checked again at shutdown.
+Invariants are raised as `RuntimeError`, so they also hold under `python -O`.
+The V2 core's additional checks use
+`TLLM_DEBUG_MODE`, which must be set before importing the package.
 
 ### Deprecated Properties
 
