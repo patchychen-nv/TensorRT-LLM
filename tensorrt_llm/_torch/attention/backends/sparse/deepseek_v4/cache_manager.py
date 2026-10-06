@@ -668,6 +668,29 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return None
         return base_window_size + self._max_draft_len
 
+    def get_layer_life_cycle_keys(self) -> List[frozenset[Tuple[int | None, int, bool]]]:
+        """For every model layer, the semantic life cycles its KV lives in.
+
+        A key is ``(window size or None, sink blocks, sparse history)``, derived from the window
+        sizes the V2 layer configs use. Ranks that own different layers number their life cycles
+        differently, so layer ownership is validated against these keys.
+        """
+        keys = []
+        for layer_idx in range(self.num_layers):
+            compress_ratio = self._compress_ratios[layer_idx]
+            layer_keys = set()
+            for attn_type in DeepseekV4AttentionType:
+                if not compress_ratio_has_attention(compress_ratio, attn_type):
+                    continue
+                is_sparse = (
+                    self._enable_kv_cache_offload
+                    and attn_type == DeepseekV4AttentionType.COMPRESS
+                    and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
+                )
+                layer_keys.add((self._get_window_size(compress_ratio, attn_type), 0, is_sparse))
+            keys.append(frozenset(layer_keys))
+        return keys
+
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
         # Tensors for compatibility with AttentionOp, only contains swa attention.
         # SWA uses per-layer page indices, so each SWA layer has a virtual

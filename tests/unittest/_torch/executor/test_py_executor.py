@@ -3316,3 +3316,124 @@ class TestDkvRuntimeValidation:
         with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning:
             executor._validate_dkv_runtime()
         assert "expert parallel size" in warning.call_args.args[0]
+
+    # ---- the layer-split layout -------------------------------------------------------------
+
+    _SM = "tensorrt_llm._torch.pyexecutor.py_executor.get_sm_version"
+
+    @staticmethod
+    def _make_layer_split_executor(manager_type=None, *, tp_size=4, world_size=None, comm=None):
+        """An executor on DeepSeek-V4-Pro's layer layout (43 layers: 2 SWA-only, then CSA and HCA
+        alternating), whose model holds ``comm`` as the communication of one MoE layer."""
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+            DeepseekV4CacheManager,
+        )
+
+        executor = TestDkvRuntimeValidation._make_executor(manager_type or DeepseekV4CacheManager)
+        manager = executor.kv_cache_manager
+        manager.num_layers = 43
+        manager._compress_ratios = [1, 1] + [4 if layer % 2 == 0 else 128 for layer in range(41)]
+        manager._swa_window_size = 128
+        manager._max_draft_len = 0
+        manager._enable_kv_cache_offload = False
+        executor.dkv_layer_split = True
+        executor.dist = types.SimpleNamespace(
+            mapping=types.SimpleNamespace(
+                world_size=world_size or tp_size, tp_size=tp_size, moe_ep_size=tp_size
+            )
+        )
+        model = torch.nn.Module()
+        if comm is not None:
+            model.moe = torch.nn.Module()
+            model.moe.comm = comm
+        executor.model_engine = types.SimpleNamespace(model=model)
+        return executor
+
+    @pytest.mark.parametrize("tp_size", [2, 4, 8, 21])
+    def test_layer_split_accepts_deepseek_v4_on_blackwell(self, tp_size):
+        with patch(self._SM, return_value=103):
+            self._make_layer_split_executor(tp_size=tp_size)._validate_dkv_runtime()
+        with patch(self._SM, return_value=100):
+            self._make_layer_split_executor(tp_size=tp_size)._validate_dkv_runtime()
+
+    def test_layer_split_makes_no_claim_that_reused_outputs_are_invalid(self):
+        executor = self._make_layer_split_executor()
+        with (
+            patch(self._SM, return_value=103),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning,
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning_once") as warn_once,
+        ):
+            executor._validate_dkv_runtime()
+        warn_once.assert_not_called()
+        assert not any("reuse is disabled" in call.args[0] for call in warning.call_args_list)
+
+    def test_layer_split_still_warns_when_reuse_is_disabled(self):
+        executor = self._make_layer_split_executor()
+        executor.kv_cache_manager.enable_block_reuse = False
+        with (
+            patch(self._SM, return_value=103),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning,
+        ):
+            executor._validate_dkv_runtime()
+        assert any("reuse is disabled" in call.args[0] for call in warning.call_args_list)
+
+    def test_layer_split_rejects_a_cache_manager_that_is_not_deepseek_v4s(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+        executor = self._make_layer_split_executor(KVCacheManagerV2)
+        with patch(self._SM, return_value=103):
+            with pytest.raises(
+                ValueError,
+                match="KVCacheManagerV2 is not supported with dkv_config layer_split yet",
+            ):
+                executor._validate_dkv_runtime()
+
+    def test_layer_split_rejects_a_world_larger_than_the_group(self):
+        executor = self._make_layer_split_executor(tp_size=4, world_size=8)
+        with patch(self._SM, return_value=103):
+            with pytest.raises(ValueError, match=r"world_size \(8\) other than tp_size \(4\)"):
+                executor._validate_dkv_runtime()
+
+    @pytest.mark.parametrize("sm_version", [80, 90, 120])
+    def test_layer_split_rejects_gpus_whose_attention_reads_the_cache_differently(self, sm_version):
+        executor = self._make_layer_split_executor()
+        with patch(self._SM, return_value=sm_version):
+            with pytest.raises(
+                ValueError,
+                match=f"SM{sm_version} is not supported with dkv_config layer_split yet",
+            ):
+                executor._validate_dkv_runtime()
+
+    def test_layer_split_rejects_a_group_whose_ranks_would_lack_a_life_cycle(self):
+        executor = self._make_layer_split_executor(tp_size=22)
+        with patch(self._SM, return_value=103):
+            with pytest.raises(ValueError, match=r"rank 0 would own layers \[0, 1\]"):
+                executor._validate_dkv_runtime()
+
+    @pytest.mark.parametrize("comm_name", ["AllGatherReduceScatter", "NcclEP"])
+    def test_layer_split_rejects_moe_layers_that_communicate_through_nccl(self, comm_name):
+        from tensorrt_llm._torch.moe.fused_moe import communication
+
+        comm_type = getattr(communication, comm_name)
+        executor = self._make_layer_split_executor(comm=comm_type.__new__(comm_type))
+        with patch(self._SM, return_value=103):
+            with pytest.raises(
+                ValueError,
+                match=f"MoE communication through \\['{comm_name}'\\] is not supported with "
+                "dkv_config layer_split yet",
+            ):
+                executor._validate_dkv_runtime()
+
+    def test_layer_split_accepts_moe_layers_that_communicate_over_nvlink(self):
+        from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
+
+        executor = self._make_layer_split_executor(comm=NVLinkOneSided.__new__(NVLinkOneSided))
+        with patch(self._SM, return_value=103):
+            executor._validate_dkv_runtime()
+
+    def test_the_replicated_layout_does_not_check_what_only_layer_split_needs(self):
+        # No model, no GPU architecture and no ownership are consulted.
+        executor = self._make_executor()
+        assert executor.dkv_layer_split is False
+        with patch(self._SM, side_effect=AssertionError("the architecture was read")):
+            executor._validate_dkv_runtime()

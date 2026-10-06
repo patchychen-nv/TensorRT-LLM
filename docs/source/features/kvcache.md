@@ -385,8 +385,12 @@ requests assigned to another compute rank. Model execution, sampling, sequence
 slots, and request statistics use only the local compute-rank batch. An idle
 rank forwards its resident dummy so all ranks participate in model collectives.
 Only the compute rank constructs a response. A DKV context worker can send its
-computed KV to an ordinary generation worker. Distributed layer ownership and
-KV data movement between DKV replicas are not implemented yet.
+computed KV to an ordinary generation worker. `dkv_config.kv_layout` names the
+layout of the KV data: `replicated`, the default and the only layout that runs,
+keeps every layer on every rank; `layer_split` would keep each layer on its owner
+rank only and move KV between ranks per layer, and is rejected until it is
+implemented. Distributed layer ownership and KV data movement between DKV
+replicas are not implemented yet.
 
 Two collectives keep the replicas aligned. **S-sample** is the single all-gather
 after sampling in every iteration that has a batch: each compute rank publishes

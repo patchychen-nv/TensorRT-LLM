@@ -264,6 +264,63 @@ def test_startup_settings_cover_every_process_level_switch(monkeypatch) -> None:
     assert recorded == {"dual_ledger": True, "metrics_all_ranks": True, "kv_cache_backend": "py"}
 
 
+@pytest.mark.parametrize("layer_split", [False, True])
+def test_layer_split_ranks_must_agree_on_the_ownership_table(layer_split: bool) -> None:
+    recorded = []
+
+    def initialize(dist):
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.dist = dist
+        executor.dkv_layer_split = layer_split
+        # The ranks disagree about how many layers the model has.
+        executor.kv_cache_manager = SimpleNamespace(
+            num_layers=43 + dist.tp_rank,
+            get_dkv_config_fingerprint=lambda: [],
+            get_dkv_startup_settings=lambda: {},
+        )
+        executor.scheduler = SimpleNamespace(dkv_dual_ledger_enabled=True)
+        executor._initialize_dkv_invariant_checker()
+        recorded.append(dist.tp_rank)
+
+    if layer_split:
+        with pytest.raises(RuntimeError, match="startup settings differ.*layer_ownership"):
+            LockstepTpGroup(2).run(initialize)
+    else:
+        # The replicated layout has no table to compare.
+        LockstepTpGroup(2).run(initialize)
+        assert sorted(recorded) == [0, 1]
+
+
+def test_layer_split_records_the_ownership_table_in_the_startup_settings(monkeypatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.dkv import compute_ownership, ownership_fingerprint
+
+    recorded = {}
+
+    class _RecordingChecker:
+        enabled = False
+
+        def __init__(self, dist, enabled=None, startup_settings=None) -> None:
+            recorded.update(startup_settings)
+
+        def check_many(self, iter_counter, items_by_tag) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.DkvInvariantChecker", _RecordingChecker
+    )
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.dist = SimpleNamespace(mapping=SimpleNamespace(tp_size=4))
+    executor.dkv_layer_split = True
+    executor.kv_cache_manager = SimpleNamespace(
+        num_layers=43,
+        get_dkv_config_fingerprint=lambda: [],
+        get_dkv_startup_settings=lambda: {},
+    )
+    executor.scheduler = SimpleNamespace(dkv_dual_ledger_enabled=True)
+    executor._initialize_dkv_invariant_checker()
+    assert recorded["layer_ownership"] == ownership_fingerprint(compute_ownership(43, 4))
+
+
 def _scheduled_executor(dist, *, trace, requests, checker_enabled=True) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
     executor.dist = dist

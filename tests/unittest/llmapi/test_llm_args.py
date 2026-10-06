@@ -5246,6 +5246,99 @@ class TestDkvConfig:
                            match="not supported with dkv_config yet"):
             DkvConfig(attention_mode="sp")
 
+    def test_kv_layout_defaults_to_replicated(self) -> None:
+        assert DkvConfig().kv_layout == "replicated"
+        with pytest.raises(ValueError, match="kv_layout"):
+            DkvConfig(kv_layout="striped")
+
+    @classmethod
+    def _layer_split_args(cls, **kwargs) -> TorchLlmArgs:
+        # A configuration the layer-split data plane could host, so that each
+        # test changes only the setting it targets.
+        config = dict(dkv_config=DkvConfig(kv_layout="layer_split"),
+                      cuda_graph_config=None)
+        config.update(kwargs)
+        return cls._dkv_args(**config)
+
+    def test_layer_split_is_rejected_until_its_data_plane_exists(self) -> None:
+        with pytest.raises(
+                ValueError,
+                match="kv_layout='layer_split' is not supported with "
+                "dkv_config yet"):
+            self._layer_split_args()
+
+    @pytest.mark.parametrize("kwargs, message", [
+        ({
+            "cuda_graph_config": CudaGraphConfig()
+        }, r"cuda_graph_config is not supported with dkv_config layer_split "
+         r"yet; set cuda_graph_config to null"),
+        ({
+            "prefill_cuda_graph_backend": PrefillCudaGraphBackend.PIECEWISE
+        }, "prefill_cuda_graph_backend is not supported with dkv_config "
+         "layer_split yet"),
+        ({
+            "prefill_cuda_graph_backend": PrefillCudaGraphBackend.BREAKABLE
+        }, "prefill_cuda_graph_backend is not supported with dkv_config "
+         "layer_split yet"),
+        ({
+            "torch_compile_config": TorchCompileConfig()
+        }, "torch_compile_config is not supported with dkv_config layer_split "
+         "yet"),
+        ({
+            "sparse_attention_config":
+            DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+        }, "enable_kv_cache_offload is not supported with dkv_config "
+         "layer_split yet"),
+        ({
+            "kv_cache_config":
+            KvCacheConfig(
+                dtype="fp8_ds_mla",
+                block_reuse_config=BlockReuseConfig(policy="per_request"))
+        }, "kv_cache_config.dtype='fp8_ds_mla' is not supported with "
+         "dkv_config layer_split yet"),
+        ({
+            "kv_cache_config":
+            KvCacheConfig(
+                dtype="nvfp4",
+                block_reuse_config=BlockReuseConfig(policy="per_request"))
+        }, "kv_cache_config.dtype='nvfp4' is not supported with dkv_config "
+         "layer_split yet"),
+        ({
+            "cache_transceiver_config": CacheTransceiverConfig(backend="NIXL")
+        }, "cache_transceiver_config.backend is not supported with "
+         "dkv_config layer_split yet"),
+    ])
+    def test_layer_split_rejects_what_its_data_plane_cannot_host(
+            self, kwargs, message) -> None:
+        with pytest.raises(ValueError, match=message):
+            self._layer_split_args(**kwargs)
+
+    def test_layer_split_needs_the_dual_ledger(self, monkeypatch) -> None:
+        monkeypatch.setenv("TRTLLM_DKV_DUAL_LEDGER", "0")
+        with pytest.raises(
+                ValueError,
+                match="TRTLLM_DKV_DUAL_LEDGER=0 is not supported with "
+                "dkv_config layer_split yet"):
+            self._layer_split_args()
+        # The replicated layout does not depend on it.
+        self._dkv_args()
+
+    def test_replicated_layout_keeps_accepting_cuda_graphs(self) -> None:
+        args = self._dkv_args()
+        assert args.dkv_config.kv_layout == "replicated"
+        assert args.cuda_graph_config is not None
+
+    def test_layer_split_reuse_error_makes_no_claim_about_invalid_output(
+            self) -> None:
+        with pytest.raises(ValueError, match="use 'per_request'") as caught:
+            self._layer_split_args(kv_cache_config=KvCacheConfig(
+                block_reuse_config=BlockReuseConfig(policy="all_reusable")))
+        assert "not valid" not in str(caught.value)
+        assert "enable_block_reuse=False" in str(caught.value)
+        with pytest.raises(ValueError, match="not valid"):
+            self._dkv_args(kv_cache_config=KvCacheConfig(
+                block_reuse_config=BlockReuseConfig(policy="all_reusable")))
+
     @pytest.mark.parametrize("dkv_enabled", [False, True])
     def test_deepseek_v4_defaults(self, dkv_enabled) -> None:
         from tensorrt_llm._torch.models.modeling_deepseekv4 import \

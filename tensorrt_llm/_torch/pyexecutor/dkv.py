@@ -23,12 +23,13 @@ lockstep exchanges that keep them aligned and the checker that detects drift:
   every replica reaches the same state before KV is committed;
 * the control sync: one allgather at the top of every iteration that carries the
   capacity digest, fatal errors, pending responses and transfer events;
-* ``DkvInvariantChecker``: startup agreement plus debug-only fingerprint checks.
+* ``DkvInvariantChecker``: startup agreement plus debug-only fingerprint checks;
+* layer ownership: which rank stores the KV of which layer under the ``layer_split`` layout.
 """
 
 import hashlib
 import os
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import DkvTransferEvent
@@ -498,3 +499,83 @@ class DkvInvariantChecker:
         msg = "\n".join(report)
         logger.error(msg)
         raise RuntimeError(msg)
+
+
+# A semantic KV life cycle: (window size, or None for the whole history; number of sink blocks;
+# whether the history is attended sparsely). Ranks that own different layers number their life
+# cycles differently, so whatever is compared across ranks is keyed by this tuple.
+LifeCycleKey = tuple[int | None, int, bool]
+
+
+def compute_ownership(num_layers: int, group_size: int) -> tuple[int, ...]:
+    """The rank that stores the KV of every layer under the ``layer_split`` layout.
+
+    Layers are split into contiguous ranges whose sizes differ by at most one; the first
+    ``num_layers % group_size`` ranks take the extra layer. The table is a pure function of its
+    arguments, so every rank derives the same one without communication.
+
+    Raises:
+        ValueError: ``num_layers`` or ``group_size`` is below one.
+    """
+    if num_layers < 1 or group_size < 1:
+        raise ValueError(
+            f"num_layers and group_size must be positive, got {num_layers} and {group_size}"
+        )
+    base, extra = divmod(num_layers, group_size)
+    owners: list[int] = []
+    for rank in range(group_size):
+        owners.extend([rank] * (base + (1 if rank < extra else 0)))
+    return tuple(owners)
+
+
+def owned_layers(owner_of_layer: Sequence[int], rank: int) -> tuple[int, ...]:
+    """The layers whose KV ``rank`` stores, in increasing order."""
+    return tuple(layer for layer, owner in enumerate(owner_of_layer) if owner == rank)
+
+
+def ownership_fingerprint(owner_of_layer: Sequence[int]) -> str:
+    """A digest of the ownership table that is identical across processes."""
+    return hashlib.sha256(repr(tuple(owner_of_layer)).encode()).hexdigest()
+
+
+def validate_ownership(
+    owner_of_layer: Sequence[int],
+    life_cycles_of_layer: Sequence[Collection[LifeCycleKey]],
+    group_size: int,
+) -> None:
+    """Check that every rank can hold every KV life cycle of the model.
+
+    The prefix-match length is decided by which life cycles exist for a block, so a rank that
+    lacks one of them would reuse a different number of tokens than the others and the replicated
+    lifecycle would diverge. Every rank must therefore own layers that cover all the life cycles
+    that any layer of the model takes part in.
+
+    Args:
+        owner_of_layer: The rank that stores each layer.
+        life_cycles_of_layer: The semantic life cycles each layer's KV lives in.
+        group_size: The number of ranks.
+
+    Raises:
+        ValueError: The table does not cover the layers, names a rank outside the group, or leaves
+            a rank without some life cycle.
+    """
+    if len(owner_of_layer) != len(life_cycles_of_layer):
+        raise ValueError(
+            f"The ownership table has {len(owner_of_layer)} layers, the model {len(life_cycles_of_layer)}"
+        )
+    outside = sorted({owner for owner in owner_of_layer if not 0 <= owner < group_size})
+    if outside:
+        raise ValueError(f"Ranks {outside} own layers but the group has {group_size} ranks")
+    required = set().union(*life_cycles_of_layer) if life_cycles_of_layer else set()
+    for rank in range(group_size):
+        layers = owned_layers(owner_of_layer, rank)
+        covered = (
+            set().union(*(life_cycles_of_layer[layer] for layer in layers)) if layers else set()
+        )
+        if covered != required:
+            raise ValueError(
+                f"{len(owner_of_layer)} layers on {group_size} ranks is not supported with "
+                f"dkv_config layer_split yet: rank {rank} would own layers {list(layers)}, which "
+                f"lack the KV life cycles {sorted(required - covered, key=repr)} that other layers "
+                "use. Use a smaller attention-DP group."
+            )
