@@ -14,8 +14,9 @@
 
 import copy
 import dataclasses
+import functools
 import os
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -1811,6 +1812,7 @@ class KvCacheCreator:
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             dkv_group_size=self._dkv_group_size,
+            **self._dkv_layer_split_kwargs(model_engine),
         )
 
         if not self._skip_est:
@@ -1837,6 +1839,35 @@ class KvCacheCreator:
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
+
+    def _dkv_layer_split_kwargs(
+            self, model_engine: PyTorchModelEngine) -> Dict[str, Any]:
+        """The cache manager arguments of the layer-split layout of DKV.
+
+        A rank stores the KV of the layers it owns only, and the ranks agree on the number of
+        pages of every life cycle instead of on a byte quota, since the layers of a rank differ
+        in bytes. The counts are computed inside the manager, from its final cache config, and
+        reduced over the group with the minimum.
+        """
+        dkv_config = self._llm_args.dkv_config
+        if dkv_config is None or dkv_config.kv_layout != "layer_split":
+            return {}
+        from tensorrt_llm._torch.distributed.communicator import Distributed
+
+        from .dkv import compute_ownership, owned_layers
+        from .kv_cache.lifecycle_slot_counts import solve_lifecycle_slot_counts
+
+        num_layers = (
+            model_engine.model.model_config.pretrained_config.num_hidden_layers)
+        owners = compute_ownership(num_layers, self._mapping.tp_size)
+        return {
+            "dkv_owned_layers":
+            owned_layers(owners, self._mapping.tp_rank),
+            "dkv_lifecycle_slot_counts":
+            functools.partial(solve_lifecycle_slot_counts,
+                              allgather=Distributed.get(
+                                  self._mapping).tp_allgather),
+        }
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
@@ -2818,7 +2849,9 @@ def _create_kv_cache_manager(
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
-        dkv_group_size: Optional[int] = None) -> KVCacheManager:
+        dkv_group_size: Optional[int] = None,
+        dkv_owned_layers: Optional[Sequence[int]] = None,
+        dkv_lifecycle_slot_counts: Optional[Callable] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2992,6 +3025,11 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         if dkv_group_size is not None:
             manager_extra_kwargs["dkv_group_size"] = dkv_group_size
+        if dkv_owned_layers is not None:
+            manager_extra_kwargs["owned_layers"] = dkv_owned_layers
+        if dkv_lifecycle_slot_counts is not None:
+            manager_extra_kwargs[
+                "lifecycle_slot_counts"] = dkv_lifecycle_slot_counts
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         # Vocab size also enables multimodal event decoding and its per-block

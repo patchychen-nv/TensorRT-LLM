@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from _torch.executor.dkv_test_utils import LockstepTpGroup
+from _torch.executor.dkv_test_utils import LockstepDistributed, LockstepTpGroup
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -24,15 +24,21 @@ from tensorrt_llm.mapping import Mapping
 pytestmark = pytest.mark.cpu_only
 
 
-def _make_creator(dkv_enabled: bool) -> KvCacheCreator:
+def _make_creator(
+    dkv_enabled: bool, kv_layout: str = "replicated", rank: int = 0, num_layers: int = 43
+) -> KvCacheCreator:
     config = KvCacheConfig(use_kv_cache_manager_v2=True)
-    model_config = SimpleNamespace(is_generation=True, is_encoder_decoder=False)
+    model_config = SimpleNamespace(
+        is_generation=True,
+        is_encoder_decoder=False,
+        pretrained_config=SimpleNamespace(num_hidden_layers=num_layers),
+    )
     engine = SimpleNamespace(
         model=SimpleNamespace(model_config=model_config),
         kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
     )
     args = SimpleNamespace(
-        dkv_config=DkvConfig() if dkv_enabled else None,
+        dkv_config=DkvConfig(kv_layout=kv_layout) if dkv_enabled else None,
         kv_cache_config=config,
         cache_transceiver_config=None,
         disable_overlap_scheduler=True,
@@ -46,7 +52,7 @@ def _make_creator(dkv_enabled: bool) -> KvCacheCreator:
         return KvCacheCreator(
             model_engine=engine,
             draft_model_engine=None,
-            mapping=Mapping(world_size=4, tp_size=4, enable_attention_dp=True),
+            mapping=Mapping(world_size=4, rank=rank, tp_size=4, enable_attention_dp=True),
             net_max_seq_len=1024,
             kv_connector_manager=None,
             max_num_tokens=256,
@@ -78,6 +84,34 @@ def test_creator_propagates_group_size(dkv_enabled: bool, estimating: bool) -> N
 
     assert create.call_args.kwargs["dkv_group_size"] == (4 if dkv_enabled else None)
     assert create.call_args.kwargs["estimating_kv_cache"] is estimating
+    # The replicated layout stores every layer on every rank and syncs byte quotas.
+    assert "dkv_owned_layers" not in create.call_args.kwargs
+    assert "dkv_lifecycle_slot_counts" not in create.call_args.kwargs
+
+
+@pytest.mark.parametrize("estimating", [False, True])
+@pytest.mark.parametrize("rank", range(4))
+def test_creator_gives_a_layer_split_rank_the_layers_it_owns_and_the_page_counts(
+    rank: int, estimating: bool
+) -> None:
+    creator = _make_creator(True, "layer_split", rank=rank, num_layers=43)
+    manager = SimpleNamespace(max_seq_len=1024)
+    dist = LockstepDistributed(LockstepTpGroup(4), rank)
+    with (
+        patch.object(creator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager", return_value=manager
+        ) as create,
+        patch.object(Distributed, "get", return_value=dist),
+    ):
+        assert creator._create_kv_cache_manager(creator._model_engine, estimating) is manager
+
+    owned = create.call_args.kwargs["dkv_owned_layers"]
+    # 43 layers on 4 ranks: the first three ranks own 11 layers and the last one 10, in order.
+    assert list(owned) == list(range(11 * rank, 11 * rank + (10 if rank == 3 else 11)))
+    counts = create.call_args.kwargs["dkv_lifecycle_slot_counts"]
+    assert counts.func.__name__ == "solve_lifecycle_slot_counts"
+    assert counts.keywords["allgather"] == dist.tp_allgather
 
 
 @pytest.mark.parametrize("dkv_group_size", [None, 4])
