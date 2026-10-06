@@ -252,9 +252,9 @@ def run_workload(
 
     ``submit(request)`` starts a request and returns a callable that waits for it and returns the
     number of prompt tokens served from cache. A request waits for the previous turn of its session
-    to finish and, when it has an arrival offset, for that offset to pass. ``completed_turns`` maps a
-    session to the number of its turns an earlier call already served, so one workload can be run
-    in several consecutive parts.
+    to finish and, when it has an arrival offset, for that offset to pass; offsets count from the
+    start of each call. ``completed_turns`` maps a session to the number of its turns an earlier call
+    already served, so a closed-loop workload can be run in several consecutive parts.
     """
     if concurrency < 1:
         raise ValueError("concurrency must be positive")

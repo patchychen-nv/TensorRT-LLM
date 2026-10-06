@@ -7,6 +7,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,8 +27,18 @@ _TABLES = _RUNNER.tables
 pytestmark = pytest.mark.cpu_only
 
 
-def _options(**changes):
+# The runner is loaded by path, so a type checker cannot see its classes: the helpers that return
+# one of them are annotated ``Any``.
+def _options(**changes: object) -> Any:
     return dataclasses.replace(_RUNNER.Phase6Options(model="model", mode="dkv"), **changes)
+
+
+def _model_dir(tmp_path: Path, **config: object) -> Path:
+    """A checkpoint directory that holds only the ``config.json`` the runner reads."""
+    directory = tmp_path / "model"
+    directory.mkdir(exist_ok=True)
+    (directory / "config.json").write_text(json.dumps({"vocab_size": 100, **config}))
+    return directory
 
 
 def test_modes_are_named_after_their_router() -> None:
@@ -129,7 +140,7 @@ class _Streams:
         ]
 
 
-def _observer(tmp_path: Path, streams: _Streams):
+def _observer(tmp_path: Path, streams: _Streams) -> Any:
     return _RUNNER.Observer(
         streams, streams.group, tmp_path, clock=streams.clock, sleep=streams.clock.sleep
     )
@@ -168,6 +179,111 @@ def test_an_event_stream_that_never_goes_quiet_is_reported(tmp_path: Path) -> No
         _observer(tmp_path, streams).drain(deadline_s=3.0)
 
 
+def test_an_observer_replaces_the_stream_files_of_an_earlier_run(tmp_path: Path) -> None:
+    (tmp_path / "events.jsonl").write_text('{"event_id": 99}\n')
+    (tmp_path / "iteration-stats.jsonl").write_text('{"iter": 99}\n')
+    streams = _Streams(_Clock(), group=1)
+    streams.events = [[{"event_id": 0}]]
+    observer = _observer(tmp_path, streams)
+    assert not (tmp_path / "events.jsonl").exists()
+    assert not (tmp_path / "iteration-stats.jsonl").exists()
+    observer.pull()
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    rows = [
+        json.loads(line) for line in (tmp_path / "iteration-stats.jsonl").read_text().splitlines()
+    ]
+    assert events == [{"event_id": 0}]
+    assert [row["iter"] for row in rows] == [1]
+
+
+# A Zipf run whose longest prompt (two blocks and a suffix) and warm-up prompts hold 19 tokens.
+_SMALL = {
+    "requests": 12,
+    "prefixes": 3,
+    "prefix_blocks": 2,
+    "tokens_per_block": 8,
+    "suffix_tokens": 3,
+    "warmup": 2,
+    "max_seq_len": 64,
+    "max_num_tokens": 64,
+}
+
+
+def test_preparing_a_run_builds_its_workload_from_the_checkpoint_config(tmp_path: Path) -> None:
+    options = _options(model=str(_model_dir(tmp_path)), mode="adp_kv:2", prime=True, **_SMALL)
+    plan = _RUNNER.prepare(options)
+    assert plan.mode == _RUNNER.Mode("adp_kv_b2", False, 2.0)
+    assert plan.vocab == 100 and plan.longest == 19 and plan.reference is None
+    assert len(plan.requests) == 12 and all(len(r.prompt) == 19 for r in plan.requests)
+    assert len(plan.warm) == 2 and all(len(prompt) == 19 for prompt in plan.warm)
+    assert len(plan.primers) == len({request.session for request in plan.requests})
+    assert _RUNNER.prepare(dataclasses.replace(options, vocab=50)).vocab == 50
+    chat = dataclasses.replace(
+        options,
+        workload="chat",
+        sessions=3,
+        turns_min=2,
+        turns_max=2,
+        first_tokens="6",
+        turn_tokens="4",
+        warmup_tokens=12,
+    )
+    plan = _RUNNER.prepare(chat)
+    assert plan.longest == 10 and plan.primers == []
+    assert all(len(prompt) == 12 for prompt in plan.warm)
+
+
+@pytest.mark.parametrize(
+    ("changes", "config", "message"),
+    [
+        ({"warmup": 0}, {}, "at least 1"),
+        ({"phases": 0}, {}, "at least 1"),
+        ({"concurrency": 0}, {}, "at least 1"),
+        ({"max_seq_len": 19}, {}, r"longest prompt \(19 tokens\)"),
+        ({"max_num_tokens": 18}, {}, r"longest prompt \(19 tokens\)"),
+        (
+            {
+                "workload": "chat",
+                "sessions": 2,
+                "turns_min": 1,
+                "turns_max": 2,
+                "first_tokens": "6",
+                "turn_tokens": "4",
+                "warmup_tokens": 70,
+            },
+            {},
+            r"longest prompt \(70 tokens\)",
+        ),
+        ({}, {"max_position_embeddings": 19}, r"exceeds the model's 19 tokens"),
+        ({"mode": "adp", "adp_reference": "reference.json"}, {}, "only applies to the dkv mode"),
+        ({"mode": "nope"}, {}, "unknown mode"),
+    ],
+)
+def test_options_that_would_fail_after_the_model_loaded_are_rejected_first(
+    tmp_path: Path, changes: dict, config: dict, message: str
+) -> None:
+    options = _options(model=str(_model_dir(tmp_path, **config)), **{**_SMALL, **changes})
+    with pytest.raises(ValueError, match=message):
+        _RUNNER.prepare(options)
+
+
+def test_a_prompt_that_just_fits_the_limits_is_accepted(tmp_path: Path) -> None:
+    model = _model_dir(tmp_path, max_position_embeddings=20)
+    options = _options(model=str(model), **{**_SMALL, "max_seq_len": 20, "max_num_tokens": 19})
+    assert _RUNNER.prepare(options).longest == 19
+
+
+def test_an_adp_reference_gives_its_pools_to_the_dkv_run(tmp_path: Path) -> None:
+    pools = [{"pools_by_level": [[{"total": 5}]]}]
+    reference = tmp_path / "adp.json"
+    reference.write_text(json.dumps({"report": {"capacity_by_rank": pools}}))
+    model = str(_model_dir(tmp_path))
+    plan = _RUNNER.prepare(_options(model=model, adp_reference=str(reference), **_SMALL))
+    assert plan.reference == pools
+    with pytest.raises(OSError):
+        _RUNNER.prepare(_options(model=model, adp_reference=str(tmp_path / "none"), **_SMALL))
+
+
 class _Future:
     def __init__(self, timeouts: int) -> None:
         self.timeouts = timeouts
@@ -195,6 +311,7 @@ def _report(
     scheduled: int = 50,
     reasons: list[str] | None = None,
     drops: int = 0,
+    logical_drops: int | None = None,
     removed: int = 0,
     requests: int = 4,
     complete: bool = True,
@@ -220,6 +337,9 @@ def _report(
             "duplicate_storage_ratio": 0.5,
             "removed_block_copies": removed,
             "last_tier_capacity_dropped_pages": drops,
+            "last_tier_capacity_dropped_pages_logical": drops
+            if logical_drops is None
+            else logical_drops,
         },
         "validity": {"invalid_reasons": reasons or []},
         "capacity_comparison": None,
@@ -324,9 +444,61 @@ def test_the_seed_summary_has_a_column_per_label() -> None:
     assert "requests per rank, max / min" in text
 
 
+def test_phases_are_ordered_by_number_and_a_missing_phase_is_a_gap() -> None:
+    full = _result("adp")
+    full["phases"] = {f"phase{n}": {"report": _report(hit=n / 20)} for n in (10, 2, 1)}
+    short = _result("dkv")
+    short["phases"] = {"phase1": {"report": _report(hit=0.05)}}
+    text = _TABLES.comparison_tables([full, short])
+    (head,) = [line for line in text.splitlines() if line.startswith("| mode | valid")]
+    assert head.index("hit phase1 ") < head.index("hit phase2 ") < head.index("hit phase10 ")
+    assert "| adp | yes | 0.500 | 0.050 | 0.100 | 0.500 |" in text
+    assert "| dkv | yes | 0.500 | 0.050 | n/a | n/a |" in text
+
+
+def test_a_run_without_a_report_is_a_row_as_wide_as_its_table() -> None:
+    broken = _result("dkv")
+    broken["report"] = {"report_error": "counters reset"}
+    good = _result("adp")
+    for text in (
+        _TABLES.comparison_tables([good, broken]),
+        _TABLES.capacity_table({"x": [good, broken]}),
+    ):
+        assert "report error: counters reset" in text
+        blocks = [block for block in text.split("\n\n") if block.lstrip().startswith("|")]
+        assert blocks
+        for block in blocks:
+            widths = {len(line.strip("|").split("|")) for line in block.splitlines()}
+            assert len(widths) == 1, block
+
+
+def test_the_drops_of_a_dkv_run_are_those_of_one_replica() -> None:
+    adp = _result("adp", drops=7)
+    dkv = _result("dkv", drops=44, logical_drops=11)  # 11 pages dropped on each of 4 ranks
+    assert "drops=11 " in _TABLES.check_runs([dkv])[0]
+    text = _TABLES.comparison_tables([adp, dkv])
+    assert "| 0.500 | 0 | 7 |" in text and "| 0.500 | 0 | 11 |" in text
+    assert "| 44 |" not in text
+    capacity = _TABLES.capacity_table({"label": [adp, dkv]})
+    assert "| 7 | 1.00 |" in capacity and "| 11 | 1.00 |" in capacity
+    assert "| 44 |" not in capacity
+    summary = _TABLES.seed_summary({"a": [adp, dkv]})
+    assert "| dkv | 11 |" in summary and "| dkv | 44 |" not in summary
+
+
+def test_the_drops_are_unknown_when_the_replicas_disagree_and_physical_in_older_reports() -> None:
+    disagree = _result("dkv", drops=5, reasons=["removals_without_verified_equal_capacity"])
+    disagree["report"]["storage"]["last_tier_capacity_dropped_pages_logical"] = None
+    assert "drops=None " in _TABLES.check_runs([disagree])[0]
+    assert _TABLES.gate_label(disagree["report"]) == "NO"
+    older = _result("adp", drops=3)
+    del older["report"]["storage"]["last_tier_capacity_dropped_pages_logical"]
+    assert "drops=3 " in _TABLES.check_runs([older])[0]
+
+
 def test_the_capacity_table_lists_pages_hits_and_the_equal_capacity_verdict() -> None:
     adp = _result("adp", hit=0.2, matched=18, drops=7)
-    dkv = _result("dkv", hit=0.45, matched=45, drops=11)
+    dkv = _result("dkv", hit=0.45, matched=45, drops=22, logical_drops=11)
     dkv["options"]["kv_quota_gib"] = 4.0
     dkv["report"]["capacity_comparison"] = {
         "equal_usable_capacity": True,
@@ -376,11 +548,84 @@ def test_the_report_commands_read_a_results_directory(tmp_path: Path, capfd) -> 
     assert _RUNNER.main(["check", str(tmp_path)]) == 1
 
 
-def test_the_command_line_rejects_an_unknown_mode(tmp_path: Path) -> None:
+_SMALL_FLAGS = [
+    "--tokens-per-block",
+    "8",
+    "--prefix-blocks",
+    "2",
+    "--suffix-tokens",
+    "3",
+    "--requests",
+    "8",
+    "--prefixes",
+    "2",
+    "--warmup",
+    "2",
+    "--max-seq-len",
+    "64",
+    "--max-num-tokens",
+    "64",
+]
+
+
+def test_a_run_is_checked_before_any_worker_starts(tmp_path: Path, monkeypatch) -> None:
+    started: list[object] = []
+    monkeypatch.setattr(_RUNNER, "run_modes", lambda *args, **kwargs: started.append(args) or {})
+    model = str(_model_dir(tmp_path))
+    out = str(tmp_path / "out")
+    rejected = [
+        ["--modes", "adp,nope"],
+        ["--modes", "adp", "--adp-reference", str(tmp_path / "adp.json")],
+        ["--modes", "dkv", "--adp-reference", str(tmp_path / "missing.json")],
+        ["--modes", "adp", "--max-seq-len", "10"],
+        ["--modes", "adp", "--concurrency", "0"],
+    ]
+    for extra in rejected:
+        with pytest.raises(SystemExit) as stopped:
+            _RUNNER.main(["run", "--model", model, "--out", out, *_SMALL_FLAGS, *extra])
+        assert stopped.value.code == 2, extra
     with pytest.raises(SystemExit):
-        _RUNNER.main(["run", "--model", "m", "--out", str(tmp_path), "--modes", "adp,nope"])
+        _RUNNER.main(["run", "--model", str(tmp_path / "gone"), "--out", out, "--modes", "adp"])
+    assert started == []
+
+
+def test_a_run_gives_every_mode_a_worker_and_fails_when_one_does(
+    tmp_path: Path, monkeypatch, capfd
+) -> None:
+    calls: list[tuple] = []
+    codes = {"adp": 0, "dkv": 0}
+
+    def run_modes(options, modes, out, *, gpus, timeout_s):
+        calls.append((options, list(modes), out, gpus, timeout_s))
+        return codes
+
+    monkeypatch.setattr(_RUNNER, "run_modes", run_modes)
+    model = str(_model_dir(tmp_path))
+    argv = ["run", "--model", model, "--out", str(tmp_path / "out"), "--modes", "adp,dkv"]
+    argv += ["--gpus", "2,3", "--timeout", "60", *_SMALL_FLAGS]
+    assert _RUNNER.main(argv) == 0
+    assert 'PHASE6_DONE {"failed": []}' in capfd.readouterr().out
+    codes["dkv"] = 1
+    assert _RUNNER.main(argv) == 1
+    assert 'PHASE6_DONE {"failed": ["dkv"]}' in capfd.readouterr().out
+    options, modes, out, gpus, timeout_s = calls[0]
+    assert (modes, out, gpus, timeout_s) == (["adp", "dkv"], tmp_path / "out", "2,3", 60)
+    assert options.model == model and options.requests == 8 and options.max_seq_len == 64
+
+
+def test_the_commands_that_read_results_need_labelled_directories(capfd) -> None:
+    for command in ("summary", "capacity"):
+        with pytest.raises(SystemExit) as stopped:
+            _RUNNER.main([command, "no-label"])
+        assert stopped.value.code == 2
+        assert "expected LABEL=DIR" in capfd.readouterr().err
+
+
+def test_a_worker_needs_its_options_or_a_model_and_a_mode(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         _RUNNER.main(["worker", "--out", str(tmp_path)])
+    with pytest.raises(SystemExit):
+        _RUNNER.main(["worker", "--model", "model", "--out", str(tmp_path)])
 
 
 def test_a_worker_takes_its_options_from_a_file_or_from_flags(tmp_path: Path, monkeypatch) -> None:
