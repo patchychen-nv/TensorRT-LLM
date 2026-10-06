@@ -64,6 +64,8 @@ class _PageManager:
         self.enable_block_reuse = bool(prefix)
         self.block_reuse_policy = BlockReusePolicy.PER_REQUEST
         self._has_cp_helix = False
+        # With a tier below the GPU the scheduler suspends requests instead of preempting them.
+        self.has_cache_tier_below_gpu = True
 
     @property
     def used_pages(self) -> int:

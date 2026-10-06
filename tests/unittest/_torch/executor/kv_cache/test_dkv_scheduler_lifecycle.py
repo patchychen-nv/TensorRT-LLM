@@ -78,6 +78,7 @@ def _scheduler(manager: KVCacheManagerV2) -> KVCacheV2Scheduler:
         kv_cache_manager=manager,
         scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         ctx_chunk_config=(None, _TOKENS_PER_BLOCK),
+        enable_recompute_pause=False,
         dkv_group_size=2,
     )
 
