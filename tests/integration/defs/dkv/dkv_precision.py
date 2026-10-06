@@ -257,7 +257,9 @@ def _compare_noisy(
         f"margin of at least {policy.min_margin}; the gate cannot compare tokens"
     )
     assert summary["mean_extra_tv"] <= policy.max_mean_extra_tv, (
-        f"DKV differs from ADP by {summary['mean_extra_tv']:.4f} more than ADP differs from itself"
+        f"DKV differs from ADP by {summary['mean_extra_tv']:.4f} more than ADP differs from itself "
+        f"(ADP differs from itself by {summary['mean_adp_self_tv']:.4f}; by prompt: "
+        f"{[round(value, 4) for value in summary['extra_tv_by_prompt']]})"
     )
     assert summary["max_extra_tv"] <= policy.max_prompt_extra_tv, (
         f"One prompt differs from ADP by {summary['max_extra_tv']:.4f} more than ADP differs from "

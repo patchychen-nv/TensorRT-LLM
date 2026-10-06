@@ -33,12 +33,11 @@ def _tier_totals(rows: list[dict]) -> dict[str, int]:
     return totals
 
 
-@pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("model", MODELS, ids=MODEL_IDS)
-def test_dkv_host_tier_spills_and_onboards_replicated_prefixes(
-    monkeypatch, model: DkvModel
-) -> None:
-    """Prefixes evicted from the GPU pool survive in the host tier and hit again on the other rank."""
+def run_host_tier_case(monkeypatch, model: DkvModel) -> None:
+    """Spill prefixes to the host tier and hit them again on the other rank.
+
+    The group is built with the layout ``DKV_TEST_KV_LAYOUT`` names.
+    """
     if torch.cuda.device_count() < 2:
         pytest.skip("The DKV host-tier test needs two GPUs")
     if not Path(model.path()).is_dir():
@@ -111,3 +110,12 @@ def test_dkv_host_tier_spills_and_onboards_replicated_prefixes(
     assert set(free) == {0, 1} and len(set(free.values())) == 1, (
         f"The replicas' pools of all tiers differ: {free}"
     )
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("model", MODELS, ids=MODEL_IDS)
+def test_dkv_host_tier_spills_and_onboards_replicated_prefixes(
+    monkeypatch, model: DkvModel
+) -> None:
+    """Prefixes evicted from the GPU pool survive in the host tier and hit again on the other rank."""
+    run_host_tier_case(monkeypatch, model)

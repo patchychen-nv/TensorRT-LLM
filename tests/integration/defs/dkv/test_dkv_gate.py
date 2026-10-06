@@ -45,6 +45,7 @@ def _llm(
     logits: bool,
     group_size: int = 2,
     measurement: bool = False,
+    **llm_kwargs,
 ):
     validate_precision_inputs(enable_block_reuse=False, tokens_per_block=model.tokens_per_block)
     return make_dkv_llm(
@@ -55,6 +56,7 @@ def _llm(
         group_size=group_size,
         gather_logits=logits,
         env_overrides=dkv_worker_env(measurement=measurement),
+        **llm_kwargs,
     )
 
 
@@ -177,18 +179,22 @@ def run_precision_passes(
     prompts: list[list[int]],
     passes: int,
     group_size: int = 2,
+    **llm_kwargs,
 ) -> list[PrecisionRun]:
     """Run the pinned prompts one at a time, ``passes`` times in one executor.
 
     Repeating inside one executor keeps the ADP control and replay under identical initialization,
-    so any difference between them is run-to-run noise of the model itself.
+    so any difference between them is run-to-run noise of the model itself. ``llm_kwargs`` are
+    further arguments of ``make_dkv_llm``, such as the chunked prefill.
     """
     sampling = SamplingParams(
         max_tokens=1, temperature=0, ignore_eos=True, return_generation_logits=True
     )
     placement = precision_placement(group_size)
     runs: list[PrecisionRun] = []
-    with _llm(model, dkv_enabled=dkv_enabled, logits=True, group_size=group_size) as llm:
+    with _llm(
+        model, dkv_enabled=dkv_enabled, logits=True, group_size=group_size, **llm_kwargs
+    ) as llm:
         for _ in range(passes):
             tokens: list[list[int]] = []
             logits: list[torch.Tensor] = []
