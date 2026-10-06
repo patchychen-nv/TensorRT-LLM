@@ -95,6 +95,8 @@ class Scenario:
     fault: str = ""
     # Checksum every message at both ends and compare the ranks' records after every iteration.
     debug: bool = False
+    # The compress ratio of every layer of the model.
+    ratios: tuple[int, ...] = tuple(_RATIOS)
 
     @classmethod
     def soak(cls, group_size: int, ring_depth: int, iterations: int) -> "Scenario":
@@ -149,7 +151,9 @@ def _pattern(request_id: int, layer: int, index: int, blocks: list[int], nbytes:
     return ((positions[None, :] * 7 + seeds[:, None]) % 251).to(torch.uint8)
 
 
-def _manager(owned: tuple[int, ...], rank: int, group_size: int) -> DeepseekV4CacheManager:
+def _manager(
+    owned: tuple[int, ...], rank: int, group_size: int, ratios: tuple[int, ...]
+) -> DeepseekV4CacheManager:
     return DeepseekV4CacheManager(
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
@@ -158,7 +162,7 @@ def _manager(owned: tuple[int, ...], rank: int, group_size: int) -> DeepseekV4Ca
             event_buffer_max_size=0,
         ),
         kv_cache_type=CacheType.SELFKONLY,
-        num_layers=len(_RATIOS),
+        num_layers=len(ratios),
         num_kv_heads=1,
         head_dim=512,
         tokens_per_block=_TOKENS_PER_BLOCK,
@@ -173,7 +177,7 @@ def _manager(owned: tuple[int, ...], rank: int, group_size: int) -> DeepseekV4Ca
         vocab_size=129280,
         max_num_tokens=1024,
         sparse_attn_config=DeepSeekV4SparseAttentionConfig(
-            index_head_dim=128, window_size=128, compress_ratios=_RATIOS, indexer_k_dtype="fp8"
+            index_head_dim=128, window_size=128, compress_ratios=list(ratios), indexer_k_dtype="fp8"
         ),
         owned_layers=owned,
     )
@@ -278,9 +282,9 @@ def _probe_rank(scenario: Scenario) -> dict:
     rank = tensorrt_llm.mpi_rank()
     group_size = scenario.group_size
     torch.cuda.set_device(rank % torch.cuda.device_count())
-    owners = compute_ownership(len(_RATIOS), group_size)
+    owners = compute_ownership(len(scenario.ratios), group_size)
     transport = nccl_p2p_transport(group_size, rank)
-    manager = _manager(owned_layers(owners, rank), rank, group_size)
+    manager = _manager(owned_layers(owners, rank), rank, group_size, scenario.ratios)
     geometry = StagingGeometry.from_cache_manager(
         manager, max_staging_tokens=8192, ring_depth=scenario.ring_depth
     )
@@ -336,7 +340,7 @@ def _probe_rank(scenario: Scenario) -> dict:
             placement = [(r.context_current_position, r.context_chunk_size) for r in local]
             spans = {kind: layout.request_spans(kind, placement) for kind in layout.kinds}
             checks: list = []
-            for layer in range(len(_RATIOS)):
+            for layer in range(len(scenario.ratios)):
                 streamer.on_layer(layer)
                 _attention(layer, local, spans, layout, pool, checks)
             _record_writes(written, real, layout, manager)
@@ -474,3 +478,30 @@ def test_a_soak_of_requests_that_come_and_go_neither_hangs_nor_corrupts(
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"
         assert result["iterations"] == scenario.iterations
+
+
+@pytest.mark.skipif(
+    MPI.COMM_WORLD.Get_size() != 8,
+    reason="needs a job of eight MPI ranks, with one task per GPU on two nodes",
+)
+def test_the_pages_of_every_layer_reach_the_compute_rank_between_two_nodes() -> None:
+    """Every task of the job is a rank of the group, so half of the messages cross the nodes."""
+    group_size = 8
+    # One request per rank: a cache manager has room for eight requests at a time.
+    lengths = (90, 300, 150, 700, 1000, 520, 260, 130)
+    prompts = {request_id: lengths[request_id - 1] for request_id in range(1, 9)}
+    scenario = Scenario(
+        group_size,
+        2,
+        prompts,
+        _spread(group_size, prompts),
+        arrival={5: 1, 6: 2, 7: 3},
+        debug=True,
+        ratios=tuple(_RATIOS) * 2,
+    )
+    results = mpi_comm().allgather(_probe_rank(scenario))
+    for rank, result in enumerate(results):
+        assert result["errors"] == [], f"rank {rank}"
+        assert result["iterations"] == scenario.iterations
+        assert result["bytes_sent"] > 0 and result["bytes_received"] > 0, f"rank {rank}"
+    assert sum(r["bytes_sent"] for r in results) == sum(r["bytes_received"] for r in results)
