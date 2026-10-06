@@ -364,6 +364,10 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
 
 class PyTorchModelEngine(ModelEngine):
 
+    # Whether DKV stages the KV of the layers: the attention metadata then reads the staged view
+    # of the cache manager. The executor switches it on before the first forward pass.
+    dkv_staging: bool = False
+
     def __init__(
         self,
         *,
@@ -3661,7 +3665,8 @@ class PyTorchModelEngine(ModelEngine):
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
             # object if it changes.
-            assert self.attn_metadata.kv_cache_manager is kv_cache_manager
+            assert (self.attn_metadata.kv_cache_manager
+                    is self._attention_cache_manager(kv_cache_manager))
             return self.attn_metadata
 
         config = self.model.model_config.pretrained_config
@@ -3675,7 +3680,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             cache_indirection=self.cache_indirection_attention
             if self.attn_backend.Metadata is TrtllmAttentionMetadata else None,
-            kv_cache_manager=kv_cache_manager,
+            kv_cache_manager=self._attention_cache_manager(kv_cache_manager),
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
@@ -3685,6 +3690,26 @@ class PyTorchModelEngine(ModelEngine):
             self.model)
 
         return self.attn_metadata
+
+    def _attention_cache_manager(self, kv_cache_manager):
+        """The cache manager the attention metadata reads.
+
+        It is the staged view of the manager when DKV stages the layers' KV, the manager itself
+        otherwise.
+        """
+        if self.dkv_staging and isinstance(kv_cache_manager, KVCacheManagerV2):
+            view = kv_cache_manager.dkv_staged_view
+            if view is not None:
+                return view
+        return kv_cache_manager
+
+    def _end_staged_forward(self, inputs: Dict[str, Any]) -> None:
+        """Return the pages of the last layer to the cache manager after a staged forward pass."""
+        attn_metadata = inputs.get('attn_metadata', None)
+        view = getattr(attn_metadata, 'kv_cache_manager', None)
+        streamer = getattr(view, 'dkv_streamer', None)
+        if streamer is not None:
+            streamer.end_forward()
 
     @property
     def is_multimodal(self) -> bool:
@@ -4524,7 +4549,8 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=buffers['cached_token_lengths']
             [:num_sequences],
             num_extra_kv_tokens=0)
-        attn_metadata.kv_cache_manager = kv_cache_manager
+        attn_metadata.kv_cache_manager = self._attention_cache_manager(
+            kv_cache_manager)
         assert isinstance(attn_metadata, TrtllmAttentionMetadata)
         attn_metadata.prepare_encoder_decoder_from_precomputed_lengths(
             prompt_lens=buffers['prompt_lengths'][:num_sequences],
@@ -4705,7 +4731,8 @@ class PyTorchModelEngine(ModelEngine):
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=get_num_extra_kv_tokens(None))
-        attn_metadata.kv_cache_manager = kv_cache_manager
+        attn_metadata.kv_cache_manager = self._attention_cache_manager(
+            kv_cache_manager)
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = \
                 self.model.model_config.pretrained_config.chunk_size
@@ -5765,7 +5792,8 @@ class PyTorchModelEngine(ModelEngine):
             use_full_generation_page_table=(
                 self._should_use_full_generation_page_table(
                     spec_config, attn_metadata)))
-        attn_metadata.kv_cache_manager = kv_cache_manager
+        attn_metadata.kv_cache_manager = self._attention_cache_manager(
+            kv_cache_manager)
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
@@ -6397,6 +6425,8 @@ class PyTorchModelEngine(ModelEngine):
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
+        if self.dkv_staging:
+            self._end_staged_forward(inputs)
 
         if self.without_logits:
             return outputs

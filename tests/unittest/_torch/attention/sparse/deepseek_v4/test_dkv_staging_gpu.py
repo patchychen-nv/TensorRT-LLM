@@ -28,14 +28,18 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager imp
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import DeepseekV4AttentionType
 from tensorrt_llm._torch.pyexecutor.dkv_staging import (
     BAD_PAGE_INDEX,
+    STAGING_COMPONENTS,
     DkvPageCopier,
+    DkvStagedKvView,
     StagingComponent,
     StagingGeometry,
     StagingKind,
     StagingLayout,
+    StagingOverflow,
     StagingPool,
     pool_page_addresses,
 )
+from tensorrt_llm._torch.pyexecutor.dkv_streamer import LoopbackStreamer
 from tensorrt_llm.bindings import DataType
 
 from .test_deepseek_v4_cache_manager import TestDeepseekV4CacheManager as _ManagerFactory
@@ -94,6 +98,13 @@ def case(request) -> Iterator[_Case]:
     """A slot for every layer: the copies of most tests are not ordered by layer, so two layers
     must not share the rows a test compares."""
     with _staged_case(*request.param, ring_depth=len(_RATIOS)) as value:
+        yield value
+
+
+@pytest.fixture(**_VARIANTS)
+def ringed(request) -> Iterator[_Case]:
+    """The default ring of two slots, which the layers of a kind take turns in."""
+    with _staged_case(*request.param, ring_depth=2) as value:
         yield value
 
 
@@ -289,6 +300,200 @@ def test_a_block_without_a_page_has_no_address(case: _Case) -> None:
     assert pool_page_addresses(
         manager, 0, case.layout.components[0].attention_type, [BAD_PAGE_INDEX, indices[0]]
     ) == [None, addresses[0]]
+
+
+# ---- the view the attention backend sees ---------------------------------------------------------
+
+
+@pytest.fixture
+def view(case: _Case) -> DkvStagedKvView:
+    return DkvStagedKvView(case.manager, case.pool)
+
+
+def test_the_view_covers_every_layer_with_the_staging_pointers(case: _Case, view) -> None:
+    manager, layout, pool = case.manager, case.layout, case.pool
+    assert view.pp_layers == list(range(len(_RATIOS))) == list(manager.pp_layers)
+    assert view.layer_offsets == dict(manager.layer_offsets)
+    assert view.num_local_layers == manager.num_local_layers
+    swa = StagingComponent(StagingKind.SWA, DeepseekV4AttentionType.SWA)
+    assert view.swa_pool_ptr == pool.buffer.data_ptr() + layout.region_offset(swa)
+    assert set(view.compress_pool_ptrs) == {4, 128}
+    assert view.kv_cache_pool_pointers.shape == manager.kv_cache_pool_pointers.shape
+    assert (view.kv_cache_pool_pointers[:, 0] == view.swa_pool_ptr).all()
+    assert torch.equal(view.kv_cache_pool_mapping, manager.kv_cache_pool_mapping)
+    # What the view does not define is the manager's.
+    assert view.tokens_per_block == manager.tokens_per_block
+    assert view.max_blocks_per_seq == manager.max_blocks_per_seq
+    assert view.dtype == manager.dtype
+
+
+def test_view_buffers_have_the_rows_of_the_managers_and_start_at_the_staging_pages(
+    case: _Case, view
+) -> None:
+    manager, layout, pool = case.manager, case.layout, case.pool
+    for component in layout.components:
+        for layer in layout.layers_of(component.kind):
+            real = manager.get_buffers(layer, component.attention_type)
+            staged = view.get_buffers(layer, component.attention_type)
+            assert staged.dtype == real.dtype
+            assert staged.shape[1:] == real.shape[1:]
+            assert staged.stride(0) * staged.element_size() == layout.page_bytes(component)
+            assert staged.data_ptr() == pool.layer_pointer(layer, component)
+            assert staged.shape[0] * layout.page_bytes(component) <= layout.region_bytes(component)
+    indexer = view.get_indexer_k_cache_buffers(1)
+    assert indexer.dtype == torch.uint8
+    assert indexer.shape[1:] == manager.get_indexer_k_cache_buffers(1).shape[1:]
+
+
+def test_view_tables_are_the_identity_maps_onto_the_slots_of_the_staged_requests(
+    case: _Case, view
+) -> None:
+    layout = case.layout
+    requests = [(300, 400), (0, 50), (1000, 1)]
+    view.begin_staged_batch([11, 12, 13], [h for h, _ in requests], [c for _, c in requests], 3)
+    view.compute_sliding_block_tables([11, 12, 13], 3)
+    max_blocks = case.manager.max_blocks_per_seq
+    sliding = torch.empty(len(_RATIOS), 5, 4, max_blocks, dtype=torch.int32, device="cuda")
+    view.copy_batch_sliding_block_tables(sliding, [11, 12, 13], 3, 3)
+    for layer in range(len(_RATIOS)):
+        for index, attention_type in enumerate(DkvStagedKvView._SLIDING):
+            component = [
+                c
+                for c in layout.components
+                if c.attention_type is attention_type and layer in layout.layers_of(c.kind)
+            ]
+            table = sliding[layer, index].cpu()
+            if not component:
+                assert (table == BAD_PAGE_INDEX).all()
+                continue
+            kind = component[0].kind
+            spans = layout.request_spans(kind, requests)
+            for row, span in enumerate(spans):
+                expected = layout.block_table(kind, layer, span, max_blocks)
+                assert table[row].tolist() == expected, (layer, attention_type, row)
+            assert (table[3] == BAD_PAGE_INDEX).all()  # the unused row of the batch
+    # The generic block offsets are the SWA tables, for every layer.
+    offsets = torch.empty(len(_RATIOS), 4, 2, max_blocks, dtype=torch.int32, device="cuda")
+    view.copy_batch_block_offsets(offsets, [11, 12, 13], 1, 3, 3)
+    assert torch.equal(offsets[:, :, 0], sliding[:, DeepseekV4AttentionType.SWA.value])
+    assert (offsets[:, :, 1] == BAD_PAGE_INDEX).all()
+    # The shared tables of the compressed kinds do not depend on the layer.
+    compress = torch.empty(4, max_blocks, dtype=torch.int32, device="cuda")
+    for ratio, kind in ((4, StagingKind.COMPRESS_R4), (128, StagingKind.COMPRESS_R128)):
+        view.copy_batch_compress_block_tables(compress, [11, 12, 13], ratio, 1, 3, 3)
+        for row, span in enumerate(layout.request_spans(kind, requests)):
+            layer = layout.layers_of(kind)[0]
+            assert compress[row].cpu().tolist() == layout.block_table(kind, layer, span, max_blocks)
+    host = torch.full((4, max_blocks), 7, dtype=torch.int32)
+    view.copy_batch_indexer_compress_block_tables(host, [11, 12, 13], 1, 3, 3)
+    for row, span in enumerate(layout.request_spans(StagingKind.INDEXER_COMPRESS, requests)):
+        layer = layout.layers_of(StagingKind.INDEXER_COMPRESS)[0]
+        assert host[row].tolist() == layout.block_table(
+            StagingKind.INDEXER_COMPRESS, layer, span, max_blocks
+        )
+    assert (host[3] == 7).all()  # rows beyond the batch are not written
+
+
+def test_the_view_needs_a_batch_before_it_builds_tables(case: _Case, view) -> None:
+    with pytest.raises(RuntimeError, match="begin_staged_batch has not been called"):
+        view.compute_sliding_block_tables([1], 1)
+    with pytest.raises(ValueError, match="differ in length"):
+        view.begin_staged_batch([1, 2], [0], [10], 1)
+    with pytest.raises(StagingOverflow):
+        view.begin_staged_batch(list(range(100)), [0] * 100, [4096] * 100, 100)
+
+
+# ---- the streamer that moves the pages between the cache manager and the staging area ------------
+
+
+def _components_of(layout: StagingLayout, layer: int) -> list[StagingComponent]:
+    return [c for c in layout.components if layer in layout.layers_of(c.kind)]
+
+
+def _salt(layer: int, component: StagingComponent, block: int, generation: int) -> int:
+    role = STAGING_COMPONENTS.index(component)
+    return (((generation * len(_RATIOS) + layer) * len(STAGING_COMPONENTS)) + role) * 16 + block
+
+
+def _cache_pages(manager, layer: int, component: StagingComponent) -> dict[int, torch.Tensor]:
+    """The pages of the request in the cache manager by block."""
+    indices = manager.get_cache_indices(_REQUEST, layer, component.attention_type)
+    return {
+        block: _pool_page(manager, layer, component.attention_type, index)
+        for block, index in enumerate(indices[: _blocks()])
+        if index != BAD_PAGE_INDEX
+    }
+
+
+def _staged_page(view: DkvStagedKvView, layer: int, component: StagingComponent, index: int):
+    return view.get_buffers(layer, component.attention_type)[index].view(torch.uint8).reshape(-1)
+
+
+@pytest.mark.parametrize("fill", ["", "nan"])
+def test_the_streamer_fetches_the_cached_pages_and_writes_back_the_new_ones(
+    ringed: _Case, fill: str
+) -> None:
+    manager, layout, pool = ringed.manager, ringed.layout, ringed.pool
+    view = DkvStagedKvView(manager, pool)
+    streamer = LoopbackStreamer(manager, view, fill=fill)
+    view.dkv_streamer = streamer
+    layers = range(len(_RATIOS))
+    # Every page of the request in the cache manager gets a content of its own.
+    for layer in layers:
+        for component in _components_of(layout, layer):
+            for block, page in _cache_pages(manager, layer, component).items():
+                page.copy_(_pattern(_salt(layer, component, block, 0), page.numel()))
+    torch.cuda.synchronize()
+
+    view.begin_staged_batch([_REQUEST], [_HISTORY], [_CHUNK], 1)
+    fetched_bytes = written_bytes = 0
+    for layer in layers:
+        streamer.on_layer(layer)
+        for component in _components_of(layout, layer):
+            kind = component.kind
+            span = layout.request_spans(kind, [(_HISTORY, _CHUNK)])[0]
+            table = layout.block_table(kind, layer, span, _blocks())
+            first, count = layout.fetch_range(kind, _HISTORY, _CHUNK)
+            for block in range(span.first_block, span.first_block + span.num_pages):
+                page = _staged_page(view, layer, component, table[block])
+                if first <= block < first + count:
+                    expected = _pattern(_salt(layer, component, block, 0), page.numel())
+                    assert torch.equal(page, expected), ("fetch", component, layer, block)
+                elif fill:
+                    # What was not fetched is what the fill left, not what an earlier layer of the
+                    # ring held.
+                    assert (page == 0xFF).all(), ("fill", component, layer, block)
+            fetched_bytes += count * layout.page_bytes(component)
+            # The attention writes the pages of the new tokens.
+            first, count = layout.writeback_range(kind, _HISTORY, _CHUNK)
+            for block in range(first, first + count):
+                page = _staged_page(view, layer, component, table[block])
+                page.copy_(_pattern(_salt(layer, component, block, 1), page.numel()))
+            written_bytes += count * layout.page_bytes(component)
+    streamer.end_forward()
+    torch.cuda.synchronize()
+
+    assert streamer.bytes_fetched == fetched_bytes
+    assert streamer.bytes_written_back == written_bytes
+    for layer in layers:
+        for component in _components_of(layout, layer):
+            first, count = layout.writeback_range(component.kind, _HISTORY, _CHUNK)
+            for block, page in _cache_pages(manager, layer, component).items():
+                generation = int(first <= block < first + count)
+                expected = _pattern(_salt(layer, component, block, generation), page.numel())
+                assert torch.equal(page, expected), ("write back", component, layer, block)
+
+
+def test_the_streamer_skips_a_request_the_cache_manager_does_not_hold(ringed: _Case) -> None:
+    # A warm-up or dummy request has no pages to move.
+    view = DkvStagedKvView(ringed.manager, ringed.pool)
+    streamer = LoopbackStreamer(ringed.manager, view)
+    view.dkv_streamer = streamer
+    view.begin_staged_batch([_REQUEST + 100], [0], [64], 1)
+    for layer in range(len(_RATIOS)):
+        streamer.on_layer(layer)
+    streamer.end_forward()
+    assert streamer.bytes_fetched == streamer.bytes_written_back == 0
 
 
 def test_a_fill_covers_the_slots_of_one_layer(case: _Case) -> None:

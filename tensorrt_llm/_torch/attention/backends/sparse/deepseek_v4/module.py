@@ -967,6 +967,10 @@ def forward_sparse_attn(
 ) -> None:
     """Run DeepSeek-V4 MLA and write into the algorithm-defined output buffers."""
     assert self.mha is None and self.mqa is not None, "DeepSeek-V4 is only supported in MQA mode"
+    # A staged view of the cache (DKV layer split) brings this layer's KV into its slot first.
+    staging_streamer = getattr(attn_metadata.kv_cache_manager, "dkv_streamer", None)
+    if staging_streamer is not None:
+        staging_streamer.on_layer(self.layer_idx)
     output = attn_output[0]
     # A 3D token-major output is the internal fusion marker, avoiding
     # algorithm-specific parameters in the shared MLA custom-op schema.

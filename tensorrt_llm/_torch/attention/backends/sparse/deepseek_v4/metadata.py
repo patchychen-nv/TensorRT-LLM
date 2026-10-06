@@ -641,6 +641,21 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         assert self.request_ids is not None
         self.validate_sparse_offload_batch()
 
+        # A staged view of the cache (DKV layer split) places the batch in its slots first; its
+        # block tables follow from where the requests sit.
+        begin_staged_batch = getattr(self.kv_cache_manager, "begin_staged_batch", None)
+        if begin_staged_batch is not None:
+            num_staged_requests = self.num_contexts + self.num_generations
+            begin_staged_batch(
+                self.request_ids,
+                [
+                    int(n)
+                    for n in self.kv_cache_params.num_cached_tokens_per_seq[:num_staged_requests]
+                ],
+                self.seq_lens[:num_staged_requests].tolist(),
+                self.num_contexts,
+            )
+
         self.kv_cache_manager.compute_sliding_block_tables(
             self.request_ids,
             self.num_contexts,

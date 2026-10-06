@@ -1274,6 +1274,9 @@ class KVCacheManagerV2(BaseResourceManager):
     dkv_group_size: int | None = None
     _dkv_trace_enabled = False
     _dkv_measurement: DkvMeasurementCounters | None = None
+    # What the attention backend reads instead of this manager when DKV stages the layers' KV
+    # (``DkvStagedKvView``); the executor sets it.
+    dkv_staged_view = None
 
     def __init__(
         self,

@@ -23,8 +23,9 @@ at construction stay valid. The slot holds the pages of the requests back to bac
 table of a slot is the identity map onto them, offset by where the request's pages start.
 
 This module holds the arithmetic (``StagingLayout``, pure functions of the model geometry), the
-buffers (``StagingPool``) and the copies between staging pages and the pages of the real cache
-manager (``DkvPageCopier``). It does not decide when anything is copied.
+buffers (``StagingPool``), the cache manager the attention backend sees when the layers are staged
+(``DkvStagedKvView``) and the copies between staging pages and the pages of the real cache manager
+(``DkvPageCopier``). It does not decide when anything is copied.
 """
 
 import enum
@@ -37,6 +38,12 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager imp
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DeepseekV4AttentionType,
     is_overlap_compressor,
+)
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    convert_to_torch_tensor,
+    get_size_in_bytes,
+    prefer_pinned,
 )
 from tensorrt_llm.bindings import DataType
 
@@ -458,6 +465,305 @@ class StagingPool:
         for component in self.layout.components:
             if layer in self.layout.layers_of(component.kind):
                 self.slot(layer, component).fill_(value)
+
+
+class DkvStagedKvView:
+    """The cache manager as the attention backend sees it when the layers are staged.
+
+    The backend reads every layer's KV through ``metadata.kv_cache_manager``: the buffers of a
+    layer, the per-layer block tables and the base pointers it bakes into its metadata. This view
+    answers all of that from the staging area: the buffers are views of the rings, the base
+    pointers are those of the rings, and the block tables are the identity maps onto the pages the
+    requests of the iteration occupy in a slot. Everything else (sizes, dtypes, the capacity the
+    metadata is allocated for, ...) is the real manager's, so the backend does not know the
+    difference.
+
+    The view covers every layer of the model, whether or not the real manager holds it, which is
+    what the layer-split layout needs. It supports the FP8 and BF16 KV layouts of DeepSeek-V4 on
+    GPUs whose attention op reads the KV directly; the footer-scale and NVFP4 layouts are not
+    staged.
+    """
+
+    # The block tables and the buffers of the real manager have these cache roles per layer.
+    _SLIDING = (
+        DeepseekV4AttentionType.SWA,
+        DeepseekV4AttentionType.COMPRESSOR_KV,
+        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+    )
+
+    def __init__(self, manager, pool: StagingPool) -> None:
+        if getattr(manager, "use_fp8_ds_mla", False) or getattr(
+            manager, "_use_nvfp4_compress", False
+        ):
+            raise NotImplementedError(
+                "The footer-scale and NVFP4 KV layouts are not supported by the staged view"
+            )
+        self._manager = manager
+        self.pool = pool
+        self.layout = pool.layout
+        num_layers = len(self.layout.geometry.compress_ratios)
+        self.num_layers = num_layers
+        self.pp_layers = list(range(num_layers))
+        self.num_local_layers = num_layers
+        self.layer_offsets = {layer: layer for layer in range(num_layers)}
+        self.max_attention_window_vec = list(manager.max_attention_window_vec)
+        if len(self.max_attention_window_vec) != num_layers:
+            raise NotImplementedError(
+                "The staged view needs the attention windows of every layer; the manager has "
+                f"{len(self.max_attention_window_vec)} of {num_layers}"
+            )
+        component = {(c.kind, c.attention_type): c for c in self.layout.components}
+        swa = component[(StagingKind.SWA, DeepseekV4AttentionType.SWA)]
+        self.swa_pool_ptr = pool.buffer.data_ptr() + self.layout.region_offset(swa)
+        self.compress_pool_ptrs = {
+            ratio: pool.buffer.data_ptr()
+            + self.layout.region_offset(component[(kind, DeepseekV4AttentionType.COMPRESS)])
+            for ratio, kind in ((4, StagingKind.COMPRESS_R4), (128, StagingKind.COMPRESS_R128))
+            if kind in self.layout.kinds
+        }
+        self.compress_scale_pool_ptrs: dict[int, int] = {}
+        # What the attention op sees of the sliding-window pool: one virtual pool per layer, all
+        # at the base of the SWA ring (the slot of a layer is in its page indices).
+        self.kv_cache_pool_pointers = torch.tensor(
+            [[self.swa_pool_ptr, 0] for _ in range(num_layers)],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        self.kv_cache_pool_mapping = torch.tensor(
+            [[layer, 0] for layer in range(num_layers)],
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        self.num_attention_op_pools = num_layers
+        # The staged kind of every (layer, sliding-window cache role), which does not change.
+        self._sliding_kinds: list[list[StagingKind | None]] = [
+            [None] * len(self._SLIDING) for _ in range(num_layers)
+        ]
+        for index, attention_type in enumerate(self._SLIDING):
+            for kind in self.layout.kinds:
+                if attention_type in kind.attention_types:
+                    for layer in self.layout.layers_of(kind):
+                        self._sliding_kinds[layer][index] = kind
+        self._buffers: dict[tuple[int, DeepseekV4AttentionType], torch.Tensor] = {}
+        self._tables: dict[tuple[StagingKind, int], torch.Tensor] | None = None
+        self._width = 0
+        self._num_requests = 0
+        self._sliding: torch.Tensor | None = None
+        # Moves the pages between the real manager and the staging area; none: the content of the
+        # staging area is not maintained (warm-up and profiling forwards).
+        self.dkv_streamer = None
+
+    def __getattr__(self, name: str):
+        # Only called for what the view does not define itself.
+        if name == "_manager":
+            raise AttributeError(name)
+        return getattr(self._manager, name)
+
+    # ---- buffers --------------------------------------------------------------------------
+
+    def _component(self, layer: int, attention_type: DeepseekV4AttentionType) -> StagingComponent:
+        for component in self.layout.components:
+            if component.attention_type is attention_type and layer in self.layout.layers_of(
+                component.kind
+            ):
+                return component
+        raise KeyError(f"layer {layer} has no {attention_type.name} storage")
+
+    def get_buffers(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> torch.Tensor:
+        """The staged pages of a layer's cache role, shaped ``[pages, rows per page, row size]``.
+
+        The pages are indexed like the cache manager's: by the entries of the block tables this
+        view builds. The tensor starts at the layer's base address, so a table entry is a number of
+        pages from there.
+        """
+        key = (layer_idx, attn_type)
+        if key not in self._buffers:
+            manager = self._manager
+            component = self._component(layer_idx, attn_type)
+            layout = self.layout
+            page_bytes = layout.page_bytes(component)
+            rows = layout.geometry.tokens_per_block
+            if attn_type in (
+                DeepseekV4AttentionType.COMPRESS,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+            ):
+                rows //= component.kind.compress_ratio
+            row_bytes = page_bytes // rows
+            base = self.pool.layer_pointer(layer_idx, component)
+            region_end = (
+                self.pool.buffer.data_ptr()
+                + layout.region_offset(component)
+                + layout.region_bytes(component)
+            )
+            pages = (region_end - base) // page_bytes
+            if attn_type is DeepseekV4AttentionType.INDEXER_COMPRESS:
+                dtype = manager._indexer_dtype
+            elif attn_type in (
+                DeepseekV4AttentionType.COMPRESSOR_KV,
+                DeepseekV4AttentionType.COMPRESSOR_SCORE,
+                DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
+                DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+            ):
+                dtype = manager._compressor_dtype
+            else:
+                dtype = manager.dtype
+            if attn_type is DeepseekV4AttentionType.INDEXER_COMPRESS:
+                row_elements = manager._indexer_data_size + manager._indexer_scale_size
+            else:
+                row_elements = _elements_per_row(row_bytes, dtype)
+            self._buffers[key] = convert_to_torch_tensor(
+                TensorWrapper(base, dtype, (pages, rows, row_elements))
+            )
+        return self._buffers[key]
+
+    def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
+        buffer = self.get_buffers(layer_idx, DeepseekV4AttentionType.INDEXER_COMPRESS).unsqueeze(2)
+        return buffer.view(torch.uint8)
+
+    def get_compress_scale_buffers(self, layer_idx: int) -> torch.Tensor:
+        raise RuntimeError("COMPRESS block scales exist only for the NVFP4 KV cache.")
+
+    def get_compress_pool_buffers(self, compress_ratio: int):
+        raise RuntimeError("COMPRESS NVFP4 pools are not staged.")
+
+    # ---- block tables ---------------------------------------------------------------------
+
+    def begin_staged_batch(
+        self,
+        request_ids: Sequence[int],
+        history_tokens: Sequence[int],
+        new_tokens: Sequence[int],
+        num_contexts: int,
+    ) -> None:
+        """Place the requests of the iteration in the slots; the tables follow from this.
+
+        ``history_tokens`` are the tokens each request already has cached and ``new_tokens`` the
+        ones the iteration computes, in the order of the batch. Raises ``StagingOverflow`` when the
+        requests need more pages than a slot has.
+        """
+        if not (len(request_ids) == len(history_tokens) == len(new_tokens)):
+            raise ValueError("request_ids, history_tokens and new_tokens differ in length")
+        requests = list(zip(history_tokens, new_tokens))
+        layout = self.layout
+        spans = {kind: layout.request_spans(kind, requests) for kind in layout.kinds}
+        self._width = max(
+            (
+                span.first_block + span.num_pages
+                for kind_spans in spans.values()
+                for span in kind_spans
+            ),
+            default=0,
+        )
+        max_blocks = self._manager.max_blocks_per_seq
+        if self._width > max_blocks:
+            raise StagingOverflow(
+                f"a request spans {self._width} blocks, the block tables have {max_blocks}"
+            )
+        tables: dict[tuple[StagingKind, int], torch.Tensor] = {}
+        for kind in layout.kinds:
+            slots = (0,) if kind.shared_page_index else range(layout.geometry.ring_depth)
+            for slot in slots:
+                slot_offset = 0 if kind.shared_page_index else slot * layout.slot_pages(kind)
+                table = torch.full((len(requests), self._width), BAD_PAGE_INDEX, dtype=torch.int32)
+                for row, span in enumerate(spans[kind]):
+                    first = slot_offset + span.page_offset
+                    table[row, span.first_block : span.first_block + span.num_pages] = torch.arange(
+                        first, first + span.num_pages, dtype=torch.int32
+                    )
+                tables[kind, slot] = table
+        self._tables = tables
+        self._sliding = None
+        self._num_requests = len(requests)
+        if self.dkv_streamer is not None:
+            self.dkv_streamer.begin_iteration(request_ids, history_tokens, new_tokens, spans)
+
+    def _table(self, kind: StagingKind, layer: int) -> torch.Tensor:
+        if self._tables is None:
+            raise RuntimeError("No batch is staged: begin_staged_batch has not been called")
+        slot = 0 if kind.shared_page_index else self.layout.slot_of(layer, kind)
+        return self._tables[kind, slot]
+
+    def compute_sliding_block_tables(self, request_ids: Sequence[int], num_contexts: int) -> None:
+        """Build the per-layer block tables of the sliding-window cache roles for the batch."""
+        if self._tables is None:
+            raise RuntimeError("No batch is staged: begin_staged_batch has not been called")
+        tables = torch.full(
+            (self.num_layers, len(self._SLIDING), self._num_requests, self._width),
+            BAD_PAGE_INDEX,
+            dtype=torch.int32,
+        )
+        for layer in range(self.num_layers):
+            for index, kind in enumerate(self._sliding_kinds[layer]):
+                if kind is not None:
+                    tables[layer, index] = self._table(kind, layer)
+        self._sliding = tables
+
+    def copy_batch_sliding_block_tables(
+        self, dst_tensor: torch.Tensor, request_ids: Sequence[int], num_contexts: int, num_seqs: int
+    ) -> None:
+        assert dst_tensor.is_cuda, "copy_batch_sliding_block_tables expects a CUDA destination"
+        dst_tensor.fill_(BAD_PAGE_INDEX)
+        if self._width:
+            dst_tensor[:, :, :num_seqs, : self._width].copy_(
+                self._sliding[:, :, :num_seqs], non_blocking=True
+            )
+
+    def copy_batch_block_offsets(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: Sequence[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+        max_blocks: int | None = None,
+    ) -> None:
+        """For the attention op: the sliding-window (SWA) table of every layer."""
+        assert beam_width == 1, "DSV4 only supports beam width 1 now"
+        assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
+        dst_tensor.fill_(BAD_PAGE_INDEX)
+        if self._width:
+            dst_tensor[:, :num_seqs, 0, : self._width].copy_(
+                self._sliding[:, DeepseekV4AttentionType.SWA.value, :num_seqs], non_blocking=True
+            )
+
+    def copy_batch_compress_block_tables(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: Sequence[int],
+        compress_ratio: int,
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+    ) -> None:
+        assert beam_width == 1, "DSV4 only supports beam width 1 now"
+        kind = {4: StagingKind.COMPRESS_R4, 128: StagingKind.COMPRESS_R128}[compress_ratio]
+        dst_tensor[:num_seqs].fill_(BAD_PAGE_INDEX)
+        if self._width:
+            dst_tensor[:num_seqs, : self._width].copy_(self._table(kind, 0), non_blocking=True)
+
+    def copy_batch_indexer_compress_block_tables(
+        self,
+        host_block_table: torch.Tensor,
+        request_ids: Sequence[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+    ) -> None:
+        assert beam_width == 1, "DSV4 only supports beam width 1 now"
+        host_block_table[:num_seqs].fill_(BAD_PAGE_INDEX)
+        if self._width:
+            host_block_table[:num_seqs, : self._width] = self._table(
+                StagingKind.INDEXER_COMPRESS, 0
+            )
+
+
+def _elements_per_row(row_bytes: int, dtype) -> int:
+    """How many elements of a bindings ``DataType`` a row of ``row_bytes`` bytes holds."""
+    return row_bytes // get_size_in_bytes(1, dtype)
 
 
 def pool_page_addresses(
