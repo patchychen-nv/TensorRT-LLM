@@ -85,6 +85,62 @@ def test_transfer_id_cannot_be_claimed_by_two_owners() -> None:
     assert errors[0] == errors[1]
 
 
+def test_every_rank_reports_its_own_send_of_a_request_under_the_layer_split() -> None:
+    group = LockstepTpGroup(3)
+    results = group.run(
+        lambda dist: sync_dkv_control(
+            dist,
+            _payload(
+                transfer_events=(
+                    DkvTransferEvent(4, 2, "completed", "", dist.tp_rank),
+                    DkvTransferEvent(9 - dist.tp_rank, 1, "failed", "reset", dist.tp_rank),
+                )
+            ),
+        )
+    )
+    expected = (
+        DkvTransferEvent(4, 2, "completed", "", 0),
+        DkvTransferEvent(4, 2, "completed", "", 1),
+        DkvTransferEvent(4, 2, "completed", "", 2),
+        DkvTransferEvent(7, 1, "failed", "reset", 2),
+        DkvTransferEvent(8, 1, "failed", "reset", 1),
+        DkvTransferEvent(9, 1, "failed", "reset", 0),
+    )
+    assert results == [DkvControlResult((), False, expected)] * 3
+    assert [len(trace) for trace in group.traces] == [1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        DkvTransferEvent(4, 0, "completed", "", 1),
+        DkvTransferEvent(4, 0, "completed", "", True),
+    ],
+)
+def test_a_rank_cannot_report_the_send_of_another_rank(event) -> None:
+    group = LockstepTpGroup(2)
+
+    def run_rank(dist):
+        payload = _payload(transfer_events=(event,) if dist.tp_rank == 0 else ())
+        with pytest.raises(RuntimeError, match="invalid transfer event") as caught:
+            sync_dkv_control(dist, payload)
+        return str(caught.value)
+
+    errors = group.run(run_rank)
+    assert errors[0] == errors[1]
+
+
+def test_a_rank_cannot_report_its_send_of_a_request_twice() -> None:
+    group = LockstepTpGroup(2)
+
+    def run_rank(dist):
+        events = (DkvTransferEvent(4, 1, "completed", "", dist.tp_rank),) * 2
+        with pytest.raises(RuntimeError, match="duplicate transfer event"):
+            sync_dkv_control(dist, _payload(transfer_events=events))
+
+    group.run(run_rank)
+
+
 def test_request_id_digest_ignores_order_and_distinguishes_sets() -> None:
     assert digest_request_ids([3, 1, 2]) == digest_request_ids((1, 2, 3))
     assert digest_request_ids([]) != digest_request_ids([0])

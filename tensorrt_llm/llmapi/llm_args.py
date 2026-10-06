@@ -6852,10 +6852,6 @@ class TorchLlmArgs(BaseLlmArgs):
         if os.environ.get("TRTLLM_DKV_DUAL_LEDGER", "1") != "1":
             raise ValueError(f"TRTLLM_DKV_DUAL_LEDGER=0 {suffix}; the staging "
                              "budget lives in the dual ledger")
-        transceiver_config = self.cache_transceiver_config
-        if (transceiver_config is not None
-                and transceiver_config.backend is not None):
-            raise ValueError(f"cache_transceiver_config.backend {suffix}")
 
     @model_validator(mode="after")
     def validate_speculative_config(self):

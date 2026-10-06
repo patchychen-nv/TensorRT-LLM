@@ -15,12 +15,18 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse
 
 @dataclass(frozen=True)
 class DkvTransferEvent:
-    """A compute rank's physically retired context transfer for S-control."""
+    """A rank's physically retired context transfer for S-control.
+
+    Under the replicated layout only the compute rank of a request sends it and reports the event.
+    Under the layer-split layout every rank sends the layers it owns, and ``rank`` names the rank
+    that reports its own send of a request, whose compute rank is ``compute_rank``.
+    """
 
     request_id: int
     compute_rank: int
     outcome: Literal["completed", "failed", "timed_out"]
     error_message: str = ""
+    rank: Optional[int] = None
 
 
 class ExecutorEffects(Protocol):

@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, cast
 
 import numpy as np
 import torch
@@ -230,6 +230,28 @@ def _validate_fp4_mla_bridge_profile(
     return True
 
 
+def layer_split_layer_counts(layers_by_rank: Sequence[Sequence[int]]) -> List[int]:
+    """The number of layers of every rank of a layer-split group.
+
+    The ranks own consecutive ranges of the layers of the model in rank order, which is how a
+    pipeline of that many stages divides it, so the group is published as such a pipeline.
+
+    Raises:
+        ValueError: A rank owns something other than the layers that follow those of the ranks
+            before it.
+    """
+    first = 0
+    for rank, layers in enumerate(layers_by_rank):
+        if not layers or list(layers) != list(range(first, first + len(layers))):
+            raise ValueError(
+                f"rank {rank} owns layers {list(layers)}, but a layer-split context worker "
+                f"publishes consecutive layer ranges in rank order, and this one starts at "
+                f"layer {first}"
+            )
+        first += len(layers)
+    return [len(layers) for layers in layers_by_rank]
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
     @property
     def consumes_transfer_buffer(self) -> bool:
@@ -247,6 +269,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
+        # Under the layer-split layout of DKV every rank holds the layers it owns for every request.
+        self._layer_split = getattr(kv_cache_manager, "dkv_layer_split", False) is True
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         if self.kv_transfer_timeout_ms is None:
             raise ValueError("KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms")
@@ -332,7 +356,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             f"KvCacheTransceiverV2 setup: rank={rank} TransferWorker ready; "
             "broadcast context endpoint (collective)"
         )
-        self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
+        # The ranks of a layer-split group are the pipeline stages of one worker, whose requests
+        # all belong to data-parallel rank 0.
+        self._dp_rank = (
+            mapping.tp_rank if mapping.enable_attention_dp and not self._layer_split else 0
+        )
         self._context_info_endpoint = self._broadcast_context_endpoint()
         self._init_sync_policy()
         logger.info(f"KvCacheTransceiverV2 setup: rank={rank} exchange rank info (collective)")
@@ -404,6 +432,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
+        if self._layer_split:
+            layers_by_rank = cast(
+                list, self._dist.allgather(list(self._kv_cache_manager.pp_layers))
+            )
+            layer_num_per_pp = layer_split_layer_counts(layers_by_rank)
+            self._transfer_worker.populate_instance_and_rank_info(
+                endpoints=endpoints, layer_num_per_pp=layer_num_per_pp, virtual_pp=True
+            )
+            logger.info(f"transfer worker ctx_server_endpoints: {endpoints}")
+            logger.info(f"layer split, layer_num_per_pp: {layer_num_per_pp}")
+            logger.info(f"self._context_info_endpoint: {self._context_info_endpoint}")
+            return
         layer_num = len(self._kv_cache_manager.pp_layers)
         if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
             self._kv_cache_manager, MambaHybridCacheManagerV2
@@ -1536,7 +1576,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # broadcasts REQUEST_DATA to all ctx DP ranks.  The actual ctx_dp_rank
         # is stamped into ContextPhaseParams by respond_and_send_async() after
         # the prefill is scheduled.
-        ctx_dp_rank = None if self._mapping.enable_attention_dp else self._dp_rank
+        ctx_dp_rank = (
+            None if self._mapping.enable_attention_dp and not self._layer_split else self._dp_rank
+        )
         return {
             "ctx_dp_rank": ctx_dp_rank,
             "ctx_info_endpoint": [self._context_info_endpoint]

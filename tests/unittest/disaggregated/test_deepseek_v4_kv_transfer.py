@@ -127,6 +127,7 @@ def _init_pool_data(
     tp: int,
     seed_base: int = 0,
     fill_random: bool = True,
+    layer_split: bool = False,
 ) -> None:
     """Initialize pool data for all managers.
 
@@ -139,6 +140,7 @@ def _init_pool_data(
         tp: TP size.
         seed_base: Base seed offset (different for ctx vs gen to avoid collisions).
         fill_random: If True fill with random data (ctx), if False fill with zeros (gen).
+        layer_split: Every rank holds other layers, so every rank has a seed of its own.
     """
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
@@ -162,7 +164,7 @@ def _init_pool_data(
             )
             if fill_random:
                 # Same seed for same pp_rank across TP ranks (kv_heads=1)
-                seed = seed_base + pp_rank
+                seed = seed_base + (rank if layer_split else pp_rank)
                 generator = torch.Generator(device=pool_tensor.device).manual_seed(seed)
                 random_values = torch.rand(
                     pool_tensor.shape,
@@ -300,19 +302,22 @@ def _find_ctx_rank_for_layer(
     ctx_tp: int,
     ctx_enable_dp: bool,
     req_idx: int,
+    ctx_layer_split: bool = False,
 ) -> int:
     """Find the ctx rank that owns a given model layer.
 
-    Returns a rank with the correct PP rank and correct TP rank for DP.
+    Returns a rank with the correct PP rank and correct TP rank for DP. In a layer-split group every
+    rank holds the layers it owns of every request.
     """
     for rank, mgr in enumerate(ctx_managers):
         tp_rank = rank % ctx_tp
-        if ctx_enable_dp:
-            if req_idx % ctx_tp != tp_rank:
+        if not ctx_layer_split:
+            if ctx_enable_dp:
+                if req_idx % ctx_tp != tp_rank:
+                    continue
+            elif tp_rank != 0:
+                # Without DP, all TP ranks have same data; use tp_rank=0
                 continue
-        elif tp_rank != 0:
-            # Without DP, all TP ranks have same data; use tp_rank=0
-            continue
         if layer_idx in mgr.pp_layers:
             return rank
     raise ValueError(f"No ctx rank found for layer {layer_idx}")
@@ -331,6 +336,7 @@ def verify_all_requests(
     gen_enable_dp: bool,
     ctx_request_ids: List[int],
     gen_request_ids: List[int],
+    ctx_layer_split: bool = False,
 ):
     """Verify transferred cache data for all requests across all gen ranks."""
     gen_world = gen_tp * gen_pp
@@ -356,6 +362,7 @@ def verify_all_requests(
                     ctx_tp,
                     ctx_enable_dp,
                     req_idx,
+                    ctx_layer_split,
                 )
                 ctx_mgr = ctx_managers[ctx_rank]
 
@@ -590,3 +597,114 @@ def test_deepseek_v4_kv_transfer_uneven_pp(
     )
 
     print("PASSED")
+
+
+# ---------------------------------------------------------------------------
+# A layer-split context group (DKV): every rank holds the layers it owns of every request
+# ---------------------------------------------------------------------------
+LAYER_SPLIT_COMPRESS_RATIOS = [4, 128, 1] * 4
+
+
+def _create_layer_split_managers(
+    group_size: int, compress_ratios: List[int]
+) -> List[DeepseekV4CacheManager]:
+    """The cache managers of a layer-split group, with the page counts fixed per life cycle."""
+    from tensorrt_llm._torch.pyexecutor.dkv import compute_ownership, owned_layers
+    from tensorrt_llm._torch.pyexecutor.kv_cache.lifecycle_slot_counts import (
+        solve_lifecycle_slot_counts,
+    )
+
+    owners = compute_ownership(len(compress_ratios), group_size)
+    managers = []
+    for rank in range(group_size):
+        mapping = Mapping(
+            world_size=group_size,
+            rank=rank,
+            tp_size=group_size,
+            pp_size=1,
+            enable_attention_dp=True,
+        )
+        max_num_tokens = MAX_SEQ_LEN * MAX_BATCH_SIZE
+        managers.append(
+            DeepseekV4CacheManager(
+                kv_cache_config=KvCacheConfig(
+                    dtype="fp8_ds_mla" if get_sm_version() == 90 else "auto",
+                    enable_block_reuse=False,
+                    max_tokens=max_num_tokens,
+                    event_buffer_max_size=0,
+                ),
+                kv_cache_type=CacheTypeCpp.SELFKONLY,
+                num_layers=len(compress_ratios),
+                num_kv_heads=NUM_KV_HEADS,
+                head_dim=HEAD_DIM,
+                tokens_per_block=TOKENS_PER_BLOCK,
+                max_seq_len=MAX_SEQ_LEN,
+                max_batch_size=MAX_BATCH_SIZE,
+                mapping=mapping,
+                dtype=DataType.BF16,
+                compressor_dtype=DataType.FLOAT,
+                vocab_size=VOCAB_SIZE,
+                max_num_tokens=max_num_tokens,
+                sparse_attn_config=DeepSeekV4SparseAttentionConfig(
+                    index_head_dim=INDEX_HEAD_DIM,
+                    window_size=WINDOW_SIZE,
+                    compress_ratios=compress_ratios,
+                ),
+                owned_layers=owned_layers(owners, rank),
+                lifecycle_slot_counts=solve_lifecycle_slot_counts,
+            )
+        )
+    return managers
+
+
+LAYER_SPLIT_CONFIGS = [
+    # (group_size, gen_tp, gen_pp, gen_enable_dp, test_id)
+    (2, 1, 1, False, "g2_to_tp1"),
+    (2, 2, 1, False, "g2_to_tp2"),
+    (2, 1, 2, False, "g2_to_pp2"),
+    (4, 1, 1, False, "g4_to_tp1"),
+    (4, 2, 1, False, "g4_to_tp2"),
+    (4, 4, 1, False, "g4_to_tp4"),
+    (4, 2, 2, False, "g4_to_tp2_pp2"),
+    # The stages of generation share a context rank where the layers of the two do not line up.
+    (4, 1, 3, False, "g4_to_pp3"),
+    (4, 2, 1, True, "g4_to_tp2_dp"),
+]
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize(
+    "group_size,gen_tp,gen_pp,gen_enable_dp",
+    [config[:4] for config in LAYER_SPLIT_CONFIGS],
+    ids=[config[4] for config in LAYER_SPLIT_CONFIGS],
+)
+@pytest.mark.parametrize(
+    "update_before_transfer",
+    [True, False],
+    ids=["update_before", "update_after"],
+)
+def test_deepseek_v4_layer_split_kv_transfer(
+    group_size, gen_tp, gen_pp, gen_enable_dp, update_before_transfer
+):
+    """Every rank of a layer-split context group sends its layers of every request."""
+    compress_ratios = LAYER_SPLIT_COMPRESS_RATIOS
+    run_kv_transfer_test(
+        ctx_tp=group_size,
+        ctx_pp=1,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=True,
+        gen_enable_dp=gen_enable_dp,
+        update_before_transfer=update_before_transfer,
+        manager_factory=lambda tp, pp, enable_dp: _create_managers_for_instance(
+            tp, pp, enable_dp, compress_ratios
+        ),
+        ctx_manager_factory=lambda tp, pp, enable_dp: _create_layer_split_managers(
+            tp, compress_ratios
+        ),
+        ctx_layer_split=True,
+        init_fn=functools.partial(_init_pool_data, layer_split=True),
+        verify_fn=functools.partial(
+            verify_all_requests, compress_ratios=compress_ratios, ctx_layer_split=True
+        ),
+    )

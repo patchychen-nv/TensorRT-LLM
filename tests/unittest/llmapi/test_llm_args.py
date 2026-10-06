@@ -5302,15 +5302,16 @@ class TestDkvConfig:
                 block_reuse_config=BlockReuseConfig(policy="per_request"))
         }, "kv_cache_config.dtype='nvfp4' is not supported with dkv_config "
          "layer_split yet"),
-        ({
-            "cache_transceiver_config": CacheTransceiverConfig(backend="NIXL")
-        }, "cache_transceiver_config.backend is not supported with "
-         "dkv_config layer_split yet"),
     ])
     def test_layer_split_rejects_what_its_data_plane_cannot_host(
             self, kwargs, message) -> None:
         with pytest.raises(ValueError, match=message):
             self._layer_split_args(**kwargs)
+
+    def test_layer_split_accepts_a_cache_transceiver(self) -> None:
+        args = self._layer_split_args(
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"))
+        assert args.cache_transceiver_config.backend == "NIXL"
 
     def test_layer_split_needs_the_dual_ledger(self, monkeypatch) -> None:
         monkeypatch.setenv("TRTLLM_DKV_DUAL_LEDGER", "0")

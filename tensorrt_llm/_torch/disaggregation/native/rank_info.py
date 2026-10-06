@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict, dataclass
-from typing import List, Optional
+from dataclasses import asdict, dataclass, fields
+from typing import Iterable, List, Optional
 
 import msgpack
 
@@ -48,6 +48,9 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    # The instance is a layer-split group of DKV published as a pipeline: every rank is a stage
+    # that holds a range of the layers of every request, and every stage writes to a peer.
+    layer_split: bool = False
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -60,6 +63,9 @@ class RankInfo:
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
+        if not self.layer_split:
+            # A peer of an earlier version still reads the description of an ordinary instance.
+            del data["layer_split"]
         return msgpack.packb(data)
 
     @classmethod
@@ -117,6 +123,12 @@ class RankInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
+        unknown = sorted(set(unpacked) - {field.name for field in fields(cls)})
+        if unknown:
+            raise ValueError(
+                f"The rank info carries the fields {unknown}, which this version does not know: "
+                "run the context and the generation workers of the same version"
+            )
         if unpacked.get("attention") is not None:
             unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:
@@ -124,3 +136,59 @@ class RankInfo:
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
         return cls(**unpacked)
+
+
+def validate_layer_split_peer(self_info: RankInfo, peer_info: RankInfo) -> None:
+    """Check that a layer-split context group covers every layer of this worker.
+
+    Every rank of the group is a stage that writes the layers it holds, so the stages must add up
+    to the layers of this worker: a request would otherwise be received without some of them and
+    nothing would notice.
+
+    Raises:
+        ValueError: The group does not cover the layers of this worker exactly.
+    """
+    if not peer_info.layer_split:
+        return
+    peer_layers = sum(peer_info.layer_num_per_pp)
+    own_layers = sum(self_info.layer_num_per_pp)
+    if len(peer_info.layer_num_per_pp) != peer_info.pp_size or peer_layers != own_layers:
+        raise ValueError(
+            f"a layer-split context worker with {peer_info.pp_size} ranks holding "
+            f"{list(peer_info.layer_num_per_pp)} layers does not cover the {own_layers} layers of "
+            "this worker"
+        )
+
+
+def layer_split_coverage_gap(
+    self_info: RankInfo, peer_info: RankInfo, writers: Iterable[int]
+) -> Optional[str]:
+    """Say which layers of this rank no writer of a layer-split context worker sends.
+
+    The ranks of the group are its stages, so the layers of a writer are the range of its stage. A
+    worker that is a pipeline stage itself is written by the stages that overlap its own layers
+    only; together they have to cover them exactly.
+
+    Args:
+        self_info: The receiving rank.
+        peer_info: Any rank of the layer-split group, which describes the group.
+        writers: The ranks of the group that write to this rank.
+
+    Returns:
+        A description of the gap, or None if the writers cover the layers of this rank.
+    """
+    counts = list(peer_info.layer_num_per_pp)
+    first = sum(self_info.layer_num_per_pp[: self_info.pp_rank])
+    last = first + self_info.layer_num_per_pp[self_info.pp_rank]
+    covered = 0
+    for stage in sorted(set(writers)):
+        if not 0 <= stage < len(counts):
+            return f"rank {stage} is not one of the {len(counts)} ranks of the context worker"
+        begin = sum(counts[:stage])
+        covered += max(0, min(begin + counts[stage], last) - max(begin, first))
+    if covered != last - first:
+        return (
+            f"the ranks {sorted(set(writers))} of the context worker send {covered} of the "
+            f"{last - first} layers of this rank ({first}..{last - 1})"
+        )
+    return None

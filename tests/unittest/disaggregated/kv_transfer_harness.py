@@ -206,8 +206,16 @@ def run_kv_transfer_test(
     manager_factory: ManagerFactory[_CacheManagerT],
     init_fn: CacheInitializer[_CacheManagerT],
     verify_fn: CacheVerifier[_CacheManagerT],
+    ctx_manager_factory: Optional[ManagerFactory[_CacheManagerT]] = None,
+    ctx_layer_split: bool = False,
 ) -> None:
-    """Run one ctx->gen KV transfer with injectable model-specific cache hooks."""
+    """Run one ctx->gen KV transfer with injectable model-specific cache hooks.
+
+    ``ctx_manager_factory`` builds the managers of the context instance when they differ from
+    those of the generation instance. With ``ctx_layer_split`` the context instance is a
+    layer-split group (``ctx_tp`` attention-data-parallel ranks, each holding the layers it owns):
+    every rank handles every request, and the group is data-parallel rank 0 for the generation side.
+    """
     ctx_world = ctx_tp * ctx_pp
     gen_world = gen_tp * gen_pp
 
@@ -216,7 +224,7 @@ def run_kv_transfer_test(
     request_lengths = [65, 256, 129, 383]
 
     # ===== 1. Create cache managers =====
-    ctx_managers = list(manager_factory(ctx_tp, ctx_pp, ctx_enable_dp))
+    ctx_managers = list((ctx_manager_factory or manager_factory)(ctx_tp, ctx_pp, ctx_enable_dp))
     gen_managers = list(manager_factory(gen_tp, gen_pp, gen_enable_dp))
 
     # ===== 2. Initialize data =====
@@ -253,7 +261,7 @@ def run_kv_transfer_test(
             ctx_request_ids.append(ctx_rid)
             gen_request_ids.append(gen_rid)
 
-            ctx_dp_rank = req_idx % ctx_tp if ctx_enable_dp else 0
+            ctx_dp_rank = req_idx % ctx_tp if ctx_enable_dp and not ctx_layer_split else 0
 
             ctx_request = LlmRequest(
                 request_id=ctx_rid,
@@ -286,7 +294,9 @@ def run_kv_transfer_test(
 
             for rank in range(ctx_world):
                 tp_rank = rank % ctx_tp
-                should_handle = (not ctx_enable_dp) or (req_idx % ctx_tp == tp_rank)
+                should_handle = (
+                    ctx_layer_split or (not ctx_enable_dp) or (req_idx % ctx_tp == tp_rank)
+                )
                 if should_handle:
                     ctx_handle_map[rank].append((req_idx, ctx_request))
 

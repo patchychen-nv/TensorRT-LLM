@@ -69,7 +69,11 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import (
+    RankInfo,
+    layer_split_coverage_gap,
+    validate_layer_split_peer,
+)
 from tensorrt_llm._torch.disaggregation.native.retirement import (
     QuiescenceFatalEvent,
     RetirementDeadline,
@@ -2805,6 +2809,9 @@ class KVRecvTask(_LogicalTask):
         self.slice_id = slice_id
         self.status = TaskStatus.INIT
         self.expected_transfers = 0
+        # The ranks the destination was published to: only they may report on the piece. None
+        # until the piece is dispatched.
+        self.authorized_writers: Optional[set[int]] = None
         # One terminal result per writer rank, keyed by the rank the result frame carries.
         self._writer_reports: dict[int, bool] = {}
         # Verified-range admission accounting: the receiver-computed byte
@@ -2878,7 +2885,15 @@ class KVRecvTask(_LogicalTask):
         repeat is refused outright, so the caller settles the piece once rather than once per frame.
         Callers hold ``RxSession.lock``, which serializes the writes.
         """
-        # TODO: a report from a rank outside the authorized writer set is counted, not rejected.
+        if self.authorized_writers is not None and peer_rank not in self.authorized_writers:
+            self.fail(
+                RuntimeError(
+                    f"rank {peer_rank} reported on slice {self.slice_id} of request "
+                    f"{self._unique_rid}, but the request was published to ranks "
+                    f"{sorted(self.authorized_writers)} only"
+                )
+            )
+            return False, False
         if peer_rank in self._writer_reports:
             previous = self._writer_reports[peer_rank]
             if previous != succeeded:
@@ -3178,6 +3193,20 @@ class Receiver(ReceiverBase):
                     return int(block_ids[0])
         return None
 
+    def _fail_unpublished_task(self, task: KVRecvTask, error: PeerIncompatibleError) -> None:
+        """Fail a request that no sender has been told about yet.
+
+        The task is in the session's ``_kv_tasks``, no bounce reservation exists and
+        ``session._sender_endpoints`` is still empty, so the unpublished owner can close locally.
+        """
+        if self._enforce_physical_ownership:
+            session = self._get_session(task._unique_rid)
+            if session is None:
+                task.cancel_unpublished()
+            else:
+                session.cancel_unpublished_task(task)
+        task.fail(error)
+
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
         logger.debug(
@@ -3203,13 +3232,7 @@ class Receiver(ReceiverBase):
                 "dispatch_task: context peer incompatible, failing request "
                 f"unique_rid={task._unique_rid}: {e}"
             )
-            if self._enforce_physical_ownership:
-                session = self._get_session(task._unique_rid)
-                if session is None:
-                    task.cancel_unpublished()
-                else:
-                    session.cancel_unpublished_task(task)
-            task.fail(e)
+            self._fail_unpublished_task(task, e)
             return
 
         if sender_dp_rank is not None:
@@ -3240,6 +3263,21 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
+        task.authorized_writers = set(peer_overlap.ranks)
+        if peer_infos.layer_split:
+            gap = layer_split_coverage_gap(
+                self._registrar.self_rank_info, peer_infos, peer_overlap.ranks
+            )
+            if gap is not None:
+                error = PeerIncompatibleError(
+                    f"request {task._unique_rid} would miss layers of a layer-split context "
+                    f"worker: {gap}"
+                )
+                logger.error(
+                    f"dispatch_task: failing request unique_rid={task._unique_rid}: {error}"
+                )
+                self._fail_unpublished_task(task, error)
+                return
         # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
         # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
@@ -3395,6 +3433,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                validate_layer_split_peer(self._registrar.self_rank_info, sender_info)
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
@@ -4554,10 +4593,31 @@ class TransferWorker:
         if watchdog is not None:
             watchdog.request_shutdown()
 
-    def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
+    def populate_instance_and_rank_info(
+        self, endpoints: list[str], layer_num_per_pp: list[int], virtual_pp: bool = False
+    ):
+        """Fill in what the ranks of the instance have to agree on.
+
+        ``virtual_pp`` publishes the instance as one tensor-parallel rank with as many pipeline
+        stages as it has ranks, rank ``r`` being stage ``r``. A layer-split context group is
+        published so: every rank holds the layers of one range of the model for every request,
+        which is what a pipeline stage holds, so a peer finds every rank among the writers of a
+        request and the layers each one sends from its layer ranges.
+        """
         assert self._rank_info is not None
-        self._rank_info.sender_endpoints = endpoints
-        self._rank_info.layer_num_per_pp = layer_num_per_pp
+        info = self._rank_info
+        info.sender_endpoints = endpoints
+        info.layer_num_per_pp = layer_num_per_pp
+        if virtual_pp:
+            info.pp_size = len(layer_num_per_pp)
+            info.pp_rank = info.tp_rank
+            info.tp_size = 1
+            info.tp_rank = 0
+            info.dp_size = 1
+            info.dp_rank = 0
+            info.layer_split = True
+            if info.attention is not None:
+                info.attention.enable_attention_dp = False
 
     def create_tx_session(self, request: LlmRequest) -> TxSession:
         params = request.py_disaggregated_params

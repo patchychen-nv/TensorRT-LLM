@@ -711,8 +711,13 @@ every rank derives from the replicated scheduling state, so no rank exchanges th
 host waits for the data stream at the end of every iteration, before a page can be freed or
 moved. The ranks agree on the number of pages of every KV life cycle, since the layers they
 hold differ in bytes. The layout needs DeepSeek-V4 on SM100 or SM103, `cuda_graph_config: null`,
-no `torch_compile_config`, no cache transceiver (the context-transfer path is not available
-yet) and every rank to own layers of every KV life cycle, which limits the group size.
+no `torch_compile_config` and every rank to own layers of every KV life cycle, which limits the
+group size. As the context worker of a disaggregated deployment, every rank sends the layers it
+owns of every request. The group is published to the generation workers as one tensor-parallel
+rank of a pipeline with as many stages as the group has ranks, so a generation worker is
+configured as for any other context worker, but both sides have to run a version that knows the
+layout. A request is done when every rank has finished its send; the failure or the timeout of one
+rank cancels the sends of all.
 
 `TRTLLM_DKV_STAGING_TOKENS`, `TRTLLM_DKV_STAGING_DEPTH` and `TRTLLM_DKV_STAGING_FILL` work as
 for the loopback. `TRTLLM_DKV_TRANSPORT_TIMEOUT_S` (default 60) is how long the host waits for

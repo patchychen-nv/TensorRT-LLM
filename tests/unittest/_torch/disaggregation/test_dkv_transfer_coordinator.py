@@ -62,7 +62,7 @@ def _request(request_id=7, owner=1):
     return request
 
 
-def _rank(rank, requests):
+def _rank(rank, requests, *, every_rank_sends=False):
     registry = _Registry()
     registry.active = requests
     kv = Mock()
@@ -98,6 +98,7 @@ def _rank(rank, requests):
         force_terminate_ctx_for_partial_reuse=False,
         is_kv_manager_v2=True,
         is_local=lambda request: request.py_dkv_compute_rank == rank,
+        every_rank_sends=every_rank_sends,
     )
     return SimpleNamespace(
         coordinator=coordinator,
@@ -458,3 +459,156 @@ def test_legacy_error_and_timeout_votes_are_disabled_for_dkv():
     worker.coordinator.handle_errors_synced()
     worker.coordinator.handle_timeouts_synced()
     worker.effects.fail_requests.assert_not_called()
+
+
+# The layer-split layout: every rank sends the layers it owns of every request
+
+
+def _owner_ranks(requests_of):
+    """Two ranks that each send their layers of a request that rank 1 computes."""
+    return [_rank(rank, requests_of(), every_rank_sends=True) for rank in range(2)]
+
+
+def _report(worker, outcome="completed", message="", request_id=7, rank=None, owner=1):
+    return DkvTransferEvent(
+        request_id, owner, outcome, message, worker_rank(worker) if rank is None else rank
+    )
+
+
+def worker_rank(worker):
+    return worker.coordinator._dist.tp_rank
+
+
+def test_every_rank_sends_the_layers_it_owns_and_starts_its_own_clock():
+    for worker in _owner_ranks(lambda: [_request()]):
+        request = worker.registry.active[0]
+        worker.coordinator.send_completed_context([request])
+        worker.transceiver.respond_and_send_async.assert_called_once_with(request)
+        assert request.py_kv_transfer_start_time is not None
+        assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+
+def test_a_rank_reports_its_own_send_with_its_own_rank():
+    workers = _owner_ranks(lambda: [_request()])
+    for worker in workers:
+        worker.coordinator.send_completed_context(worker.registry.active)
+        worker.transceiver.check_context_transfer_status.return_value = CtxTransferStatus([7], [])
+    for rank, worker in enumerate(workers):
+        assert worker.coordinator.collect_dkv_transfer_events() == (
+            DkvTransferEvent(7, 1, "completed", "", rank),
+        )
+
+
+def test_a_request_is_released_only_when_every_rank_has_reported_it():
+    workers = _owner_ranks(lambda: [_request()])
+    for worker in workers:
+        worker.coordinator.send_completed_context(worker.registry.active)
+    first, second = _report(workers[0], rank=0), _report(workers[1], rank=1)
+    for worker in workers:
+        assert not worker.coordinator.commit_dkv_transfer_events([first])
+        worker.kv.unpin_blocks_by_id.assert_not_called()
+        assert list(worker.transfers.requests_in_transfer()) == [7]
+    for rank, worker in enumerate(workers):
+        request = worker.registry.active[0]
+        assert worker.coordinator.commit_dkv_transfer_events([second])
+        worker.kv.unpin_blocks_by_id.assert_called_once_with(7)
+        assert not worker.transfers.has_any_inflight_requests()
+        # Only the compute rank answers the client.
+        assert request.create_response.call_count == rank
+        response = request.create_response.return_value if rank else None
+        worker.effects.stage_transfer_response.assert_called_once_with(7, response, request)
+
+
+def test_the_reports_of_one_round_are_taken_in_rank_order():
+    workers = _owner_ranks(lambda: [_request()])
+    for worker in workers:
+        worker.coordinator.send_completed_context(worker.registry.active)
+        assert worker.coordinator.commit_dkv_transfer_events(
+            [_report(workers[1], rank=1), _report(workers[0], rank=0)]
+        )
+        worker.kv.unpin_blocks_by_id.assert_called_once_with(7)
+
+
+def test_a_rank_that_has_reported_does_not_report_again_while_the_others_are_still_sending():
+    request = _request()
+    worker = _rank(0, [request], every_rank_sends=True)
+    worker.coordinator.send_completed_context([request])
+    worker.transceiver.check_context_transfer_status.return_value = CtxTransferStatus([7], [])
+    (event,) = worker.coordinator.collect_dkv_transfer_events()
+    assert not worker.coordinator.commit_dkv_transfer_events([event])
+    # The session is retired and nothing is polled for the request any more.
+    worker.transceiver.check_context_transfer_status.return_value = CtxTransferStatus([], [])
+    worker.transceiver.has_retired_send_session.return_value = True
+    assert worker.coordinator.collect_dkv_transfer_events() == ()
+
+
+def test_a_report_that_is_not_a_completion_makes_every_rank_cancel_its_own_send():
+    workers = _owner_ranks(lambda: [_request()])
+    for worker in workers:
+        worker.coordinator.send_completed_context(worker.registry.active)
+    failure = _report(workers[1], "failed", "peer reset", rank=1)
+    for worker in workers:
+        assert not worker.coordinator.commit_dkv_transfer_events([failure])
+        worker.kv.unpin_blocks_by_id.assert_not_called()
+    # Rank 0 is still sending: it cancels, and reports when the send has stopped.
+    workers[0].transceiver.cancel_request.side_effect = [False, True]
+    assert workers[0].coordinator.collect_dkv_transfer_events() == ()
+    (cancelled,) = workers[0].coordinator.collect_dkv_transfer_events()
+    assert cancelled.rank == 0 and cancelled.outcome == "failed"
+    assert "another rank failed" in cancelled.error_message
+    for worker in workers:
+        request = worker.registry.active[0]
+        assert worker.coordinator.commit_dkv_transfer_events([cancelled])
+        assert not worker.transfers.has_any_inflight_requests()
+        worker.effects.fail_requests.assert_called_once()
+        message = worker.effects.fail_requests.call_args.args[0]
+        assert (
+            "rank 0: Context KV transfer cancelled" in message and "rank 1: peer reset" in message
+        )
+        request.create_response.assert_not_called()
+
+
+def test_a_timeout_of_one_rank_is_the_outcome_of_the_request():
+    workers = _owner_ranks(lambda: [_request()])
+    for worker in workers:
+        worker.coordinator.send_completed_context(worker.registry.active)
+        worker.coordinator.commit_dkv_transfer_events(
+            [_report(workers[0], rank=0), _report(workers[1], "timed_out", "late", rank=1)]
+        )
+        worker.effects.fail_requests.assert_called_once_with(
+            "rank 1: late", [worker.registry.active[0]], charge_budget=False
+        )
+        assert worker.registry.active[0].py_kv_transfer_timed_out
+
+
+@pytest.mark.parametrize("malformed", ["unknown", "owner", "duplicate", "state", "no_rank"])
+def test_an_invalid_report_is_rejected_before_any_release(malformed):
+    request = _request()
+    worker = _rank(0, [request], every_rank_sends=True)
+    worker.coordinator.send_completed_context([request])
+    events = [DkvTransferEvent(7, 1, "completed", "", 0)]
+    if malformed == "unknown":
+        events.append(DkvTransferEvent(8, 1, "completed", "", 1))
+    elif malformed == "owner":
+        events = [DkvTransferEvent(7, 0, "completed", "", 0)]
+    elif malformed == "duplicate":
+        events *= 2
+    elif malformed == "state":
+        request.state = LlmRequestState.GENERATION_COMPLETE
+    else:
+        events = [DkvTransferEvent(7, 1, "completed")]
+    with pytest.raises(RuntimeError, match="Invalid DKV transfer event"):
+        worker.coordinator.commit_dkv_transfer_events(events)
+    worker.kv.unpin_blocks_by_id.assert_not_called()
+
+
+def test_an_unresolved_send_of_a_rank_that_is_not_the_compute_rank_is_a_stall():
+    request = _request()
+    worker = _rank(0, [request], every_rank_sends=True)
+    worker.transceiver.cancel_request.return_value = False
+    with patch(_CLOCK, return_value=10):
+        worker.coordinator.send_completed_context([request])
+    with patch(_CLOCK, return_value=12.5):
+        assert worker.coordinator.collect_dkv_transfer_events() == ()
+        (message,) = worker.coordinator.take_dkv_fatal_messages()
+    assert "request 7" in message

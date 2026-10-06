@@ -1303,6 +1303,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # Whether the page counts are fixed per life cycle (``lifecycle_slot_counts``): every pool
     # group then holds one life cycle, and the DKV digest and fingerprints name it by its key.
     _fixed_lifecycle_counts = False
+    # Whether the manager holds the layers its rank owns under the layer-split layout of DKV only.
+    dkv_layer_split = False
     # The keys of its life cycles in life cycle id order, read off the config on first use.
     _dkv_lifecycle_keys: list | None = None
     _dkv_trace_enabled = False
@@ -1393,6 +1395,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"(layers {self.pp_layers[0]}..{self.pp_layers[-1]}), not {unknown}"
                 )
             self.pp_layers = sorted(owned_layers)
+            self.dkv_layer_split = True
         self.is_draft = is_draft
 
         # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)

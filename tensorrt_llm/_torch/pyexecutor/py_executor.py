@@ -4155,7 +4155,8 @@ class PyExecutor:
                 self, "_disagg_transfer_admission_controller", None),
             is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False),
             is_local=(lambda request: request.py_dkv_is_local) if getattr(
-                self, "dkv_enabled", False) is True else None)
+                self, "dkv_enabled", False) is True else None,
+            every_rank_sends=getattr(self, "dkv_layer_split", False) is True)
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:

@@ -93,6 +93,7 @@ class DisaggTransferCoordinator:
         admission_controller: Optional[DisaggTransferAdmissionController] = None,
         is_kv_manager_v2: bool = False,
         is_local: Optional[Callable[[LlmRequest], bool]] = None,
+        every_rank_sends: bool = False,
     ) -> None:
         self._transceiver = transceiver
         self._transfers = transfer_manager
@@ -107,6 +108,15 @@ class DisaggTransferCoordinator:
         self._admission_controller = admission_controller
         self._is_kv_manager_v2 = is_kv_manager_v2
         self._is_local = is_local
+        # Under the layer-split layout of DKV every rank sends the layers it owns of every request,
+        # not only the compute rank of the request.
+        self._every_rank_sends = every_rank_sends
+        # The reports of the ranks that send a request, until all of them are in, and the requests
+        # this rank has reported already.
+        self._dkv_owner_reports: Dict[int, Dict[int, DkvTransferEvent]] = {}
+        self._dkv_reported: Set[int] = set()
+        # Requests a rank reported as not completed: every rank cancels its own send of them.
+        self._dkv_cancel_requested: Set[int] = set()
         self._dkv_transfer_events: Dict[int, DkvTransferEvent] = {}
         self._dkv_send_errors: Dict[int, str] = {}
         self._dkv_fatal_messages: List[str] = []
@@ -260,7 +270,7 @@ class DisaggTransferCoordinator:
         # when they enter the transfer manager, so this covers the whole
         # context side.
         for req in self._transfers.requests_in_transfer().values():
-            if self._is_local is not None and not self._is_local(req):
+            if self._is_local is not None and not self._sends_here(req):
                 continue
             flag_if_timed_out(req, "context")
         for req in self._registry.active_requests():
@@ -469,6 +479,10 @@ class DisaggTransferCoordinator:
                 # its chunk bounds are unset.
                 self._transceiver.respond_and_send_async(req)
 
+    def _sends_here(self, request: LlmRequest) -> bool:
+        """Whether this rank sends the KV it holds of a DKV request."""
+        return self._every_rank_sends or self._is_local(request)
+
     def _send_dkv_context(self, requests: List[LlmRequest]) -> None:
         canceled_ids = set(self._registry.canceled_request_ids())
         in_transfer = self._transfers.requests_in_transfer()
@@ -488,7 +502,7 @@ class DisaggTransferCoordinator:
                 if hasattr(manager, "release_index_slot"):
                     manager.release_index_slot(request.py_request_id)
             self._transfers.start_transfer(request)
-            if not self._is_local(request):
+            if not self._sends_here(request):
                 continue
             request.py_kv_transfer_start_time = time.monotonic()
             try:
@@ -523,16 +537,24 @@ class DisaggTransferCoordinator:
             error_message = f"Request {request_id} timed out (KV transfer)"
         else:
             outcome = "failed"
-            error_message = error_message or "Context KV transfer failed"
+            error_message = error_message or (
+                "Context KV transfer cancelled after the transfer of another rank failed"
+                if request_id in self._dkv_cancel_requested
+                else "Context KV transfer failed"
+            )
         self._dkv_transfer_events[request_id] = DkvTransferEvent(
-            request_id, request.py_dkv_compute_rank, outcome, error_message
+            request_id,
+            request.py_dkv_compute_rank,
+            outcome,
+            error_message,
+            self._dist.tp_rank if self._every_rank_sends else None,
         )
 
     def _poll_dkv_context_sends(self) -> None:
         local_requests = {
             request.py_request_id: request
             for request in self._transfers.requests_in_transfer().values()
-            if self._is_local(request)
+            if self._sends_here(request) and request.py_request_id not in self._dkv_reported
         }
         if not local_requests:
             return
@@ -553,7 +575,11 @@ class DisaggTransferCoordinator:
         for request_id, request in sorted(local_requests.items()):
             if request_id in self._dkv_transfer_events:
                 continue
-            if request.py_kv_transfer_timed_out or request_id in self._dkv_send_errors:
+            if (
+                request.py_kv_transfer_timed_out
+                or request_id in self._dkv_send_errors
+                or request_id in self._dkv_cancel_requested
+            ):
                 # A timeout alone does not establish physical quiescence.
                 if self.request_cancellation(request):
                     self._stage_dkv_transfer_event(request)
@@ -577,8 +603,9 @@ class DisaggTransferCoordinator:
         stalled = []
         for request_id, request in sorted(self._transfers.requests_in_transfer().items()):
             if (
-                not self._is_local(request)
+                not self._sends_here(request)
                 or request_id in self._dkv_transfer_events
+                or request_id in self._dkv_reported
                 or request_id in self._dkv_stalled_request_ids
                 or request.py_kv_transfer_start_time is None
             ):
@@ -637,6 +664,8 @@ class DisaggTransferCoordinator:
             if events:
                 raise RuntimeError("DKV transfer events require a DKV coordinator")
             return False
+        if self._every_rank_sends:
+            return self._commit_dkv_owner_reports(events)
         requests = self._transfers.requests_in_transfer()
         ordered = sorted(events, key=lambda event: event.request_id)
         seen = set()
@@ -653,35 +682,108 @@ class DisaggTransferCoordinator:
             seen.add(event.request_id)
         needs_flush = False
         for event in ordered:
-            request = requests[event.request_id]
-            self._dkv_transfer_events.pop(event.request_id, None)
-            self._dkv_send_errors.pop(event.request_id, None)
-            request.py_kv_transfer_start_time = None
-            request.py_kv_transfer_timed_out = event.outcome == "timed_out"
+            needs_flush |= self._release_dkv_transfer(requests[event.request_id], event)
+        return needs_flush
+
+    def _commit_dkv_owner_reports(self, events: Sequence[DkvTransferEvent]) -> bool:
+        """Collect what the ranks report of their sends and release a request once all have.
+
+        Every rank sends the layers it owns, so a request is done when every rank has reported:
+        completed when all did, timed out when one did, failed otherwise. The ranks see the same
+        reports in the same order, so they decide alike. The first report that is not a completion
+        makes every rank cancel its own send, since the pages of the request cannot be released
+        while another rank may still read them.
+        """
+        requests = self._transfers.requests_in_transfer()
+        group_size = self._dist.tp_size
+        ordered = sorted(
+            events,
+            key=lambda event: (event.request_id, -1 if event.rank is None else event.rank),
+        )
+        seen = set()
+        for event in ordered:
+            request = requests.get(event.request_id)
+            if (
+                request is None
+                or event.rank is None
+                or (event.request_id, event.rank) in seen
+                or event.rank in self._dkv_owner_reports.get(event.request_id, ())
+                or request.py_dkv_compute_rank != event.compute_rank
+                or request.state != LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                or event.outcome not in ("completed", "failed", "timed_out")
+            ):
+                raise RuntimeError(f"Invalid DKV transfer event: {event}")
+            seen.add((event.request_id, event.rank))
+        for event in ordered:
+            reports = self._dkv_owner_reports.setdefault(event.request_id, {})
+            reports[event.rank] = event
+            if event.rank == self._dist.tp_rank:
+                self._dkv_reported.add(event.request_id)
+                self._dkv_transfer_events.pop(event.request_id, None)
+                self._dkv_send_errors.pop(event.request_id, None)
             if event.outcome != "completed":
-                request.state = LlmRequestState.DISAGG_TRANS_ERROR
-                if not self._transfers.end_transfer(request):
-                    raise RuntimeError("DKV context transfer has an unexpected extra owner")
-                self._effects.fail_requests(
-                    event.error_message or "Context KV transfer failed",
-                    [request],
-                    charge_budget=False,
-                )
-                needs_flush = True
+                self._dkv_cancel_requested.add(event.request_id)
+        needs_flush = False
+        for request_id in sorted(self._dkv_owner_reports):
+            reports = self._dkv_owner_reports[request_id]
+            if len(reports) < group_size:
                 continue
-            response = None
-            if self._registry.contains(request) and self._is_local(request):
-                response = request.create_response(False, self._dist.rank)
-                if response:
-                    response.result.cached_tokens = request.cached_tokens
-                    attach_ctx_usage(request, response)
+            del self._dkv_owner_reports[request_id]
+            self._dkv_reported.discard(request_id)
+            self._dkv_cancel_requested.discard(request_id)
+            needs_flush |= self._release_dkv_transfer(
+                requests[request_id], self._merge_dkv_owner_reports(reports)
+            )
+        return needs_flush
+
+    @staticmethod
+    def _merge_dkv_owner_reports(reports: Dict[int, DkvTransferEvent]) -> DkvTransferEvent:
+        """The outcome of a request that every rank has reported its send of."""
+        first = reports[min(reports)]
+        timed_out = [event for _, event in sorted(reports.items()) if event.outcome == "timed_out"]
+        failed = [event for _, event in sorted(reports.items()) if event.outcome == "failed"]
+        if not timed_out and not failed:
+            return DkvTransferEvent(first.request_id, first.compute_rank, "completed")
+        messages = "; ".join(
+            f"rank {event.rank}: {event.error_message}"
+            for event in (timed_out or failed)
+            if event.error_message
+        )
+        return DkvTransferEvent(
+            first.request_id,
+            first.compute_rank,
+            "timed_out" if timed_out else "failed",
+            messages,
+        )
+
+    def _release_dkv_transfer(self, request: LlmRequest, event: DkvTransferEvent) -> bool:
+        """Release a request whose context transfer has ended; whether the executor must flush."""
+        self._dkv_transfer_events.pop(event.request_id, None)
+        self._dkv_send_errors.pop(event.request_id, None)
+        request.py_kv_transfer_start_time = None
+        request.py_kv_transfer_timed_out = event.outcome == "timed_out"
+        if event.outcome != "completed":
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
             if not self._transfers.end_transfer(request):
                 raise RuntimeError("DKV context transfer has an unexpected extra owner")
-            if self._registry.contains(request):
-                self._registry.remove(request)
-            self._effects.stage_transfer_response(event.request_id, response, request)
-            needs_flush = True
-        return needs_flush
+            self._effects.fail_requests(
+                event.error_message or "Context KV transfer failed",
+                [request],
+                charge_budget=False,
+            )
+            return True
+        response = None
+        if self._registry.contains(request) and self._is_local(request):
+            response = request.create_response(False, self._dist.rank)
+            if response:
+                response.result.cached_tokens = request.cached_tokens
+                attach_ctx_usage(request, response)
+        if not self._transfers.end_transfer(request):
+            raise RuntimeError("DKV context transfer has an unexpected extra owner")
+        if self._registry.contains(request):
+            self._registry.remove(request)
+        self._effects.stage_transfer_response(event.request_id, response, request)
+        return True
 
     @nvtx_range("reap_context_sends")
     def reap_context_sends(self, at_least: int = 0) -> None:

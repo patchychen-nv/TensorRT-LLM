@@ -314,7 +314,9 @@ def sync_dkv_control(dist: Distributed, payload: DkvControlPayload) -> DkvContro
     """
     all_payloads = dist.tp_allgather(payload)
     problems = []
-    transfer_events: dict[int, DkvTransferEvent] = {}
+    # The compute rank of a request reports its transfer under the replicated layout; under the
+    # layer-split layout every rank reports its own send of it, once.
+    transfer_events: dict[tuple[int, int | None], DkvTransferEvent] = {}
     if len(all_payloads) != dist.tp_size:
         problems.append(f"expected {dist.tp_size} rank payloads, got {len(all_payloads)}")
     for rank, rank_payload in enumerate(all_payloads):
@@ -345,15 +347,17 @@ def sync_dkv_control(dist: Distributed, payload: DkvControlPayload) -> DkvContro
                 not isinstance(event, DkvTransferEvent)
                 or type(event.request_id) is not int
                 or type(event.compute_rank) is not int
-                or event.compute_rank != rank
+                or (event.rank is None and event.compute_rank != rank)
+                or (event.rank is not None and event.rank != rank)
                 or event.outcome not in ("completed", "failed", "timed_out")
                 or not isinstance(event.error_message, str)
             ):
                 problems.append(f"rank {rank}: invalid transfer event {event!r}")
                 continue
-            if event.request_id in transfer_events:
+            key = (event.request_id, event.rank)
+            if key in transfer_events:
                 problems.append(f"rank {rank}: duplicate transfer event for {event.request_id}")
-            transfer_events[event.request_id] = event
+            transfer_events[key] = event
     if not problems:
         reference = all_payloads[0]
         for rank, rank_payload in enumerate(all_payloads[1:], start=1):
@@ -381,7 +385,12 @@ def sync_dkv_control(dist: Distributed, payload: DkvControlPayload) -> DkvContro
         has_pending_responses=any(
             rank_payload.has_pending_responses for rank_payload in all_payloads
         ),
-        transfer_events=tuple(transfer_events[key] for key in sorted(transfer_events)),
+        transfer_events=tuple(
+            transfer_events[key]
+            for key in sorted(
+                transfer_events, key=lambda key: (key[0], -1 if key[1] is None else key[1])
+            )
+        ),
     )
 
 
