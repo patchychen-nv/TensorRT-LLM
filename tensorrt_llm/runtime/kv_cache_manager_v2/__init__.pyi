@@ -271,6 +271,13 @@ class KVCacheManagerConfig:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    # Fixed page counts: one row per cache tier (the order of cache_tiers), one positive count
+    # per life cycle id (the order of initial_pool_ratio) in each row. Replaces the byte-quota
+    # pool sizing: every tier gets one pool group per life cycle and the pools are never resized
+    # (need_adjustment is False, adjust does nothing, resize returns False). A tier's quota then
+    # only selects the GPU allocation granularity. The hot tier is raised to the constraint-
+    # derived minimum slot count. Exclusive with initial_pool_ratio.
+    lifecycle_slot_counts: list[list[int]] | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
