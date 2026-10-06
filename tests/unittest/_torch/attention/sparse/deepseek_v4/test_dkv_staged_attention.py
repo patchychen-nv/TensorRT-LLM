@@ -70,9 +70,6 @@ pytestmark = [skip_pre_blackwell, skip_blackwell_geforce]
 
 _RATIOS = [1, 4, 128, 4, 128]
 _CSA_RATIO = 4
-# The second prompt is long enough for the indexer of the CSA layers to choose among more compressed
-# tokens (one per four) than it selects (512).
-_PROMPTS = (300, 2800)
 _TOKENS_PER_BLOCK = 128
 _MAX_SEQ_LEN = 4096
 _MAX_BATCH_SIZE = 2
@@ -117,12 +114,36 @@ class _Step:
     generations: tuple[int, ...] = ()
 
 
-_SCHEDULE = (
-    # Request 1 is prefilled in two chunks; the first one runs next to the whole prompt of request 0.
-    _Step(contexts=((0, 300), (1, 300))),
-    # The second chunk of request 1 computes on 300 cached tokens, request 0 decodes beside it.
-    _Step(contexts=((1, 2500),), generations=(0,)),
-    _Step(generations=(0, 1)),
+@dataclass(frozen=True)
+class _Workload:
+    """The prompts of two requests and the iterations that compute them."""
+
+    prompts: tuple[int, int]
+    schedule: tuple[_Step, ...]
+
+
+# Request 1 is prefilled in two chunks, the first next to the whole prompt of request 0; the second
+# computes on 300 cached tokens, with request 0 decoding beside it. Then both decode.
+#
+# The prompt of 1500 tokens has 375 compressed tokens, fewer than the 512 an indexer selects, so it
+# selects all of them. Every layer then reproduces itself bit for bit.
+_SELECTS_ALL = _Workload(
+    (300, 1500),
+    (
+        _Step(contexts=((0, 300), (1, 300))),
+        _Step(contexts=((1, 1200),), generations=(0,)),
+        _Step(generations=(0, 1)),
+    ),
+)
+# The prompt of 2800 tokens has 700, so the indexer has to choose among them. The layers with an
+# indexer then differ from run to run, by about a unit in the last place of the output.
+_SELECTS_SOME = _Workload(
+    (300, 2800),
+    (
+        _Step(contexts=((0, 300), (1, 300))),
+        _Step(contexts=((1, 2500),), generations=(0,)),
+        _Step(generations=(0, 1)),
+    ),
 )
 
 
@@ -221,10 +242,11 @@ class _Result:
 class _Flow:
     """The schedule on one cache manager, directly or through a staged view of it."""
 
-    def __init__(self, model: _Model, *, make_streamer=None) -> None:
+    def __init__(self, model: _Model, workload: _Workload, *, make_streamer=None) -> None:
         """``make_streamer(manager, view)`` returns the streamer that stages the layers; ``None``:
         the layers use the pages of the manager."""
         self.model = model
+        self.workload = workload
         self.manager = _create_manager(model)
         # The pages start the same in every run, so that the bytes a request does not write compare.
         for layer, role in self.manager._layer_attn_to_layer_id:
@@ -247,12 +269,12 @@ class _Flow:
                 sampling_config=SamplingConfig(),
                 is_streaming=False,
             )
-            for index, prompt in enumerate(_PROMPTS)
+            for index, prompt in enumerate(self.workload.prompts)
         ]
         cached = [0] * len(requests)
         result = _Result([], [])
         try:
-            for iteration, step in enumerate(_SCHEDULE):
+            for iteration, step in enumerate(self.workload.schedule):
                 batch = ScheduledRequests()
                 order = [index for index, _ in step.contexts] + list(step.generations)
                 for index, chunk in step.contexts:
@@ -302,7 +324,7 @@ class _Flow:
             request_ids=order,
             # The executor passes the tokens of the chunk for a context request.
             prompt_lens=[chunk for _, chunk in step.contexts]
-            + [_PROMPTS[index] for index in step.generations],
+            + [self.workload.prompts[index] for index in step.generations],
             max_num_tokens=8192,
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
             sparse_attention_config=model.sparse,
@@ -477,10 +499,10 @@ class _PoisonPages(LoopbackStreamer):
 
 
 @lru_cache(maxsize=None)
-def _reference(indexer: str, fp8_kv: bool) -> tuple[_Result, _Result]:
+def _reference(indexer: str, fp8_kv: bool, workload: _Workload) -> tuple[_Result, _Result]:
     """The schedule on the cache manager twice."""
     model = _model(indexer, fp8_kv)
-    return _Flow(model).run(), _Flow(model).run()
+    return _Flow(model, workload).run(), _Flow(model, workload).run()
 
 
 def _difference(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -569,32 +591,35 @@ def _assert_same(reference: tuple[_Result, _Result], other: _Result) -> None:
 
 
 _VARIANTS = pytest.mark.parametrize(
-    ("indexer", "fp8_kv"),
-    [("fp8", True), ("fp4", True), ("fp8", False), ("fp4", False)],
+    ("indexer", "fp8_kv", "workload"),
+    [
+        (indexer, fp8_kv, workload)
+        for workload in (_SELECTS_ALL, _SELECTS_SOME)
+        for indexer, fp8_kv in (("fp8", True), ("fp4", True), ("fp8", False), ("fp4", False))
+    ],
     ids=[
-        "fp8 kv, fp8 indexer",
-        "fp8 kv, fp4 indexer",
-        "bf16 kv, fp8 indexer",
-        "bf16 kv, fp4 indexer",
+        f"{kv} kv, {indexer} indexer, indexer selects {selects}"
+        for selects in ("all", "some")
+        for kv, indexer in (("fp8", "fp8"), ("fp8", "fp4"), ("bf16", "fp8"), ("bf16", "fp4"))
     ],
 )
 
 
 @_VARIANTS
 def test_the_staged_view_gives_the_outputs_and_pages_of_the_cache_manager(
-    indexer: str, fp8_kv: bool
+    indexer: str, fp8_kv: bool, workload: _Workload
 ) -> None:
-    reference = _reference(indexer, fp8_kv)
-    staged = _Flow(_model(indexer, fp8_kv), make_streamer=_loopback).run()
+    reference = _reference(indexer, fp8_kv, workload)
+    staged = _Flow(_model(indexer, fp8_kv), workload, make_streamer=_loopback).run()
     _assert_same(reference, staged)
 
 
 @_VARIANTS
 def test_what_the_staging_area_held_before_the_fetch_does_not_matter(
-    indexer: str, fp8_kv: bool
+    indexer: str, fp8_kv: bool, workload: _Workload
 ) -> None:
-    reference = _reference(indexer, fp8_kv)
-    filled = _Flow(_model(indexer, fp8_kv), make_streamer=_nan_loopback).run()
+    reference = _reference(indexer, fp8_kv, workload)
+    filled = _Flow(_model(indexer, fp8_kv), workload, make_streamer=_nan_loopback).run()
     for step in filled.outputs:
         for output in step:
             assert not output.isnan().any()
@@ -603,13 +628,18 @@ def test_what_the_staging_area_held_before_the_fetch_does_not_matter(
 
 @_VARIANTS
 def test_the_kernels_neither_read_nor_write_the_pages_of_the_cache_manager(
-    indexer: str, fp8_kv: bool
+    indexer: str, fp8_kv: bool, workload: _Workload
 ) -> None:
-    reference = _reference(indexer, fp8_kv)
-    flow = _Flow(_model(indexer, fp8_kv), make_streamer=_PoisonPages)
+    reference = _reference(indexer, fp8_kv, workload)
+    flow = _Flow(_model(indexer, fp8_kv), workload, make_streamer=_PoisonPages)
     poisoned = flow.run()
     assert flow.streamer.poisoned_pages > 0
     _assert_same(reference, poisoned)
+
+
+def test_the_layers_reproduce_themselves_when_the_indexer_selects_everything() -> None:
+    noise = _differences_by_layer(*_reference("fp8", True, _SELECTS_ALL))
+    assert noise == [0.0] * len(_RATIOS)
 
 
 def _roles(kind: StagingKind) -> tuple:
@@ -620,9 +650,10 @@ def _roles(kind: StagingKind) -> tuple:
 def test_a_corruption_of_every_kind_of_storage_in_the_staging_area_is_seen(
     kind: StagingKind,
 ) -> None:
-    reference = _reference("fp8", True)
+    reference = _reference("fp8", True, _SELECTS_SOME)
     corrupted = _Flow(
         _model("fp8", True),
+        _SELECTS_SOME,
         make_streamer=lambda manager, view: _FlipAfterFetch(manager, view, _flip_kind(kind)),
     ).run()
     # The corruption shows in the outputs, or, for what only feeds the kernels that fill the other
@@ -636,9 +667,10 @@ def test_a_corruption_of_every_kind_of_storage_in_the_staging_area_is_seen(
 def test_a_flipped_bit_in_the_last_cached_token_of_a_sliding_window_page_changes_the_output() -> (
     None
 ):
-    reference = _reference("fp8", True)
+    reference = _reference("fp8", True, _SELECTS_ALL)
     corrupted = _Flow(
         _model("fp8", True),
+        _SELECTS_ALL,
         make_streamer=lambda manager, view: _FlipAfterFetch(manager, view, _flip_one_bit(layer=0)),
     ).run()
     assert _differs(reference, corrupted)
