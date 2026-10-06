@@ -123,7 +123,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     StorageConfig storageConfig = createStorageConfig(mConfig);
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
-        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
+        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.lifecycleSlotCounts);
 
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();
@@ -446,6 +446,13 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    // A quota cannot resize pools whose slot counts are fixed.
+    if (mStorage->hasFixedSlotCounts())
+    {
+        TLLM_LOG_WARNING("Cannot resize cache level %d to %zu: the slot counts are fixed by lifecycle_slot_counts",
+            level.value(), quota);
+        return false;
+    }
     // Same precondition as adjust(): _adjustLevel may defragment, invalidating any page index an
     // ACTIVE cache holds.
     for (KvCache* kvc : mLivingKvCaches)
@@ -951,6 +958,9 @@ void KvCacheManager::unregisterKvCache(KvCache* kvc)
 
 void KvCacheManager::tryUpdateTargetRatios()
 {
+    // The target ratios only steer adjust(), which does nothing when the slot counts are fixed.
+    if (mStorage->hasFixedSlotCounts())
+        return;
     if (mNumSampledKvCaches - mLastUpdateNumSampledKvCaches < 100)
         return;
     mLastUpdateNumSampledKvCaches = mNumSampledKvCaches;
@@ -1028,6 +1038,9 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
 bool KvCacheManager::needAdjustment() const
 {
     auto const apiLock = lockShared();
+    // Fixed slot counts are never rebalanced.
+    if (mStorage->hasFixedSlotCounts())
+        return false;
     if (mNumSampledKvCaches < 2000)
         return false;
     double now = nowSeconds();
@@ -1041,6 +1054,9 @@ void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    // Fixed slot counts are never rebalanced, so there is nothing to do and no cache has to be suspended.
+    if (mStorage->hasFixedSlotCounts())
+        return;
     for (KvCache* kvc : mLivingKvCaches)
         TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
             "level adjustment requires every KvCache to be SUSPENDED: _adjustLevel may "

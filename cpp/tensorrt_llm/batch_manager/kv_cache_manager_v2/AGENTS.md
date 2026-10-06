@@ -216,6 +216,19 @@ Eviction controller
 - Eviction failure must preserve queue consistency. If a multi-pool eviction
   cannot satisfy all requested slots, restore pages already removed before
   propagating `OutOfPagesError`.
+- By default pool sizes follow the byte quotas of the cache tiers, and lifecycles
+  with equal slot bytes share a pool group (hot tier) or equal cold page bytes
+  share one (cold tiers). `KVCacheManagerConfig::lifecycleSlotCounts` replaces
+  both: one row of page counts per cache tier, one entry per lifecycle id. Every
+  tier then has one pool group per lifecycle, the counts are the pool sizes (the
+  hot tier is raised to the constraint-derived minimum), the quota only selects
+  the GPU allocation granularity, and the layout is never resized:
+  `needAdjustment()` is false, `adjust()` does nothing and `resize(level, quota)`
+  returns false. Managers whose layer subsets differ can be given the same counts,
+  and then evict and fail allocations identically, because a lifecycle's page
+  budget and LRU order no longer depend on which other lifecycles share its slot
+  size. Keep any new path that derives slot counts from quotas behind
+  `StorageManager::hasFixedSlotCounts()`.
 - Host and disk memory code directly uses `mmap`, `munmap`, `mremap`,
   `madvise`, `posix_fallocate`, and CUDA host registration. Preserve cleanup on
   partial failure, CUDA unregister/register ordering across resize, and the

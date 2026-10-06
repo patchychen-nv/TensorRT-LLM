@@ -126,12 +126,17 @@ class StorageManager : public std::enable_shared_from_this<StorageManager>
 {
 public:
     // Takes ownership of coldPageCodec immediately; nullptr selects the default lossless codec.
+    //
+    // lifecycleSlotCounts (see KVCacheManagerConfig::lifecycleSlotCounts) fixes the page count of every life cycle
+    // in every cache level. It requires a StorageConfig with one pool group per life cycle, which
+    // createStorageConfig() produces for a config that carries the same counts, and excludes initialPoolRatio.
     StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
         std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec = nullptr,
         std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
-        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f);
+        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f,
+        std::optional<std::vector<std::vector<SlotCount>>> const& lifecycleSlotCounts = std::nullopt);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -199,6 +204,13 @@ public:
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
     // ---- Query helpers -----------------------------------------------------
+
+    // Whether the page counts were fixed at construction. The pool layout is then never resized and nothing may
+    // recompute slot counts from byte quotas.
+    bool hasFixedSlotCounts() const noexcept
+    {
+        return mFixedSlotCounts;
+    }
 
     LifeCycleRegistry const& lifeCycles() const noexcept
     {
@@ -358,6 +370,10 @@ private:
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+    // Per-pool-group slot counts of a level from the configured per-life-cycle counts, raised to minSlots.
+    // Every pool group of the level must hold exactly one life cycle.
+    TypedVec<PoolGroupIndex, SlotCount> fixedSlotCountsForLevel(CacheLevel level,
+        std::vector<SlotCount> const& lifeCycleCounts, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
@@ -441,6 +457,8 @@ private:
     // Slot sizes per (level, pool group), built from mSlotDescLists.
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
+    // True when the slot counts come from KVCacheManagerConfig::lifecycleSlotCounts rather than byte quotas.
+    bool mFixedSlotCounts = false;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;

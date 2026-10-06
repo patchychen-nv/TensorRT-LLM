@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -328,6 +329,29 @@ struct KVCacheManagerConfig
     // path without scanning. A per-KvCache text_only override may only tighten this
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
+
+    // Page (slot) counts that replace the byte-quota derivation of the pool sizes.
+    //
+    // One row per cache tier, in the order of cacheTiers, and one entry per life cycle in each
+    // row, in the order of the life cycle ids (the order of initialPoolRatio). The value is the
+    // number of pages of that life cycle the tier holds; every count is positive. int64_t is the
+    // storage layer's SlotCount, which this header cannot name.
+    //
+    // When set:
+    //  - every tier gets one pool group per life cycle instead of merging life cycles with equal
+    //    slot bytes, so a life cycle's page budget and eviction order do not depend on which other
+    //    life cycles happen to share its slot size. A cold-page codec batching class therefore
+    //    holds a single life cycle;
+    //  - the tier's quota no longer sizes the pools; it only selects the GPU allocation
+    //    granularity. The hot tier is raised to the constraint-derived minimum slot count of the
+    //    life cycle when the configured count is below it;
+    //  - the pool layout never changes after construction: needAdjustment() is false, adjust()
+    //    does nothing and resize(level, quota) fails.
+    //
+    // Mutually exclusive with initialPoolRatio. Managers whose layer subsets differ (and so have
+    // different slot bytes) can be given the same counts to keep the page accounting of every
+    // life cycle identical.
+    std::optional<std::vector<std::vector<std::int64_t>>> lifecycleSlotCounts;
 
     bool enableSwaScratchReuse() const noexcept
     {

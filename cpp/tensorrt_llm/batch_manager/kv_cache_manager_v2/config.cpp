@@ -18,7 +18,10 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <set>
 #include <stdexcept>
 
@@ -57,6 +60,36 @@ void KVCacheManagerConfig::validate() const
     if (cacheTiers.empty() || cacheTierOf(cacheTiers[0]) != CacheTier::GPU_MEM)
     {
         throw AssertionError("KVCacheManagerConfig: first cache tier must be GPU memory");
+    }
+
+    // The life cycle registry does not exist yet, so only the shape and the values can be checked
+    // here. The number of life cycles is checked where the registry is available, in the
+    // StorageManager constructor.
+    if (lifecycleSlotCounts.has_value())
+    {
+        if (initialPoolRatio.has_value())
+        {
+            throw std::invalid_argument("lifecycle_slot_counts and initial_pool_ratio are mutually exclusive");
+        }
+        if (lifecycleSlotCounts->size() != cacheTiers.size())
+        {
+            throw std::invalid_argument("lifecycle_slot_counts must have one row per cache tier");
+        }
+        size_t const numLifeCycles = lifecycleSlotCounts->front().size();
+        for (auto const& row : *lifecycleSlotCounts)
+        {
+            if (row.empty() || row.size() != numLifeCycles)
+            {
+                throw std::invalid_argument("lifecycle_slot_counts rows must be non-empty and have the same length");
+            }
+            // Page indices are 32-bit throughout the storage layer, so a larger count cannot be addressed.
+            if (std::any_of(row.begin(), row.end(),
+                    [](std::int64_t count) { return count <= 0 || count > std::numeric_limits<int>::max(); }))
+            {
+                throw std::invalid_argument(
+                    "lifecycle_slot_counts values must be positive and fit a 32-bit page index");
+            }
+        }
     }
 
     // Check for duplicate layer ids.

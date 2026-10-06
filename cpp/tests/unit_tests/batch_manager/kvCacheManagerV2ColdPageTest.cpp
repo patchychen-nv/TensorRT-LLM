@@ -18,6 +18,7 @@
 #include "kvCacheManagerV2TestUtils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/config.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/introspection.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
@@ -33,7 +34,10 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
+#include <optional>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace
@@ -710,6 +714,236 @@ TEST(KvCacheManagerV2ColdPageTest, RecursiveFallenPageMergeResortsByPriority)
     EXPECT_EQ(middlePriorityPage->cacheLevel, firstColdLevel);
     EXPECT_EQ(highestPriorityPage->cacheLevel, lastColdLevel);
     EXPECT_EQ(lowestPriorityPage->cacheLevel, kHotLevel);
+}
+
+using SlotCounts = std::vector<std::vector<std::int64_t>>;
+
+//! Two life cycles (windows 128 and 256) of equal slot size over a GPU and a host tier, with fixed page counts.
+//! Without the counts each tier merges them into one pool group. With 4 tokens per block their constraint-derived
+//! hot minimums are 33 and 65 slots.
+KVCacheManagerConfig makeFixedSlotCountConfig(SlotCounts counts)
+{
+    auto config = makeSplitColdGroupingConfig();
+    config.lifecycleSlotCounts = std::move(counts);
+    return config;
+}
+
+//! A full-attention life cycle (4 KiB slots) and a window-8 life cycle (8 KiB slots): two pool groups with or without
+//! fixed page counts, so the byte-quota rebalancing has something to rebalance.
+KVCacheManagerConfig makeRebalanceableConfig(std::optional<SlotCounts> counts)
+{
+    KVCacheManagerConfig config;
+    config.tokensPerBlock = 4;
+    config.cacheTiers.emplace_back(GpuCacheTierConfig{8 << 20});
+    config.cacheTiers.emplace_back(HostCacheTierConfig{8 << 20});
+
+    AttentionLayerConfig full;
+    full.layerId = 0;
+    full.buffers.push_back(BufferConfig{"key", 4096, std::nullopt});
+    config.layers.emplace_back(std::move(full));
+
+    AttentionLayerConfig windowed;
+    windowed.layerId = 1;
+    windowed.slidingWindowSize = 8;
+    windowed.buffers.push_back(BufferConfig{"key", 8192, std::nullopt});
+    config.layers.emplace_back(std::move(windowed));
+
+    config.lifecycleSlotCounts = std::move(counts);
+    return config;
+}
+
+//! Arms the tuner state that makes the byte-quota rebalancing want to move pool bytes: the sample and cool-down gates
+//! are open and the target ratio is the current one with the first pool group's share quadrupled.
+void provokeRebalancing(KvCacheManager& manager)
+{
+    auto target = manager.storage().getRatioList(kHotLevel);
+    target[PoolGroupIndex{0}] *= 4.0F;
+    float const total = std::accumulate(target.begin(), target.end(), 0.0F);
+    for (auto& share : target)
+    {
+        share /= total;
+    }
+    KvCacheIntrospection::setNumSampledKvCaches(manager, 2001);
+    KvCacheIntrospection::setLastAdjustmentTime(manager, 0.0);
+    KvCacheIntrospection::setTargetRatioListGpu(manager, std::move(target));
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FixedSlotCountsSizeEveryTierPerLifeCycle)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    {
+        // Without the counts the equal slot sizes, and the equal cold page sizes of the default codec, merge.
+        auto manager = std::make_shared<KvCacheManager>(makeSplitColdGroupingConfig());
+        EXPECT_FALSE(manager->storage().hasFixedSlotCounts());
+        EXPECT_EQ(manager->storage().numPoolGroups(kHotLevel), PoolGroupIndex{1});
+        EXPECT_EQ(manager->storage().numPoolGroups(CacheLevel{1}), PoolGroupIndex{1});
+    }
+
+    CacheLevel const coldLevel{1};
+    auto manager = std::make_shared<KvCacheManager>(makeFixedSlotCountConfig({{40, 80}, {9, 3}}));
+    auto const& storage = manager->storage();
+    EXPECT_TRUE(storage.hasFixedSlotCounts());
+    ASSERT_EQ(storage.numLifeCycles(), LifeCycleId{2});
+
+    SlotCounts const expected{{40, 80}, {9, 3}};
+    for (CacheLevel level : {kHotLevel, coldLevel})
+    {
+        SCOPED_TRACE(level.value());
+        ASSERT_EQ(storage.numPoolGroups(level), PoolGroupIndex{2});
+        auto const grouping = manager->getLifeCyclePoolGroupIndices(level);
+        auto const statistics = manager->getStorageStatistics(level);
+        for (LifeCycleId lifeCycle{0}; lifeCycle < LifeCycleId{2}; ++lifeCycle)
+        {
+            PoolGroupIndex const poolGroup = grouping[lifeCycle];
+            EXPECT_EQ(poolGroup.value(), lifeCycle.value());
+            auto const count
+                = expected.at(static_cast<size_t>(level.value())).at(static_cast<size_t>(lifeCycle.value()));
+            EXPECT_EQ(storage.numSlots(poolGroup, level), count);
+            EXPECT_EQ(statistics[poolGroup].total, count);
+            EXPECT_EQ(statistics[poolGroup].free, count);
+            ASSERT_EQ(storage.slotSize(level, poolGroup).size(), PoolIndex{1});
+            EXPECT_EQ(storage.slotSize(level, poolGroup).at(PoolIndex{0}), 4096U);
+        }
+    }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FixedSlotCountsDoNotDependOnTheTierQuotas)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    for (auto const& [gpuQuota, hostQuota] : {std::pair<size_t, size_t>{4U << 20U, 4U << 20U},
+             std::pair<size_t, size_t>{256U << 20U, 4096U}, std::pair<size_t, size_t>{2U << 20U, 64U << 20U}})
+    {
+        SCOPED_TRACE(gpuQuota);
+        SCOPED_TRACE(hostQuota);
+        auto config = makeFixedSlotCountConfig({{40, 80}, {9, 3}});
+        config.cacheTiers = {GpuCacheTierConfig{gpuQuota}, HostCacheTierConfig{hostQuota}};
+        auto manager = std::make_shared<KvCacheManager>(std::move(config));
+        auto const& storage = manager->storage();
+        EXPECT_EQ(storage.numSlots(PoolGroupIndex{0}, kHotLevel), 40);
+        EXPECT_EQ(storage.numSlots(PoolGroupIndex{1}, kHotLevel), 80);
+        EXPECT_EQ(storage.numSlots(PoolGroupIndex{0}, CacheLevel{1}), 9);
+        EXPECT_EQ(storage.numSlots(PoolGroupIndex{1}, CacheLevel{1}), 3);
+    }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FixedHotSlotCountsAreRaisedToTheConstraintMinimum)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeFixedSlotCountConfig({{5, 5}, {1, 1}}));
+    auto const& storage = manager->storage();
+    EXPECT_EQ(storage.numSlots(PoolGroupIndex{0}, kHotLevel), 33);
+    EXPECT_EQ(storage.numSlots(PoolGroupIndex{1}, kHotLevel), 65);
+    EXPECT_EQ(storage.numSlots(PoolGroupIndex{0}, CacheLevel{1}), 1);
+    EXPECT_EQ(storage.numSlots(PoolGroupIndex{1}, CacheLevel{1}), 1);
+
+    // A count above the minimum is taken as given.
+    auto exact = std::make_shared<KvCacheManager>(makeFixedSlotCountConfig({{33, 65}, {1, 1}}));
+    EXPECT_EQ(exact->storage().numSlots(PoolGroupIndex{0}, kHotLevel), 33);
+    EXPECT_EQ(exact->storage().numSlots(PoolGroupIndex{1}, kHotLevel), 65);
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FixedSlotCountsOfTheWrongLifeCycleCountAreRejectedByTheStorageManager)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    for (auto counts : {SlotCounts{{40, 80, 90}, {9, 3, 3}}, SlotCounts{{40}, {9}}})
+    {
+        auto config = makeFixedSlotCountConfig(counts);
+        ASSERT_NO_THROW(config.validate());
+        EXPECT_THROW(
+            {
+                auto manager = std::make_shared<KvCacheManager>(std::move(config));
+                (void) manager;
+            },
+            std::invalid_argument);
+    }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FixedColdSlotCountsCapEachLifeCycleSeparately)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    // The cold pages have the same size, yet one life cycle cannot use the cold pages of the other.
+    auto manager = std::make_shared<KvCacheManager>(makeFixedSlotCountConfig({{40, 80}, {1, 3}}));
+    auto& storage = manager->storage();
+    CacheLevel const coldLevel{1};
+    TypedVec<LifeCycleId, SlotCount> twoSlotsEach(LifeCycleId{2}, 2);
+    auto hotSlots = storage.newGpuSlots(twoSlotsEach);
+    std::vector<SharedPtr<CommittedPage>> firstPages;
+    std::vector<SharedPtr<CommittedPage>> secondPages;
+    for (int index = 0; index < 2; ++index)
+    {
+        firstPages.push_back(makeCommittedPage(*manager, storage, kHotLevel, hotSlots[LifeCycleId{0}][index],
+            LifeCycleId{0}, kPriorityDefault, /*tokenBase=*/100 * index));
+        secondPages.push_back(makeCommittedPage(*manager, storage, kHotLevel, hotSlots[LifeCycleId{1}][index],
+            LifeCycleId{1}, kPriorityDefault, /*tokenBase=*/1000 + 100 * index));
+    }
+
+    TypedVec<PoolGroupIndex, SlotCount> evictAll(storage.numPoolGroups(kHotLevel), 2);
+    storage.forceEvict(kHotLevel, evictAll);
+
+    auto const numInCold = [coldLevel](std::vector<SharedPtr<CommittedPage>> const& pages)
+    {
+        return std::count_if(
+            pages.begin(), pages.end(), [coldLevel](auto const& page) { return page->cacheLevel == coldLevel; });
+    };
+    EXPECT_EQ(numInCold(firstPages), 1);
+    EXPECT_EQ(numInCold(secondPages), 2);
+    auto const statistics = manager->getStorageStatistics(coldLevel);
+    EXPECT_EQ(statistics[PoolGroupIndex{0}].free, 0);
+    EXPECT_EQ(statistics[PoolGroupIndex{1}].free, 1);
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FixedSlotCountsAreNeverRebalanced)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+
+    // Control: the byte-quota layout asks to be rebalanced and refuses to do so under an active cache.
+    {
+        auto manager = std::make_shared<KvCacheManager>(makeRebalanceableConfig(std::nullopt));
+        EXPECT_FALSE(manager->storage().hasFixedSlotCounts());
+        provokeRebalancing(*manager);
+        EXPECT_TRUE(manager->needAdjustment());
+        auto cache = manager->createKvCache();
+        ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+        EXPECT_THROW(manager->adjust(), TllmException);
+        cache->close();
+    }
+
+    auto manager = std::make_shared<KvCacheManager>(makeRebalanceableConfig(SlotCounts{{60, 50}, {7, 5}}));
+    auto const& storage = manager->storage();
+    ASSERT_TRUE(storage.hasFixedSlotCounts());
+    auto const expectCountsUnchanged = [&]()
+    {
+        EXPECT_EQ(storage.numSlots(PoolGroupIndex{0}, kHotLevel), 60);
+        EXPECT_EQ(storage.numSlots(PoolGroupIndex{1}, kHotLevel), 50);
+        EXPECT_EQ(storage.numSlots(PoolGroupIndex{0}, CacheLevel{1}), 7);
+        EXPECT_EQ(storage.numSlots(PoolGroupIndex{1}, CacheLevel{1}), 5);
+    };
+    expectCountsUnchanged();
+    size_t const hotQuota = manager->getQuota(kHotLevel);
+
+    provokeRebalancing(*manager);
+    EXPECT_FALSE(manager->needAdjustment());
+
+    // adjust() does nothing, and does not even require the caches to be suspended.
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+    EXPECT_NO_THROW(manager->adjust());
+    expectCountsUnchanged();
+
+    // Closing a cache runs the tuner update, which must neither throw nor change the layout.
+    EXPECT_TRUE(cache->resize(8));
+    cache->close();
+    EXPECT_FALSE(manager->needAdjustment());
+    expectCountsUnchanged();
+
+    // A quota cannot resize pools whose counts are fixed.
+    EXPECT_FALSE(manager->resize(kHotLevel, 64U << 20U));
+    EXPECT_FALSE(manager->resize(CacheLevel{1}, 64U << 20U));
+    EXPECT_EQ(manager->getQuota(kHotLevel), hotQuota);
+    expectCountsUnchanged();
 }
 
 class KvCacheManagerV2PageLockTest : public ::testing::Test
