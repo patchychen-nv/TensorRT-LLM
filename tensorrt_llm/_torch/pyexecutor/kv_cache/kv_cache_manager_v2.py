@@ -601,6 +601,33 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
     return host_quota
 
 
+#: Page counts for ``KVCacheManagerConfig.lifecycle_slot_counts``: either the rows themselves (one
+#: per cache tier, one count per life cycle id of this manager) or a function that computes them
+#: from the final cache config, such as ``functools.partial(solve_lifecycle_slot_counts, ...)``.
+LifecycleSlotCountsSource = Union[
+    Sequence[Sequence[int]],
+    Callable[[KVCacheManagerConfigPy], Sequence[Sequence[int]]],
+]
+
+
+def _without_host_tier(config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+    """Return ``config`` without its host tier.
+
+    The fixed page counts of the host tier go with it: ``lifecycle_slot_counts`` has one row per
+    cache tier, and a row left over from the dropped tier would be taken for the next tier's.
+    """
+    kept = [
+        level
+        for level, tier in enumerate(config.cache_tiers)
+        if not isinstance(tier, HostCacheTierConfig)
+    ]
+    fields: dict[str, object] = {"cache_tiers": [config.cache_tiers[level] for level in kept]}
+    counts = getattr(config, "lifecycle_slot_counts", None)
+    if counts is not None:
+        fields["lifecycle_slot_counts"] = [list(counts[level]) for level in kept]
+    return replace(config, **fields)
+
+
 class _KVCacheManagerInitStatus(IntEnum):
     # The numeric order is part of the allreduce(MAX) protocol: more severe
     # outcomes must have larger values.
@@ -1312,6 +1339,7 @@ class KVCacheManagerV2(BaseResourceManager):
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         dkv_group_size: Optional[int] = None,
+        lifecycle_slot_counts: Optional[LifecycleSlotCountsSource] = None,
         **kwargs,
     ) -> None:
         if dkv_group_size is not None and dkv_group_size < 2:
@@ -1680,6 +1708,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
+        config = self._apply_lifecycle_slot_counts(config, lifecycle_slot_counts)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -1739,14 +1768,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     if candidate is not None:
                         candidate.shutdown()
                     candidate = None
-                    config = replace(
-                        config,
-                        cache_tiers=[
-                            tier
-                            for tier in config.cache_tiers
-                            if not isinstance(tier, HostCacheTierConfig)
-                        ],
-                    )
+                    config = _without_host_tier(config)
                     candidate = KVCacheManagerPy(
                         config,
                         event_manager=self.event_manager,
@@ -3115,6 +3137,30 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _apply_lifecycle_slot_counts(
+        self,
+        config: KVCacheManagerConfigPy,
+        lifecycle_slot_counts: Optional[LifecycleSlotCountsSource],
+    ) -> KVCacheManagerConfigPy:
+        """Fix the page count of every life cycle of ``config`` when counts were requested.
+
+        This runs on the final config, after the layers and their buffer sizes are settled, because
+        the life cycles of a rank and their slot bytes are only known then. Without
+        ``lifecycle_slot_counts`` the config is returned unchanged and the pools are sized from the
+        byte quotas of the cache tiers. A function is called with the config on every rank, so it
+        may use collectives to agree on the counts.
+        """
+        if lifecycle_slot_counts is None:
+            return config
+        rows = (
+            lifecycle_slot_counts(config)
+            if callable(lifecycle_slot_counts)
+            else lifecycle_slot_counts
+        )
+        return replace(
+            config, lifecycle_slot_counts=[[int(count) for count in row] for row in rows]
+        )
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""

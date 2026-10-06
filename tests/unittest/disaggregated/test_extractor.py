@@ -24,7 +24,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table,
     build_page_table_from_manager,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_global_layer_ids,
     get_layer_byte_ranges,
@@ -34,7 +34,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
     get_unique_layers,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2,
     MambaRole,
@@ -1482,5 +1482,108 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
 
         simulate_prefill_completion_only_use_for_testing(req_a2)
         manager.free_resources(req_a2)
+    finally:
+        manager.shutdown()
+
+
+_PAGE_TABLE_WINDOWS = [256, 128, 256, 64]
+_PAGE_TABLE_HOT_PAGES = [90, 40, 24]
+_PAGE_TABLE_HOST_PAGES = [120, 60, 30]
+
+
+def _v2_manager_with_equal_slot_bytes(lifecycle_slot_counts=None) -> KVCacheManagerV2:
+    """Four layers over a 256 token context with windows (none, 128, none, 64).
+
+    Three life cycles result, and windows 128 and 64 have equal slot bytes: without page counts they
+    share a pool group, with page counts every life cycle has its own.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    return KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+            max_attention_window=_PAGE_TABLE_WINDOWS,
+            enable_block_reuse=False,
+        ),
+        CacheTypeCpp.SELF,
+        num_layers=len(_PAGE_TABLE_WINDOWS),
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=8,
+        max_seq_len=256,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=16,
+        lifecycle_slot_counts=lifecycle_slot_counts,
+    )
+
+
+def test_v2_page_table_with_one_pool_group_per_life_cycle():
+    """A pool group per life cycle yields a consistent page table.
+
+    The table indexes pool groups by life cycle, carries the configured page counts and the pool
+    layout of the native storage, and round-trips.
+    """
+    manager = _v2_manager_with_equal_slot_bytes([_PAGE_TABLE_HOT_PAGES, _PAGE_TABLE_HOST_PAGES])
+    try:
+        table = build_page_table_from_manager(manager)
+        descs = manager.impl.pool_group_descs
+
+        assert get_num_layer_groups(table) == 3
+        assert len(table.pool_groups) == 3
+        assert [group.pool_group_idx for group in table.layer_groups] == [0, 1, 2]
+        assert [group.sliding_window_size for group in table.layer_groups] == [None, 128, 64]
+        # The layers of a rank partition over its life cycles.
+        assert get_layer_to_layer_group(table) == {0: 0, 2: 0, 1: 1, 3: 2}
+        assert get_num_layers(table) == 4
+
+        for index, group in enumerate(table.layer_groups):
+            pool_group = table.pool_groups[group.pool_group_idx]
+            native = descs[index]
+            assert [pool.num_slots for pool in pool_group.pools] == [
+                _PAGE_TABLE_HOT_PAGES[index]
+            ] * len(native.pools)
+            assert [pool.slot_bytes for pool in pool_group.pools] == [
+                pool.slot_bytes for pool in native.pools
+            ]
+            assert [pool.base_address for pool in pool_group.pools] == [
+                pool.base_address for pool in native.pools
+            ]
+            assert group.pool_views
+            for view in group.pool_views:
+                # Raises unless the layers of the view are contiguous and equally sized in a slot.
+                starts, bytes_per_layer = get_layer_byte_ranges(view)
+                pool = get_physical_pool(table, index, view.pool_idx)
+                assert get_unique_layers(view) == set(starts)
+                assert max(starts.values()) + bytes_per_layer <= pool.slot_bytes
+
+        restored = KVCachePageTable.from_dict(table.to_dict())
+        assert [group.pool_group_idx for group in restored.layer_groups] == [0, 1, 2]
+        assert [
+            [(pool.num_slots, pool.slot_bytes) for pool in group.pools]
+            for group in restored.pool_groups
+        ] == [
+            [(pool.num_slots, pool.slot_bytes) for pool in group.pools]
+            for group in table.pool_groups
+        ]
+    finally:
+        manager.shutdown()
+
+
+def test_v2_page_table_without_page_counts_shares_a_pool_group_between_life_cycles():
+    """Without page counts equal slot bytes put two life cycles in one pool group.
+
+    The builder keeps indexing the layer groups by life cycle.
+    """
+    manager = _v2_manager_with_equal_slot_bytes()
+    try:
+        table = build_page_table_from_manager(manager)
+        assert get_num_layer_groups(table) == 3
+        assert len(table.pool_groups) == 2
+        # Pool groups are ordered by slot bytes, so the window-free life cycle comes last.
+        assert [group.pool_group_idx for group in table.layer_groups] == [1, 0, 0]
+        assert get_layer_to_layer_group(table) == {0: 0, 2: 0, 1: 1, 3: 2}
     finally:
         manager.shutdown()
