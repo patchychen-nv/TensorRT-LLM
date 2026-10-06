@@ -6272,19 +6272,29 @@ class PyExecutor:
             f"{settings['staging_tokens']} staged tokens per iteration")
 
     def _dkv_staging_settings(self) -> dict[str, object]:
-        """What the ranks must agree on to build the same staging area."""
+        """What the ranks must agree on to build the same staging area.
+
+        The slots hold the cached and the new tokens of the requests a rank schedules in one
+        iteration, and the scheduler admits requests only while their sum fits. A request of
+        ``max_seq_len`` must fit alone; by default it also fits next to a full chunk.
+        """
         manager = self.kv_cache_manager
+        staging_tokens = int(
+            os.environ.get(
+                "TRTLLM_DKV_STAGING_TOKENS",
+                max(
+                    min(manager.max_batch_size * manager.max_seq_len,
+                        manager.max_seq_len + manager.max_num_tokens),
+                    manager.max_num_tokens)))
+        if staging_tokens < manager.max_seq_len:
+            raise ValueError(
+                f"TRTLLM_DKV_STAGING_TOKENS ({staging_tokens}) must hold one "
+                f"request of max_seq_len ({manager.max_seq_len} tokens)")
         return {
-            "staging_depth":
-            int(os.environ.get("TRTLLM_DKV_STAGING_DEPTH", "2")),
-            "staging_tokens":
-            int(
-                os.environ.get(
-                    "TRTLLM_DKV_STAGING_TOKENS",
-                    max(manager.max_batch_size * manager.max_seq_len,
-                        manager.max_num_tokens))),
-            "staging_fill":
-            os.environ.get("TRTLLM_DKV_STAGING_FILL", ""),
+            "staging_depth": int(os.environ.get("TRTLLM_DKV_STAGING_DEPTH",
+                                                "2")),
+            "staging_tokens": staging_tokens,
+            "staging_fill": os.environ.get("TRTLLM_DKV_STAGING_FILL", ""),
         }
 
     def _create_dkv_staged_view(self, settings: dict[str, object]):
@@ -6302,6 +6312,9 @@ class PyExecutor:
     def _install_dkv_staged_view(self, view, settings: dict[str, object]):
         """Make the attention layers read their KV through ``view``."""
         self.kv_cache_manager.dkv_staged_view = view
+        # The scheduler admits requests to an iteration only while their attended KV fits.
+        self.kv_cache_manager.dkv_max_staging_tokens = settings[
+            "staging_tokens"]
         # Metadata built on the real manager earlier would not read the view.
         self.model_engine.attn_metadata = None
         self.model_engine.dkv_staging = True

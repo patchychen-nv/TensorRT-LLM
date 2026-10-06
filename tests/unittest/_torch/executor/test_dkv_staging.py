@@ -404,14 +404,20 @@ def test_the_geometry_is_read_off_a_cache_manager() -> None:
 @pytest.mark.parametrize(
     ("kind", "history", "chunk", "fetch", "writeback"),
     [
-        (StagingKind.SWA, 0, 400, (0, 0), (0, 4)),
-        (StagingKind.SWA, 300, 400, (1, 2), (2, 4)),
+        # A windowed kind sends back the blocks that are in its window after the chunk only.
+        (StagingKind.SWA, 0, 400, (0, 0), (2, 2)),
+        (StagingKind.SWA, 300, 400, (1, 2), (4, 2)),
         (StagingKind.COMPRESS_R4, 300, 400, (0, 3), (2, 4)),
         # A history that ends on a block boundary has no partly cached block.
         (StagingKind.SWA, 256, 128, (1, 1), (2, 1)),
         (StagingKind.COMPRESS_R128, 256, 128, (0, 2), (2, 1)),
         (StagingKind.STATE_CSA, 300, 1, (2, 1), (2, 1)),
         (StagingKind.STATE_CSA, 255, 2, (1, 1), (1, 2)),
+        # A long chunk leaves one block of a window behind, and every block of the other kinds.
+        (StagingKind.SWA, 0, 8192, (0, 0), (63, 1)),
+        (StagingKind.STATE_CSA, 0, 8192, (0, 0), (63, 1)),
+        (StagingKind.STATE_HCA, 0, 8192, (0, 0), (63, 1)),
+        (StagingKind.COMPRESS_R4, 0, 8192, (0, 0), (0, 64)),
     ],
 )
 def test_what_is_fetched_and_what_is_written_back(kind, history, chunk, fetch, writeback) -> None:
@@ -420,7 +426,7 @@ def test_what_is_fetched_and_what_is_written_back(kind, history, chunk, fetch, w
     assert layout.writeback_range(kind, history, chunk) == writeback
 
 
-def test_every_staged_page_is_fetched_or_written_back_and_nothing_else() -> None:
+def test_every_staged_page_is_fetched_or_written_back_unless_it_leaves_the_window() -> None:
     layout = StagingLayout(_geometry())
     for kind in StagingKind:
         for history in range(0, 700, 37):
@@ -429,11 +435,30 @@ def test_every_staged_page_is_fetched_or_written_back_and_nothing_else() -> None
                 staged = set(range(first, first + pages))
                 fetched = set(range(*_blocks(layout.fetch_range(kind, history, chunk))))
                 written = set(range(*_blocks(layout.writeback_range(kind, history, chunk))))
-                assert fetched | written == staged, (kind, history, chunk)
                 assert fetched <= staged and written <= staged
+                if layout.window(kind) is None:
+                    assert fetched | written == staged, (kind, history, chunk)
                 # Only blocks with cached tokens are fetched; only blocks with new tokens return.
                 assert all(block * 128 < history for block in fetched)
                 assert all((block + 1) * 128 > history for block in written)
+                # What stays out of both is released by the cache manager after the chunk.
+                alive_from = max(0, history + chunk + 1 - (layout.window(kind) or 0)) // 128
+                assert all(block < alive_from for block in staged - fetched - written)
+
+
+@pytest.mark.parametrize("kind", [kind for kind in StagingKind if kind.windowed])
+@pytest.mark.parametrize(
+    "chunks", [(128,) * 12, (1,) * 300, (300, 7, 129, 1, 512, 64), (500, 500, 500), (5000, 3, 5000)]
+)
+def test_every_block_a_chunk_fetches_was_written_back_by_an_earlier_one(kind, chunks) -> None:
+    layout = StagingLayout(_geometry())
+    written: set[int] = set()
+    history = 0
+    for chunk in chunks:
+        fetched = set(range(*_blocks(layout.fetch_range(kind, history, chunk))))
+        assert fetched <= written, (history, chunk, sorted(fetched - written))
+        written |= set(range(*_blocks(layout.writeback_range(kind, history, chunk))))
+        history += chunk
 
 
 def _blocks(span: tuple[int, int]) -> tuple[int, int]:

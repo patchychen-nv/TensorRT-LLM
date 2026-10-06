@@ -343,11 +343,19 @@ class StagingLayout:
         """The staged blocks the new tokens write to, as ``(first block, number of blocks)``.
 
         They are sent back after the layer. A block that held cached tokens as well as new ones is
-        sent whole; the cached part is unchanged, so overwriting it is harmless.
+        sent whole; the cached part is unchanged, so overwriting it is harmless. A windowed kind
+        sends only the blocks that are still inside its window once the chunk is done: the cache
+        manager releases the others before the next iteration, and the next iteration stages the
+        blocks from the start of that window.
         """
+        block = self.geometry.tokens_per_block
         first, pages = self.block_range(kind, history, chunk)
-        first_new = max(first, history // self.geometry.tokens_per_block)
-        return first_new, first + pages - first_new
+        last = first + pages - 1
+        first_new = max(first, history // block)
+        window = self.window(kind)
+        if window is not None:
+            first_new = max(first_new, (history + chunk + 1 - window) // block)
+        return first_new, max(0, last + 1 - first_new)
 
     def request_spans(
         self, kind: StagingKind, requests: Sequence[tuple[int, int]]

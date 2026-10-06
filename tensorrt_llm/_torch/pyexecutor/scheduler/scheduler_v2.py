@@ -759,14 +759,29 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
 
     def _commit_dkv_attended_kv(self, req: LlmRequest, budget: DkvBudgetTracker) -> bool:
-        """Keep the first context per rank and bound the remaining MLA workspace."""
-        cap = getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None)
+        """Bound what the context requests of one compute rank attend to in an iteration.
+
+        The sum of their attended KV lengths is bounded by the MLA workspace, which the first
+        request of the rank is exempt from so that it makes progress, and by the staging area of
+        the layer-split layout. No request may exceed the staging area alone, since it would never
+        be admitted.
+        """
         rank = req.py_dkv_compute_rank
         begin = req.context_current_position
         if req.is_first_context_chunk:
             begin = max(begin, req.estimated_reusable_tokens)
         attended = min(begin + req.context_chunk_size, req.orig_prompt_len)
         cumulative = budget.rank_attended_kv[rank] + attended
+        staging_cap = getattr(self.kv_cache_manager, "dkv_max_staging_tokens", None)
+        if staging_cap is not None:
+            if attended > staging_cap:
+                raise RuntimeError(
+                    f"DKV invariant violation: request {req.py_request_id} attends {attended} "
+                    f"tokens, more than the {staging_cap} that the staging area holds"
+                )
+            if cumulative > staging_cap:
+                return False
+        cap = getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None)
         if cap is not None and budget.rank_requests[rank] > 0 and cumulative > cap:
             return False
         budget.rank_attended_kv[rank] = cumulative

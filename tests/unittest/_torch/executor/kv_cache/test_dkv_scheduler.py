@@ -48,6 +48,7 @@ class _PageManager:
         block_size: int = 64,
         prefix: dict[int, int] | None = None,
         cap: int | None = None,
+        staging_cap: int | None = None,
         tp_rank: int = 0,
     ) -> None:
         self.pages = pages
@@ -55,6 +56,7 @@ class _PageManager:
         self.tp_rank = tp_rank
         self.prefix = prefix or {}
         self.fp8_ctx_mla_kv_len_cap = cap
+        self.dkv_max_staging_tokens = staging_cap
         self.kv_cache_map: dict[int, SimpleNamespace] = {}
         self.trace: list[tuple] = []
         self.fail_prepare: set[int] = set()
@@ -393,6 +395,42 @@ def test_attended_cap_reverts_continuation_without_rewinding_executed_history(du
     assert manager.kv_cache_map[1].capacity == 64
 
 
+def test_staging_cap_is_per_rank_and_defers_what_does_not_fit(dual_ledger) -> None:
+    manager = _PageManager(staging_cap=192)
+    scheduler = _scheduler(manager)
+    requests = _contexts([(0, 0, 128), (1, 0, 128), (2, 1, 128), (3, 0, 64)])
+    assert _ids(scheduler.schedule_request(requests, set()).context_requests) == [0, 2]
+    # The rank stops at the first request that does not fit, so the smaller one behind it waits.
+    assert 1 not in manager.kv_cache_map
+    assert not any(item[1] == 3 for item in manager.trace)
+    assert requests[1].context_current_position == 0
+
+
+@pytest.mark.parametrize("staging_cap,admitted", [(320, [1, 0, 2]), (319, [0, 2])])
+def test_staging_cap_counts_the_history_of_a_chunk(dual_ledger, staging_cap, admitted) -> None:
+    manager = _PageManager(staging_cap=staging_cap)
+    scheduler = _scheduler(manager, tokens=256, chunked=True)
+    requests = _contexts([(0, 0, 128), (1, 0, 256), (2, 1, 128)])
+    continuation = requests[1]
+    manager.prepare_context(continuation)
+    manager.resize_context(continuation, 64)
+    continuation.context_current_position = 64
+    assert not continuation.is_first_context_chunk
+    # Request 0 attends its 128 tokens. The started request then has 128 of the token budget left
+    # for a chunk and attends its 64 cached tokens besides, 192 in all, which makes 320 on the
+    # rank. The request of the other rank is separate, and the started request is listed first.
+    assert _ids(scheduler.schedule_request(requests, set()).context_requests) == admitted
+
+
+def test_a_request_that_alone_exceeds_the_staging_area_is_an_invariant_violation(
+    dual_ledger,
+) -> None:
+    # The MLA cap exempts the first request of a rank; the staging area is not one it may overflow.
+    scheduler = _scheduler(_PageManager(staging_cap=64, cap=0))
+    with pytest.raises(RuntimeError, match="more than the 64 that the staging area holds"):
+        scheduler.schedule_request(_contexts([(0, 0, 128)]), set())
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("suspended", [False, True])
 def test_empty_prefill_recovers_by_rewinding_last_started_request(
@@ -544,3 +582,51 @@ def test_replica_replay_matches_independent_adp_views(dual_ledger, group_size, c
             views.append(local_ids)
         assert set().union(*views) == {entry[0] for entry in global_round}
     assert max(map(len, local_rounds)) == len(outputs[0])
+
+
+def _replay_attended(
+    group_size: int, tp_rank: int, staging_cap: int | None, chunked: bool
+) -> tuple[list, list[int]]:
+    """Schedule the same requests as one replica and return its rounds and each round's largest
+    sum of attended KV over the compute ranks."""
+    specs = [(index, index % group_size, 64 + (index % 4) * 64) for index in range(group_size * 6)]
+    manager = _PageManager(tp_rank=tp_rank, staging_cap=staging_cap)
+    scheduler = _scheduler(
+        manager, group_size=group_size, batch_size=4, tokens=512, chunked=chunked
+    )
+    requests = _contexts(specs, tp_rank)
+    rounds, largest = [], []
+    while requests:
+        scheduled = scheduler.schedule_request(requests, set()).context_requests
+        assert scheduled
+        attended = [0] * group_size
+        for req in scheduled:
+            attended[req.py_dkv_compute_rank] += (
+                req.context_current_position + req.context_chunk_size
+            )
+        largest.append(max(attended))
+        rounds.append(
+            [
+                (req.py_request_id, req.context_current_position, req.context_chunk_size)
+                for req in scheduled
+            ]
+        )
+        for req in scheduled:
+            req.context_current_position += req.context_chunk_size
+            if req.context_remaining_length == 0:
+                manager.free_resources(req)
+                requests.remove(req)
+    return rounds, largest
+
+
+@pytest.mark.parametrize("group_size", [2, 4])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_replicas_apply_the_staging_cap_alike_and_no_iteration_exceeds_it(
+    dual_ledger, group_size, chunked
+) -> None:
+    cap = 256
+    # Without the cap the workload attends to more than the cap in some iteration.
+    assert max(_replay_attended(group_size, 0, None, chunked)[1]) > cap
+    replays = [_replay_attended(group_size, rank, cap, chunked) for rank in range(group_size)]
+    assert all(replay == replays[0] for replay in replays)
+    assert max(replays[0][1]) <= cap

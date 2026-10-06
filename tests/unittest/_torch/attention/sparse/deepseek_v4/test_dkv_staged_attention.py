@@ -363,9 +363,12 @@ class _Flow:
         """The pages of the requests, up to the rows that hold a token of the sequence.
 
         The rows of the last page behind the end of the sequence hold whatever the kernels left
-        there, which depends on memory they do not own, so they are not compared.
+        there, which depends on memory they do not own, so they are not compared. Neither are the
+        pages that have left the window of their kind: the cache manager releases them before
+        anything reads them, and the staged path does not send them back.
         """
         manager = self.manager
+        layout = StagingLayout(StagingGeometry.from_cache_manager(manager, max_staging_tokens=8192))
         pages = {}
         for request in requests:
             request_id = request.py_request_id
@@ -378,10 +381,22 @@ class _Flow:
                     DeepseekV4AttentionType.INDEXER_COMPRESS,
                 )
                 rows = _TOKENS_PER_BLOCK // ratio if compressed else _TOKENS_PER_BLOCK
+                kind = next(
+                    component.kind
+                    for component in layout.components
+                    if component.attention_type is role
+                    and layer in layout.layers_of(component.kind)
+                )
+                window = layout.window(kind)
+                first_alive = (
+                    0
+                    if window is None
+                    else max(0, cached[request_id] + 1 - window) // _TOKENS_PER_BLOCK
+                )
                 indices = manager.get_cache_indices(request_id, layer, role)
                 buffer = manager.get_buffers(layer, role)
                 for block, index in enumerate(indices):
-                    if index == BAD_PAGE_INDEX:
+                    if index == BAD_PAGE_INDEX or block < first_alive:
                         continue
                     tokens = min(
                         _TOKENS_PER_BLOCK, max(0, cached[request_id] - block * _TOKENS_PER_BLOCK)

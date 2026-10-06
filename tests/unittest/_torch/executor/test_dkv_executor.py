@@ -321,6 +321,51 @@ def test_layer_split_records_the_ownership_table_in_the_startup_settings(monkeyp
     assert recorded["layer_ownership"] == ownership_fingerprint(compute_ownership(43, 4))
 
 
+def _staging_executor(
+    max_batch_size: int = 4, max_seq_len: int = 1000, max_num_tokens: int = 300
+) -> PyExecutor:
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_cache_manager = SimpleNamespace(
+        max_batch_size=max_batch_size, max_seq_len=max_seq_len, max_num_tokens=max_num_tokens
+    )
+    return executor
+
+
+@pytest.mark.parametrize(
+    "shape,staging_tokens",
+    [
+        # A request of max_seq_len next to a full chunk.
+        ((4, 1000, 300), 1300),
+        # Not more than every request of the batch at max_seq_len.
+        ((1, 1000, 300), 1000),
+        # At least one full chunk.
+        ((1, 100, 300), 300),
+    ],
+)
+def test_the_default_staging_area_holds_a_long_request_next_to_a_chunk(
+    monkeypatch, shape, staging_tokens
+) -> None:
+    monkeypatch.delenv("TRTLLM_DKV_STAGING_TOKENS", raising=False)
+    assert _staging_executor(*shape)._dkv_staging_settings()["staging_tokens"] == staging_tokens
+
+
+def test_a_staging_area_below_one_request_of_max_seq_len_is_rejected(monkeypatch) -> None:
+    executor = _staging_executor()
+    monkeypatch.setenv("TRTLLM_DKV_STAGING_TOKENS", "1000")
+    assert executor._dkv_staging_settings()["staging_tokens"] == 1000
+    monkeypatch.setenv("TRTLLM_DKV_STAGING_TOKENS", "999")
+    with pytest.raises(ValueError, match="one request of max_seq_len"):
+        executor._dkv_staging_settings()
+
+
+def test_the_staged_view_publishes_its_token_budget_to_the_scheduler() -> None:
+    executor = _staging_executor()
+    executor.model_engine = SimpleNamespace()
+    executor._install_dkv_staged_view("view", {"staging_tokens": 1300})
+    assert executor.kv_cache_manager.dkv_staged_view == "view"
+    assert executor.kv_cache_manager.dkv_max_staging_tokens == 1300
+
+
 def _scheduled_executor(dist, *, trace, requests, checker_enabled=True) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
     executor.dist = dist

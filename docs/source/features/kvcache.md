@@ -686,8 +686,10 @@ through that path, with every rank owning every layer, so the staging path is ju
 and without any transfer between ranks. It needs the DeepSeek-V4 cache manager, an FP8 or
 BF16 KV cache (not `fp8_ds_mla` or NVFP4) and `cuda_graph_config: null`. The slots hold the
 cached and the new tokens of one iteration: `TRTLLM_DKV_STAGING_TOKENS` bounds their sum
-over the requests of a rank (default: every request of the batch at `max_seq_len`, which
-no iteration exceeds, so `StagingOverflow` only follows from a lower value). `TRTLLM_DKV_STAGING_DEPTH` sets how many
+over the requests of a rank, and the scheduler admits a request to an iteration only while
+the sum fits (default: `max_seq_len` plus `max_num_tokens`, and no more than every request
+of the batch at `max_seq_len`; a value below `max_seq_len` is rejected, since a request of
+that length would never be admitted). `TRTLLM_DKV_STAGING_DEPTH` sets how many
 layers of a kind can use the staging area at once (default 2).
 `TRTLLM_DKV_STAGING_FILL=nan` overwrites the slots of a layer with NaN before its pages are
 fetched, so a page that the layer reads without it having been fetched or written turns the
@@ -701,7 +703,9 @@ into contiguous ranges over the ranks of the group, and the cache manager of a r
 KV of the layers it owns only, so a group stores one copy of the KV of every request instead
 of one per rank. The request is still computed on its compute rank: around the attention of
 each layer, the rank that owns the layer sends the cached KV the layer reads to the compute
-rank (a fetch), and the compute rank sends the pages its new tokens wrote back (a writeback).
+rank (a fetch), and the compute rank sends the pages its new tokens wrote back (a writeback). The pages of a sliding window or
+of a compressor state that fall out of their window with the iteration are not sent, since the
+cache manager releases them before anything reads them.
 Both run on a data stream of their own over NCCL point-to-point messages, in an order that
 every rank derives from the replicated scheduling state, so no rank exchanges the plan; the
 host waits for the data stream at the end of every iteration, before a page can be freed or
