@@ -28,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.dkv import (
     ownership_fingerprint,
     validate_ownership,
 )
+from tensorrt_llm._torch.pyexecutor.dkv_types import LifecycleKey
 
 pytestmark = pytest.mark.cpu_only
 
@@ -44,6 +45,11 @@ def _alternating(num_layers: int) -> list[int]:
 
 _V4_PRO = _alternating(43)
 _V4_TEST_CONFIG = _alternating(61)
+
+
+def _key(window: int, *, sparse: bool = False) -> LifecycleKey:
+    """The key of a life cycle of a window of ``window`` tokens (0: the whole history)."""
+    return LifecycleKey(False, window, 0, sparse)
 
 
 def _life_cycle_keys(ratios: list[int], *, offload: bool = False) -> list[frozenset]:
@@ -109,7 +115,7 @@ def test_the_fingerprint_follows_the_table() -> None:
 
 
 def test_life_cycle_keys_follow_the_layer_types() -> None:
-    swa, state_csa, history = (128, 0, False), (8, 0, False), (None, 0, False)
+    swa, state_csa, history = _key(128), _key(8), _key(0)
     keys = _life_cycle_keys([_SWA_ONLY, _CSA, _HCA])
     assert keys[0] == {swa}
     assert keys[1] == {swa, state_csa, history}
@@ -118,10 +124,10 @@ def test_life_cycle_keys_follow_the_layer_types() -> None:
 
 
 def test_offloaded_csa_history_is_a_sparse_life_cycle_of_its_own() -> None:
-    swa, state_csa = (128, 0, False), (8, 0, False)
+    swa, state_csa = _key(128), _key(8)
     keys = _life_cycle_keys([_CSA, _HCA], offload=True)
-    assert keys[0] == {swa, state_csa, (None, 0, True), (None, 0, False)}
-    assert keys[1] == {swa, (None, 0, False)}
+    assert keys[0] == {swa, state_csa, _key(0, sparse=True), _key(0)}
+    assert keys[1] == {swa, _key(0)}
 
 
 def _valid_by_construction(ratios: list[int], group_size: int) -> bool:
@@ -161,8 +167,8 @@ def test_the_error_names_the_missing_life_cycles() -> None:
     with pytest.raises(ValueError) as caught:
         validate_ownership(compute_ownership(43, 22), keys, 22)
     message = str(caught.value)
-    assert "(None, 0, False)" in message and "(8, 0, False)" in message
-    assert "(128, 0, False)" not in message
+    assert "window_size=0" in message and "window_size=8" in message
+    assert "window_size=128" not in message
     assert "smaller attention-DP group" in message
 
 

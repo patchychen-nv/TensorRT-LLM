@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.interfaces import DkvTrans
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.logger import logger
 
+from .dkv_types import LifecycleKey
 from .llm_request import FinishReason, LlmRequest, LlmRequestState
 
 
@@ -501,12 +502,6 @@ class DkvInvariantChecker:
         raise RuntimeError(msg)
 
 
-# A semantic KV life cycle: (window size, or None for the whole history; number of sink blocks;
-# whether the history is attended sparsely). Ranks that own different layers number their life
-# cycles differently, so whatever is compared across ranks is keyed by this tuple.
-LifeCycleKey = tuple[int | None, int, bool]
-
-
 def compute_ownership(num_layers: int, group_size: int) -> tuple[int, ...]:
     """The rank that stores the KV of every layer under the ``layer_split`` layout.
 
@@ -540,7 +535,7 @@ def ownership_fingerprint(owner_of_layer: Sequence[int]) -> str:
 
 def validate_ownership(
     owner_of_layer: Sequence[int],
-    life_cycles_of_layer: Sequence[Collection[LifeCycleKey]],
+    life_cycles_of_layer: Sequence[Collection[LifecycleKey]],
     group_size: int,
 ) -> None:
     """Check that every rank can hold every KV life cycle of the model.

@@ -28,7 +28,6 @@ buffers (``StagingPool``), the cache manager the attention backend sees when the
 (``DkvPageCopier``). It does not decide when anything is copied.
 """
 
-import enum
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -47,6 +46,8 @@ from tensorrt_llm._utils import (
 )
 from tensorrt_llm.bindings import DataType
 
+from .dkv_types import StagingKind
+
 # The index the cache manager gives a block that holds no page.
 BAD_PAGE_INDEX = -1
 
@@ -55,65 +56,30 @@ BAD_PAGE_INDEX = -1
 REGION_ALIGNMENT = 256
 
 
-class StagingKind(enum.Enum):
-    """A kind of KV storage that is staged. Layers of one kind share one ring of slots."""
+# The cache roles a layer holds for each kind of storage, in the order their regions are laid out.
+_ATTENTION_TYPES: dict[StagingKind, tuple[DeepseekV4AttentionType, ...]] = {
+    StagingKind.SWA: (DeepseekV4AttentionType.SWA,),
+    StagingKind.COMPRESS_R4: (DeepseekV4AttentionType.COMPRESS,),
+    StagingKind.COMPRESS_R128: (DeepseekV4AttentionType.COMPRESS,),
+    StagingKind.INDEXER_COMPRESS: (DeepseekV4AttentionType.INDEXER_COMPRESS,),
+    StagingKind.STATE_CSA: (
+        DeepseekV4AttentionType.COMPRESSOR_KV,
+        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+    ),
+    StagingKind.STATE_HCA: (
+        DeepseekV4AttentionType.COMPRESSOR_KV,
+        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+    ),
+    StagingKind.STATE_INDEXER: (
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+    ),
+}
 
-    SWA = "swa"
-    COMPRESS_R4 = "compress_r4"
-    COMPRESS_R128 = "compress_r128"
-    INDEXER_COMPRESS = "indexer_compress"
-    STATE_CSA = "state_csa"
-    STATE_HCA = "state_hca"
-    STATE_INDEXER = "state_indexer"
 
-    @property
-    def shared_page_index(self) -> bool:
-        """Whether every layer indexes pages with the same page indices.
-
-        The compressed caches are indexed alike by all layers that have them, and a layer's own
-        region of the slot is selected by the base pointer. The sliding-window caches fold the
-        layer into the page index instead and share one base pointer.
-        """
-        return self in (
-            StagingKind.COMPRESS_R4,
-            StagingKind.COMPRESS_R128,
-            StagingKind.INDEXER_COMPRESS,
-        )
-
-    @property
-    def windowed(self) -> bool:
-        """Whether only the last tokens of the history are kept (a sliding window)."""
-        return not self.shared_page_index
-
-    @property
-    def compress_ratio(self) -> int | None:
-        """The compress ratio of the layers that have this kind; ``None``: every layer."""
-        return {
-            StagingKind.SWA: None,
-            StagingKind.COMPRESS_R4: 4,
-            StagingKind.COMPRESS_R128: 128,
-            StagingKind.INDEXER_COMPRESS: 4,
-            StagingKind.STATE_CSA: 4,
-            StagingKind.STATE_HCA: 128,
-            StagingKind.STATE_INDEXER: 4,
-        }[self]
-
-    @property
-    def attention_types(self) -> tuple[DeepseekV4AttentionType, ...]:
-        """The cache roles a layer holds for this kind, in the order their regions are laid out."""
-        types = DeepseekV4AttentionType
-        return {
-            StagingKind.SWA: (types.SWA,),
-            StagingKind.COMPRESS_R4: (types.COMPRESS,),
-            StagingKind.COMPRESS_R128: (types.COMPRESS,),
-            StagingKind.INDEXER_COMPRESS: (types.INDEXER_COMPRESS,),
-            StagingKind.STATE_CSA: (types.COMPRESSOR_KV, types.COMPRESSOR_SCORE),
-            StagingKind.STATE_HCA: (types.COMPRESSOR_KV, types.COMPRESSOR_SCORE),
-            StagingKind.STATE_INDEXER: (
-                types.INDEXER_COMPRESSOR_KV,
-                types.INDEXER_COMPRESSOR_SCORE,
-            ),
-        }[self]
+def attention_types(kind: StagingKind) -> tuple[DeepseekV4AttentionType, ...]:
+    """The cache roles a layer holds for ``kind``, in the order their regions are laid out."""
+    return _ATTENTION_TYPES[kind]
 
 
 @dataclass(frozen=True)
@@ -127,7 +93,7 @@ class StagingComponent:
 STAGING_COMPONENTS: tuple[StagingComponent, ...] = tuple(
     StagingComponent(kind, attention_type)
     for kind in StagingKind
-    for attention_type in kind.attention_types
+    for attention_type in attention_types(kind)
 )
 
 
@@ -252,7 +218,7 @@ class StagingLayout:
         try:
             return layers.index(layer) % self.geometry.ring_depth
         except ValueError:
-            raise ValueError(f"layer {layer} has no {kind.value} storage") from None
+            raise ValueError(f"layer {layer} has no {kind.label} storage") from None
 
     # ---- sizes ----------------------------------------------------------------------------
 
@@ -391,7 +357,7 @@ class StagingLayout:
             offset += pages
         if offset > self.slot_pages(kind):
             raise StagingOverflow(
-                f"{len(requests)} requests need {offset} {kind.value} pages, "
+                f"{len(requests)} requests need {offset} {kind.label} pages, "
                 f"a slot has {self.slot_pages(kind)}"
             )
         return tuple(spans)
@@ -545,7 +511,7 @@ class DkvStagedKvView:
         ]
         for index, attention_type in enumerate(self._SLIDING):
             for kind in self.layout.kinds:
-                if attention_type in kind.attention_types:
+                if attention_type in attention_types(kind):
                     for layer in self.layout.layers_of(kind):
                         self._sliding_kinds[layer][index] = kind
         self._buffers: dict[tuple[int, DeepseekV4AttentionType], torch.Tensor] = {}

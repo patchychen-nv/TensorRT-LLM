@@ -33,7 +33,7 @@ parity with the native results is covered by ``test_dkv_lifecycle_slot_counts.py
 import math
 import struct
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -46,6 +46,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     SsmLayerConfig,
 )
 
+from ..dkv_types import LifecycleKey
+
 # Page indices are 32-bit throughout the storage layer.
 MAX_SLOT_COUNT = (1 << 31) - 1
 
@@ -57,19 +59,6 @@ _FALLBACK_HISTORY_LENGTH = 2048
 _GPU_PHYS_MEM_BASE = 2 << 20
 _HOST_GRANULARITY = 4096
 _DISK_GRANULARITY = 2 << 20
-
-
-class LifecycleKey(NamedTuple):
-    """Semantic identity of a life cycle, the same on every rank whatever layers it holds.
-
-    Life cycle ids are assigned in the order the layers of a rank first mention each life cycle,
-    so they differ between ranks that hold different layer subsets; this key does not.
-    """
-
-    is_ssm: bool
-    window_size: int  # 0: no sliding window
-    num_sink_blocks: int
-    is_sparse: bool
 
 
 @dataclass(frozen=True)

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
+from tensorrt_llm._torch.pyexecutor.dkv_types import LifecycleKey
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _GUARD_PAGE_REQUEST_ID,
     _RESERVED_REQUEST_IDS,
@@ -668,12 +669,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return None
         return base_window_size + self._max_draft_len
 
-    def get_layer_life_cycle_keys(self) -> List[frozenset[Tuple[int | None, int, bool]]]:
+    def get_layer_life_cycle_keys(self) -> List[frozenset[LifecycleKey]]:
         """For every model layer, the semantic life cycles its KV lives in.
 
-        A key is ``(window size or None, sink blocks, sparse history)``, derived from the window
-        sizes the V2 layer configs use. Ranks that own different layers number their life cycles
-        differently, so layer ownership is validated against these keys.
+        A key is a ``LifecycleKey``, derived from the window sizes the V2 layer configs use. Ranks
+        that own different layers number their life cycles differently, so layer ownership is
+        validated against these keys.
         """
         keys = []
         for layer_idx in range(self.num_layers):
@@ -687,7 +688,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     and attn_type == DeepseekV4AttentionType.COMPRESS
                     and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
                 )
-                layer_keys.add((self._get_window_size(compress_ratio, attn_type), 0, is_sparse))
+                window_size = self._get_window_size(compress_ratio, attn_type)
+                layer_keys.add(LifecycleKey(False, window_size or 0, 0, is_sparse))
             keys.append(frozenset(layer_keys))
         return keys
 

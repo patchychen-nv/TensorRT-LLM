@@ -847,10 +847,14 @@ def test_a_plan_prints_briefly() -> None:
 @pytest.mark.parametrize(
     ("module", "allowed"),
     [
-        (plan_lib, {"collections", "dataclasses", "enum", "hashlib", "types", "typing"}),
+        (
+            plan_lib,
+            {"collections", "dataclasses", "enum", "hashlib", "types", "typing", ".dkv_types"},
+        ),
         (simulator_lib, {"collections", "dataclasses", "enum", ".dkv_plan"}),
+        (sys.modules[StagingKind.__module__], {"enum", "typing"}),
     ],
-    ids=["dkv_plan", "dkv_plan_simulator"],
+    ids=["dkv_plan", "dkv_plan_simulator", "dkv_types"],
 )
 def test_the_modules_import_nothing_but_the_standard_library(
     module: types.ModuleType, allowed: set

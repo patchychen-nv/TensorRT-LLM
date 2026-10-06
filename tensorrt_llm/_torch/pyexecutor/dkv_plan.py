@@ -79,6 +79,8 @@ from enum import Enum, IntEnum
 from types import MappingProxyType
 from typing import NamedTuple, Protocol
 
+from .dkv_types import StagingKind
+
 __all__ = [
     "DEADLINE_OF_KIND",
     "ISSUE_AT_BEGIN",
@@ -119,25 +121,6 @@ class Direction(IntEnum):
 
     FETCH = 0
     WRITEBACK = 1
-
-
-class StagingKind(IntEnum):
-    """One kind of KV storage of a layer, in the order messages list their segments.
-
-    ``SWA`` is the sliding-window KV, ``COMPRESS_R4`` and ``COMPRESS_R128`` the compressed KV of
-    the layers with compression ratio 4 and 128, ``INDEXER_COMPRESS`` the indexer's compressed
-    keys, ``STATE_CSA``, ``STATE_HCA`` and ``STATE_INDEXER`` the read-modify-write states of the
-    compressor of the two layer types and of the indexer. A state with several blocks counts as
-    one kind and its pages carry all the blocks.
-    """
-
-    SWA = 0
-    COMPRESS_R4 = 1
-    COMPRESS_R128 = 2
-    INDEXER_COMPRESS = 3
-    STATE_CSA = 4
-    STATE_HCA = 5
-    STATE_INDEXER = 6
 
 
 class DeadlineClass(IntEnum):

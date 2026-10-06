@@ -54,6 +54,7 @@ from tensorrt_llm._torch.pyexecutor.dkv_staging import (
     StagingKind,
     StagingLayout,
     StagingPool,
+    attention_types,
 )
 from tensorrt_llm._torch.pyexecutor.dkv_streamer import LoopbackStreamer
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
@@ -643,10 +644,10 @@ def test_the_layers_reproduce_themselves_when_the_indexer_selects_everything() -
 
 
 def _roles(kind: StagingKind) -> tuple:
-    return kind.attention_types
+    return attention_types(kind)
 
 
-@pytest.mark.parametrize("kind", list(StagingKind), ids=lambda kind: kind.value)
+@pytest.mark.parametrize("kind", list(StagingKind), ids=lambda kind: kind.label)
 def test_a_corruption_of_every_kind_of_storage_in_the_staging_area_is_seen(
     kind: StagingKind,
 ) -> None:
