@@ -11,7 +11,7 @@ On the same deterministic workload the runner compares
 Every mode runs in its own process, because the DKV switches are read when the workers start.
 ``run`` starts one worker process per mode on this node. ``worker`` runs one mode in the current
 process; a group that spans nodes is driven by starting it on every task of the job behind
-``trtllm-llmapi-launch``. ``report``, ``summary`` and ``check`` read the results.
+``trtllm-llmapi-launch``. ``report``, ``summary``, ``capacity`` and ``check`` read the results.
 
 The results are hit rates, the context tokens that still had to be computed, the load of every rank
 and the logical duplicate storage, each with the validity controls of
@@ -35,6 +35,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Literal, Protocol
 
 if __package__:
@@ -170,7 +171,10 @@ def hit_ceiling(options: Phase6Options, requests: Sequence[WorkloadRequest]) -> 
     """The prompt tokens a cache that keeps everything and is visible to every rank can serve.
 
     A conversation reuses its previous prompt. A shared prefix is reused by every request once it
-    was primed, and by every request but the first of its prefix otherwise.
+    was primed, and by every request but the first of its prefix otherwise. The ceiling is reached
+    exactly by conversations and primed prefixes; for an unprimed prefix it is an upper bound,
+    because requests of one prefix that are in flight together cannot reuse blocks that are not
+    committed yet.
     """
     if options.workload == "chat":
         return history_hit_ceiling(requests)
@@ -198,7 +202,7 @@ def kv_cache_options(options: Phase6Options) -> dict[str, int | bool | None]:
     return fields
 
 
-def _dkv_models():
+def _dkv_models() -> ModuleType:
     """The shared LLM factory, imported on demand: it needs torch, the report commands do not."""
     if __package__:
         from . import dkv_models
@@ -240,6 +244,8 @@ class Observer:
         self._directory = directory
         self._clock = clock
         self._sleep = sleep
+        for name in ("events", "iteration-stats"):
+            (directory / f"{name}.jsonl").unlink(missing_ok=True)
 
     def pull(self) -> list[dict]:
         """Collect what the runtime produced since the last pull; returns the new events."""
@@ -286,7 +292,15 @@ class Observer:
         raise TimeoutError(f"The rank counters reached {seen} of {expected} requests")
 
 
-def _await_cached_tokens(future, observer: Observer, timeout_s: float) -> int:
+class _Answer(Protocol):
+    cached_tokens: int
+
+
+class _Pending(Protocol):
+    def result(self, timeout: float) -> _Answer: ...
+
+
+def _await_cached_tokens(future: _Pending, observer: Observer, timeout_s: float) -> int:
     """Wait for a request while collecting the streams, so that neither buffer overflows."""
     deadline = time.monotonic() + timeout_s
     while True:
@@ -307,23 +321,32 @@ def _load_reference(options: Phase6Options, mode: Mode) -> list[dict] | None:
     return result["report"]["capacity_by_rank"]
 
 
-def run_mode(options: Phase6Options, directory: Path) -> dict:
-    """Serve the workload under one mode; writes ``result.json`` and the raw streams.
+@dataclass(frozen=True)
+class Plan:
+    """The workload of a run and what was checked about it before any model is loaded."""
 
-    Returns the result. Runs in the current process, which must have started every rank (the
-    process itself, or ``trtllm-llmapi-launch`` for a group that spans nodes).
+    mode: Mode
+    vocab: int
+    requests: list[WorkloadRequest]
+    primers: list[list[int]]
+    warm: list[list[int]]
+    longest: int
+    reference: list[dict] | None
+
+
+def prepare(options: Phase6Options) -> Plan:
+    """Build the workload of a run and reject options that would only fail after the model loaded.
+
+    Raises:
+        ValueError: A count is below one, a prompt (a warm-up one included) does not fit
+            ``max_seq_len``, ``max_num_tokens`` or the context window of the model, or an ADP
+            reference is given to a mode that is not ``dkv``.
     """
-    from tensorrt_llm import SamplingParams
-    from tensorrt_llm._torch.pyexecutor.dkv_metrics import build_dkv_measurement_report
-    from tensorrt_llm.llmapi.llm_args import AttentionDpConfig, MoeConfig
-
-    if options.warmup < 1:
-        raise ValueError("at least one warm-up request is needed to see the first statistics")
-    directory.mkdir(parents=True, exist_ok=True)
+    if min(options.warmup, options.phases, options.concurrency) < 1:
+        raise ValueError("warmup, phases and concurrency must be at least 1")
     mode = parse_mode(options.mode)
-    vocab = (
-        options.vocab or json.loads((Path(options.model) / "config.json").read_text())["vocab_size"]
-    )
+    config = json.loads((Path(options.model) / "config.json").read_text())
+    vocab = options.vocab or config["vocab_size"]
     requests = build_requests(options, vocab)
     primers = priming_prompts(options, requests)
     warm_length = (
@@ -333,9 +356,34 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
     )
     warm = warmup_prompts(count=options.warmup, tokens=warm_length, vocab=vocab, seed=options.seed)
     longest = max(len(request.prompt) for request in requests)
-    if longest + 1 > options.max_seq_len or longest > options.max_num_tokens:
-        raise ValueError(f"max_seq_len and max_num_tokens must hold the longest prompt ({longest})")
-    reference = _load_reference(options, mode)
+    needed = max(longest, warm_length)
+    if needed + 1 > options.max_seq_len or needed > options.max_num_tokens:
+        raise ValueError(
+            f"max_seq_len and max_num_tokens must hold the longest prompt ({needed} tokens)"
+        )
+    window = config.get("max_position_embeddings")
+    if window is not None and needed + 1 > window:
+        raise ValueError(
+            f"the longest prompt ({needed} tokens) exceeds the model's {window} tokens"
+        )
+    return Plan(mode, vocab, requests, primers, warm, longest, _load_reference(options, mode))
+
+
+def run_mode(options: Phase6Options, directory: Path) -> dict:
+    """Serve the workload under one mode; writes ``result.json`` and the raw streams.
+
+    Returns the result. Runs in the current process, which must have started every rank (the
+    process itself, or ``trtllm-llmapi-launch`` for a group that spans nodes).
+    """
+    plan = prepare(options)
+    mode, requests, primers, warm = plan.mode, plan.requests, plan.primers, plan.warm
+    longest, reference = plan.longest, plan.reference
+
+    from tensorrt_llm import SamplingParams
+    from tensorrt_llm._torch.pyexecutor.dkv_metrics import build_dkv_measurement_report
+    from tensorrt_llm.llmapi.llm_args import AttentionDpConfig, MoeConfig
+
+    directory.mkdir(parents=True, exist_ok=True)
     per_session: dict[int, int] = {}
     for request in requests:
         per_session[request.session] = per_session.get(request.session, 0) + 1
@@ -600,8 +648,18 @@ def _add_options(parser: argparse.ArgumentParser, *, model_required: bool = True
     parser.add_argument("--max-batch-size", type=int, default=defaults.max_batch_size)
     parser.add_argument("--max-num-tokens", type=int, default=defaults.max_num_tokens)
     parser.add_argument("--max-seq-len", type=int, default=defaults.max_seq_len)
-    parser.add_argument("--kv-max-tokens", type=int, default=defaults.kv_max_tokens)
-    parser.add_argument("--kv-quota-gib", type=float, default=None, help="max_gpu_total_bytes")
+    parser.add_argument(
+        "--kv-max-tokens",
+        type=int,
+        default=defaults.kv_max_tokens,
+        help="KV capacity in tokens; ignored when --kv-quota-gib is given",
+    )
+    parser.add_argument(
+        "--kv-quota-gib",
+        type=float,
+        default=None,
+        help="KV bytes per rank (max_gpu_total_bytes) in GiB; replaces --kv-max-tokens",
+    )
     parser.add_argument("--event-buffer", type=int, default=defaults.event_buffer)
     parser.add_argument("--adp-reference", default=None, help="result.json of an adp run")
     parser.add_argument("--capacity-tolerance-pages", type=int, default=0)
@@ -619,6 +677,8 @@ def _options_of(args: argparse.Namespace, mode: str) -> Phase6Options:
 def _parse_groups(specs: Sequence[str]) -> dict[str, list[dict]]:
     groups = {}
     for spec in specs:
+        if "=" not in spec:
+            raise ValueError(f"expected LABEL=DIR[,DIR...], got {spec!r}")
         label, directories = spec.split("=", 1)
         groups[label] = tables.load_results(Path(path) for path in directories.split(","))
     return groups
@@ -651,17 +711,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "run":
+        base = _options_of(args, mode="")
         try:
             for spec in args.modes.split(","):
-                parse_mode(spec)
-        except ValueError as error:
+                prepare(dataclasses.replace(base, mode=spec))
+        except (ValueError, OSError) as error:
             parser.error(str(error))
         codes = run_modes(
-            _options_of(args, mode=""),
-            args.modes.split(","),
-            Path(args.out),
-            gpus=args.gpus,
-            timeout_s=args.timeout,
+            base, args.modes.split(","), Path(args.out), gpus=args.gpus, timeout_s=args.timeout
         )
         failed = [name for name, code in codes.items() if code]
         print("PHASE6_DONE " + json.dumps({"failed": failed}), flush=True)
@@ -680,11 +737,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             tables.comparison_tables(tables.load_results(Path(path) for path in args.directories))
         )
         return 0
-    if args.command == "summary":
-        print(tables.seed_summary(_parse_groups(args.groups)))
-        return 0
-    if args.command == "capacity":
-        print(tables.capacity_table(_parse_groups(args.groups)))
+    if args.command in ("summary", "capacity"):
+        try:
+            groups = _parse_groups(args.groups)
+        except ValueError as error:
+            parser.error(str(error))
+        render = tables.seed_summary if args.command == "summary" else tables.capacity_table
+        print(render(groups))
         return 0
     lines = tables.check_runs(tables.load_results(Path(path) for path in args.directories))
     print("\n".join(lines))
