@@ -24,7 +24,7 @@ def _wait(path: Path) -> None:
 
 
 def install_pyexecutor_hooks(executor_class: type, trace_dir: str) -> None:
-    """Trace physical sends and replicated lifecycle, with one bounded abort handshake."""
+    """Trace physical sends and the lifecycle of every rank, with one bounded abort handshake."""
     if getattr(executor_class, "_dkv_transfer_probe_installed", False):
         return
     executor_class._dkv_transfer_probe_installed = True
@@ -130,21 +130,22 @@ def install_pyexecutor_hooks(executor_class: type, trace_dir: str) -> None:
             return result
 
         coordinator._stage_dkv_transfer_event = stage
-        original_commit = coordinator.commit_dkv_transfer_events
+        original_transfer_release = coordinator._release_dkv_transfer
 
-        @wraps(original_commit)
-        def commit(events):
-            for event in events:
-                record(
-                    executor,
-                    "commit",
-                    request_id=event.request_id,
-                    owner=event.compute_rank,
-                    outcome=event.outcome,
-                )
-            return original_commit(events)
+        # A request is committed when its transfer ends on this rank: with every rank sending its
+        # layers, that is once all of them have reported, and the event carries the merged outcome.
+        @wraps(original_transfer_release)
+        def commit(request, event):
+            record(
+                executor,
+                "commit",
+                request_id=event.request_id,
+                owner=event.compute_rank,
+                outcome=event.outcome,
+            )
+            return original_transfer_release(request, event)
 
-        coordinator.commit_dkv_transfer_events = commit
+        coordinator._release_dkv_transfer = commit
 
     original_fetch = executor_class._fetch_new_requests
 

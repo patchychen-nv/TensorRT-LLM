@@ -3,7 +3,9 @@
 """DKV precision must reject shared reusable prefixes and invalid numerical controls."""
 
 import copy
+import dataclasses
 import importlib.util
+import math
 from pathlib import Path
 
 import pytest
@@ -357,6 +359,51 @@ def test_noisy_policy_rejects_an_adp_control_that_is_too_noisy() -> None:
         _POLICY.compare_precision_runs(control, replay, dkv, _POLICY.NOISY_POLICY)
 
 
+_ALLOWANCE = dataclasses.replace(_POLICY.NOISY_POLICY, mean_extra_sigmas=2.0)
+
+
+def _extra_distance_runs(extras: list[float]) -> tuple[dict, dict, dict]:
+    """Runs of one two-token position per prompt: both ADP runs agree, and the DKV distribution of
+    prompt ``i`` lies ``extras[i]`` from theirs in total variation."""
+
+    def logits(probability: float) -> torch.Tensor:
+        return torch.tensor([[math.log(probability / (1 - probability)), 0.0]])
+
+    control = {"tokens": [[0]] * len(extras), "logits": [logits(0.9)] * len(extras)}
+    dkv = {"tokens": [[0]] * len(extras), "logits": [logits(0.9 - extra) for extra in extras]}
+    return control, copy.deepcopy(control), dkv
+
+
+def test_the_mean_extra_distance_of_scattered_prompts_may_exceed_the_allowance_by_its_error() -> (
+    None
+):
+    # The mean is 0.03 and its standard error 0.0086: a correct run lies there now and then.
+    runs = _extra_distance_runs([0.06, 0.0] * 7)
+    with pytest.raises(AssertionError, match="of which 0.0200 is allowed"):
+        _POLICY.compare_precision_runs(*runs, _POLICY.NOISY_POLICY)
+    result = _POLICY.compare_precision_runs(*runs, _ALLOWANCE)
+    assert result["mean_extra_tv"] == pytest.approx(0.03)
+
+
+def test_a_bias_that_every_prompt_shares_gets_no_allowance() -> None:
+    runs = _extra_distance_runs([0.03] * 14)
+    with pytest.raises(AssertionError, match="of which 0.0200 is allowed"):
+        _POLICY.compare_precision_runs(*runs, _ALLOWANCE)
+
+
+def test_a_prompt_that_is_far_off_is_not_excused_by_the_allowance() -> None:
+    runs = _extra_distance_runs([0.3] + [0.0] * 13)
+    with pytest.raises(AssertionError, match="One prompt differs"):
+        _POLICY.compare_precision_runs(*runs, _ALLOWANCE)
+
+
+def test_the_allowance_needs_a_spread_to_estimate() -> None:
+    assert _POLICY.mean_extra_limit(_ALLOWANCE, [0.5]) == _ALLOWANCE.max_mean_extra_tv
+    assert _POLICY.mean_extra_limit(_ALLOWANCE, [0.01, 0.03]) > _ALLOWANCE.max_mean_extra_tv
+    noisy = _POLICY.NOISY_POLICY
+    assert _POLICY.mean_extra_limit(noisy, [0.01, 0.2]) == noisy.max_mean_extra_tv
+
+
 def test_exact_policy_still_rejects_noise_that_a_noisy_policy_accepts() -> None:
     control, replay, dkv = _noisy_runs(noise=0.3)
     with pytest.raises(AssertionError):
@@ -399,6 +446,44 @@ def test_failing_requests_ignores_a_flip_inside_the_top_two_margin() -> None:
     for run, winner in ((control, 0), (replay, 1), (dkv, 0)):
         _make_near_tie(run, prompt=2, position=1, winner=winner)
     assert _POLICY.failing_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == []
+
+
+def test_far_requests_names_the_request_that_read_another_requests_kv() -> None:
+    control, replay, dkv = _noisy_runs()
+    assert _POLICY.far_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == []
+    dkv["logits"][3] = control["logits"][5].clone()
+    dkv["tokens"][3] = control["tokens"][5]
+    assert _POLICY.far_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == [3]
+
+
+def test_far_requests_leaves_out_a_flip_at_a_tie_but_failing_requests_names_it() -> None:
+    """A top-two gap of exactly ``min_margin`` is decisive for the margin check, and a flip across
+    it is a distance of 0.245, which is not far. The noise of a model can do that on its own."""
+    confident = torch.tensor([[3.0, 0.0]])
+    tie = torch.tensor([[0.5, 0.0]])
+    control = {"tokens": [[0]] * 6, "logits": [confident] * 4 + [tie] + [confident]}
+    replay = copy.deepcopy(control)
+    dkv = copy.deepcopy(control)
+    dkv["tokens"][4] = [1]
+    dkv["logits"][4] = tie.flip(dims=[1])
+    assert _POLICY.failing_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == [4]
+    assert _POLICY.far_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == []
+
+
+def test_far_requests_counts_logits_that_are_not_finite_as_far() -> None:
+    control, replay, dkv = _noisy_runs()
+    dkv["logits"][2] = torch.full_like(dkv["logits"][2], float("nan"))
+    assert _POLICY.far_requests(control, replay, dkv, _POLICY.NOISY_POLICY) == [2]
+
+
+def test_far_requests_under_the_exact_policy_are_the_failing_requests() -> None:
+    control = _noisy_run(_base_logits(), 0.0, 1)
+    replay, dkv = copy.deepcopy(control), copy.deepcopy(control)
+    dkv["logits"][6][0, 0] += 1e-5
+    assert _POLICY.far_requests(control, replay, dkv) == _POLICY.failing_requests(
+        control, replay, dkv
+    )
+    assert _POLICY.far_requests(control, replay, dkv) == [6]
 
 
 def test_failing_requests_under_the_exact_policy_sees_the_smallest_difference() -> None:
@@ -478,6 +563,23 @@ def test_burst_prompts_have_the_requested_lengths_and_unique_leading_blocks() ->
     _POLICY.validate_precision_inputs(
         enable_block_reuse=True, tokens_per_block=32, enable_partial_reuse=False, prompts=prompts
     )
+
+
+def test_prefix_pairs_hold_a_prompt_and_the_prompt_with_one_token_more() -> None:
+    prompts = _POLICY.build_prefix_pairs(_word_encode, 5, 96)
+    firsts, seconds = prompts[0::2], prompts[1::2]
+    assert [len(prompt) for prompt in firsts] == [96] * 5
+    assert [len(prompt) for prompt in seconds] == [97] * 5
+    assert all(second[:96] == first for first, second in zip(firsts, seconds))
+    assert len({tuple(prompt[:32]) for prompt in firsts}) == 5
+
+
+def test_prefix_pairs_end_in_the_given_tails_in_turn() -> None:
+    tails = ["The capital of France is", "Two plus two equals"]
+    prompts = _POLICY.build_prefix_pairs(_word_encode, 3, 96, tails=tails)
+    seconds = prompts[1::2]
+    assert [second[96:] for second in seconds] == [_word_encode(tails[i % 2]) for i in range(3)]
+    assert all(second[:96] == first for first, second in zip(prompts[0::2], seconds))
 
 
 def test_known_answers_detect_a_degraded_control() -> None:

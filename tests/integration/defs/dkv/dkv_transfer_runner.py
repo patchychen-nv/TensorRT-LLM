@@ -30,6 +30,7 @@ if __package__:
         PrecisionPolicy,
         compare_precision_runs,
         failing_requests,
+        far_requests,
         validate_adp_control,
         validate_precision_inputs,
     )
@@ -41,6 +42,7 @@ else:
         PrecisionPolicy,
         compare_precision_runs,
         failing_requests,
+        far_requests,
         validate_adp_control,
         validate_precision_inputs,
     )
@@ -93,9 +95,12 @@ def _group_size(options: dict, *, context: bool) -> int:
 def _llm(options: dict, *, context: bool):
     from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, MoeConfig
 
-    validate_precision_inputs(
-        enable_block_reuse=False, tokens_per_block=options["tokens_per_block"]
-    )
+    # Only the DKV context group reuses prefixes, and it is given prompts that share them on purpose.
+    reuse = context and options["dkv"] and options.get("reuse", False)
+    if not reuse:
+        validate_precision_inputs(
+            enable_block_reuse=False, tokens_per_block=options["tokens_per_block"]
+        )
     return make_dkv_llm(
         options["model"],
         dkv=context and options["dkv"],
@@ -106,6 +111,7 @@ def _llm(options: dict, *, context: bool):
         ),
         group_size=_group_size(options, context=context),
         attention_dp=context,
+        reuse=reuse,
         gather_logits=True,
         enable_iter_perf_stats=False,
         cache_transceiver_config=CacheTransceiverConfig(
@@ -151,7 +157,10 @@ def _generation_worker(options: dict, directory: Path) -> None:
             assert isinstance(result.generation_logits, torch.Tensor)
             values = result.generation_logits.detach().float().cpu().clone()
             assert values.ndim == 2 and values.shape[0] == 8 and values.shape[1] > 1000
-            assert torch.isfinite(values).all()
+            if not options.get("mutation"):
+                # The KV that a mutation corrupts may well turn the logits into NaN; the judge
+                # counts that as the corruption noticed.
+                assert torch.isfinite(values).all()
             _save_message(directory / f"response-{index}.pkl", (list(result.token_ids), values))
             index += 1
             deadline = time.monotonic() + 900
@@ -168,7 +177,8 @@ def _context_worker(options: dict, directory: Path) -> None:
     sampling = SamplingParams(
         max_tokens=1, temperature=0, ignore_eos=True, return_generation_logits=True
     )
-    outputs = {"tokens": [], "logits": []}
+    # The tokens of each prompt that the context worker found in its cache.
+    outputs = {"tokens": [], "logits": [], "cached": []}
     context_ids = []
     generation_index = 0
     timeout_ids = []
@@ -199,6 +209,7 @@ def _context_worker(options: dict, directory: Path) -> None:
             params = copy.copy(output.disaggregated_params)
             assert params is not None and params.ctx_request_id is not None
             context_ids.append(params.ctx_request_id)
+            outputs["cached"].append(output.cached_tokens)
             assert params.first_gen_logits, "Context must publish its first-token full logits"
             params.first_gen_logits = [value.cpu().clone() for value in params.first_gen_logits]
             _save_message(directory / f"request-{generation_index}.pkl", (prompt, params))
@@ -250,10 +261,23 @@ def _context_worker(options: dict, directory: Path) -> None:
 
 
 def validate_transfer_traces(directory: Path) -> dict:
-    """Require one physical sender, a lifecycle replica per rank, and synchronized leak-free cleanup."""
+    """Require the senders, a lifecycle replica per rank, and synchronized leak-free cleanup.
+
+    A replicated group has one physical sender per request, the rank that computed it. In a
+    layer-split group every rank sends the layers it owns, so every rank reports its own send and
+    the request is released once all of them have; the one response still comes from the compute
+    rank.
+
+    A run without injections has no timeouts and no cancellation. A run whose context group reuses
+    prefixes keeps the pages of the sequences it stored, so a request that ends does not bring the
+    pools back to the pages they started with, only to no more than that.
+    """
     expected = json.loads((directory / "context-result.json").read_text())
     options = json.loads((directory / "options.json").read_text())
     group_size = _group_size(options, context=True)
+    layer_split = options.get("layout") == "layer_split"
+    injections = options.get("injections", True)
+    reuse = options.get("reuse", False)
     events = [
         json.loads(line)
         for path in sorted((directory / "traces").glob("rank-*.jsonl"))
@@ -283,7 +307,7 @@ def validate_transfer_traces(directory: Path) -> dict:
     # Every prompt completes through generation; the timeout and the cancellation add one each.
     prompt_count = len(options["prompts"] or _repeated_token_prompts())
     assert expected["generated"] == prompt_count
-    assert len(expected["timeout_ids"]) == 2
+    assert len(expected["timeout_ids"]) == (2 if injections else 0)
     assert len(expected_ids) == prompt_count + len(expected["timeout_ids"])
     for kind in ("release_index", "start", "commit", "free"):
         for rank in range(group_size):
@@ -293,31 +317,65 @@ def validate_transfer_traces(directory: Path) -> dict:
                 rank,
                 counts,
             )
-    for kind in ("send", "observed", "response"):
-        counts = Counter(row["request_id"] for row in by_kind[kind])
-        assert counts == Counter({request_id: 1 for request_id in expected_ids}), (kind, counts)
+    every_request_once = Counter({request_id: 1 for request_id in expected_ids})
+    if layer_split:
+        for kind in ("send", "observed"):
+            for rank in range(group_size):
+                counts = Counter(row["request_id"] for row in by_kind[kind] if row["rank"] == rank)
+                assert counts == every_request_once, (kind, rank, counts)
+        counts = Counter(row["request_id"] for row in by_kind["response"])
+        assert counts == every_request_once, ("response", counts)
+    else:
+        for kind in ("send", "observed", "response"):
+            counts = Counter(row["request_id"] for row in by_kind[kind])
+            assert counts == every_request_once, (kind, counts)
     owners = {row["request_id"]: row["owner"] for row in by_kind["start"]}
     assert all(row["error"] is None for row in by_kind["response"])
-    for kind in ("send", "observed", "response"):
-        assert all(row["rank"] == owners[row["request_id"]] for row in by_kind[kind]), kind
+    # The response comes from the rank that computed the request.
+    assert all(row["rank"] == owners[row["request_id"]] for row in by_kind["response"])
+    if not layer_split:
+        for kind in ("send", "observed"):
+            assert all(row["rank"] == owners[row["request_id"]] for row in by_kind[kind]), kind
     for request_id in expected_ids:
-        observed = next(row for row in by_kind["observed"] if row["request_id"] == request_id)
+        observed_rows = [row for row in by_kind["observed"] if row["request_id"] == request_id]
         commits = [row for row in by_kind["commit"] if row["request_id"] == request_id]
         frees = [row for row in by_kind["free"] if row["request_id"] == request_id]
         assert len({(row["control"], row["iteration"], row["outcome"]) for row in commits}) == 1
         assert len({(row["control"], row["iteration"]) for row in frees}) == 1
-        expected_control = observed["control"] + (0 if observed["in_control"] else 1)
+        # A report reaches the others in the next control exchange, and the request is committed
+        # in the exchange that carries the last one.
+        expected_control = max(
+            row["control"] + (0 if row["in_control"] else 1) for row in observed_rows
+        )
         assert commits[0]["control"] == expected_control
         assert all(row["control"] == expected_control and row["in_control"] for row in frees)
         assert all(row["iteration"] == commits[0]["iteration"] for row in frees)
         assert all(row["window"] == "control" for row in frees)
-        assert all(row["free_pages"] == baseline["free_pages"] for row in frees)
+        for row in frees:
+            if reuse:
+                current = [page for level in row["free_pages"] for page in level]
+                total = [page for level in baseline["free_pages"] for page in level]
+                assert all(free <= initial for free, initial in zip(current, total, strict=True))
+            else:
+                assert row["free_pages"] == baseline["free_pages"]
         assert all(row["index_used"] == baseline["index_used"] for row in frees)
         outcome = "timed_out" if request_id in expected["timeout_ids"] else "completed"
-        assert observed["outcome"] == outcome
         assert all(row["outcome"] == outcome for row in commits)
-        if outcome == "timed_out":
-            assert observed["elapsed_ms"] >= options["transfer_timeout_ms"]
+        if layer_split and outcome == "timed_out":
+            # A rank that has not timed out yet cancels its own send once another one reported.
+            assert {row["outcome"] for row in observed_rows} <= {"timed_out", "failed"}
+            assert any(row["outcome"] == "timed_out" for row in observed_rows)
+            assert all(
+                row["elapsed_ms"] >= options["transfer_timeout_ms"]
+                for row in observed_rows
+                if row["outcome"] == "timed_out"
+            )
+        else:
+            assert all(row["outcome"] == outcome for row in observed_rows)
+            if outcome == "timed_out":
+                assert all(
+                    row["elapsed_ms"] >= options["transfer_timeout_ms"] for row in observed_rows
+                )
         for rank in range(group_size):
             local = [
                 row for row in events if row.get("request_id") == request_id and row["rank"] == rank
@@ -329,7 +387,7 @@ def validate_transfer_traces(directory: Path) -> dict:
                 < positions["commit"]
                 < positions["free"]
             )
-            if rank == owners[request_id]:
+            if layer_split or rank == owners[request_id]:
                 assert (
                     positions["start"]
                     < positions["send"]
@@ -345,15 +403,20 @@ def validate_transfer_traces(directory: Path) -> dict:
                         free <= initial for free, initial in zip(current, total, strict=True)
                     )
                     assert any(free < initial for free, initial in zip(current, total, strict=True))
-    cancel_id = expected["timeout_ids"][-1]
-    attempts = [row for row in by_kind["cancel_attempt"] if row["request_id"] == cancel_id]
-    assert len(attempts) == group_size
-    assert {row["rank"] for row in attempts} == set(range(group_size))
-    assert all(not row["accepted"] for row in attempts), "In-flight public abort freed a KV replica"
+    cancel_id = expected["timeout_ids"][-1] if injections else None
+    if injections:
+        attempts = [row for row in by_kind["cancel_attempt"] if row["request_id"] == cancel_id]
+        assert len(attempts) == group_size
+        assert {row["rank"] for row in attempts} == set(range(group_size))
+        assert all(not row["accepted"] for row in attempts), (
+            "In-flight public abort freed a KV replica"
+        )
     return {
         "status": "passed",
+        "layout": "layer_split" if layer_split else "replicated",
         "context_requests": len(expected_ids),
         "generation_requests": expected["generated"],
+        "sends": len(by_kind["send"]),
         "unique_raw_responses": len(by_kind["response"]),
         "timeout_ids": expected["timeout_ids"],
         "cancel_request_id": cancel_id,
@@ -508,6 +571,8 @@ def _transfer_options(
         "prompts": prompts,
         "ctx_group_size": ctx_group_size,
         "gen_group_size": gen_group_size,
+        # What the DKV context workers of the run are built with, as ``make_dkv_llm`` reads it.
+        "layout": os.environ.get("DKV_TEST_KV_LAYOUT", "replicated"),
     }
 
 
@@ -517,10 +582,30 @@ def _load_outputs(directory: Path, name: str) -> dict:
     return torch.load(directory / name / "outputs.pt", weights_only=True)
 
 
+def check_prefix_hits(cached: list[int], minimum: int) -> dict:
+    """The prompts come in pairs, the second the first with something more: only the second hits.
+
+    ``cached`` is what the context worker took from its cache for each prompt, and ``minimum`` how
+    much of the shared prefix the second prompt of a pair has to find there.
+    """
+    firsts, seconds = cached[0::2], cached[1::2]
+    assert len(firsts) == len(seconds) > 0, f"The prompts are not pairs: {cached}"
+    assert firsts == [0] * len(firsts), f"A prompt without a cached prefix hit the cache: {cached}"
+    assert all(value >= minimum for value in seconds), f"No prefix hit of {minimum}: {cached}"
+    return {"cached_tokens": cached, "minimum_hit": minimum}
+
+
+def _second_prompts(run: dict) -> dict:
+    """The requests of the second prompt of every pair of a run."""
+    return {"tokens": run["tokens"][1::2], "logits": run["logits"][1::2]}
+
+
 def judge_transfer_gate(directory: Path, *, mode: str, policy: PrecisionPolicy) -> dict:
     """Judge the finished runs of a work directory.
 
-    The lifecycle traces are checked and, for precision, DKV is compared with the two ADP runs.
+    The lifecycle traces are checked and, for precision, DKV is compared with the two ADP runs. A
+    context group that reuses prefixes must also have found them in its cache, and its precision
+    is judged on the second prompt of each pair, the one that hits the cache.
     """
     summary = {"lifecycle": validate_transfer_traces(directory / "dkv"), "precision": "not_run"}
     if mode == "precision":
@@ -530,6 +615,9 @@ def judge_transfer_gate(directory: Path, *, mode: str, policy: PrecisionPolicy) 
         options = json.loads((directory / "dkv" / "options.json").read_text())
         expected = len(options["prompts"] or _repeated_token_prompts())
         assert len(control["logits"]) == len(replay["logits"]) == len(actual["logits"]) == expected
+        if options.get("reuse"):
+            summary["reuse"] = check_prefix_hits(actual["cached"], options["reuse_hit_tokens"])
+            control, replay, actual = (_second_prompts(run) for run in (control, replay, actual))
         comparison = compare_precision_runs(control, replay, actual, policy)
         summary["precision"] = {
             **comparison,
@@ -554,11 +642,18 @@ def run_transfer_gate(
     prompts: list[list[int]] | None = None,
     ctx_group_size: int = 2,
     gen_group_size: int = 2,
+    reuse_hit_tokens: int = 0,
 ) -> dict:
     """Run real NIXL transfers; precision requires an independently repeated ADP control.
 
     ``prompts`` replaces the default repeated-token requests; the last two run after the timeout
     and cancellation injections. ``policy`` decides how closely DKV must match the ADP control.
+
+    With ``reuse_hit_tokens`` the DKV context group reuses prefixes, and the run has no injections.
+    ``prompts`` are then pairs, the second of a pair the first with something more, which run on
+    different ranks of the group and of which the second has to find at least ``reuse_hit_tokens``
+    in the cache. Only the second prompts are compared with the controls, so they are the ones that
+    should end in a question whose answer the model is sure of. The ADP controls do not reuse.
     """
     directory = Path(work_dir).resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -572,6 +667,15 @@ def run_transfer_gate(
         ctx_group_size=ctx_group_size,
         gen_group_size=gen_group_size,
     )
+    if reuse_hit_tokens:
+        if mode != "precision" or not prompts or len(prompts) % 2:
+            raise ValueError("A reuse run compares the pairs of an even number of prompts")
+        options = {
+            **options,
+            "reuse": True,
+            "reuse_hit_tokens": reuse_hit_tokens,
+            "injections": False,
+        }
     runs = [("adp-control", False), ("adp-replay", False)] if mode == "precision" else []
     runs.append(("dkv", True))
     for name, enabled in runs:
@@ -608,8 +712,9 @@ def judge_mutation(directory: Path, name: str, policy: PrecisionPolicy) -> dict:
     """What the precision gate says about the mutated run ``name`` of a work directory.
 
     ``gate_error`` is the gate's failure message, or None when the gate accepted the run;
-    ``failing_requests`` lists the requests that break the policy on their own; ``records`` are the
-    corruptions the context workers applied.
+    ``failing_requests`` lists the requests that break the policy on their own and ``far_requests``
+    those among them that no noise explains; ``records`` are the corruptions the context workers
+    applied.
     """
     control = _load_outputs(directory, "adp-control")
     replay = _load_outputs(directory, "adp-replay")
@@ -623,6 +728,7 @@ def judge_mutation(directory: Path, name: str, policy: PrecisionPolicy) -> dict:
     return {
         "gate_error": gate_error,
         "failing_requests": failing_requests(control, replay, mutated, policy),
+        "far_requests": far_requests(control, replay, mutated, policy),
         "records": _mutation_records(directory / name),
     }
 
@@ -690,14 +796,17 @@ def _natural_prompts(model: str, tokens_per_block: int) -> list[list[int]]:
 
 
 def _parse_mutations(items: list[str]) -> dict[str, dict]:
-    """Run name -> spec for ``KIND[:FRACTION]`` command-line items."""
+    """Run name -> spec for ``KIND[:FRACTION[:OWNER]]`` command-line items."""
     mutations = {}
     for item in items:
-        kind, _, fraction = item.partition(":")
-        mutations[item.replace(":", "-")] = {
-            "kind": kind,
-            "fraction": float(fraction) if fraction else 1.0,
-        }
+        kind, _, rest = item.partition(":")
+        fraction, _, owner = rest.partition(":")
+        spec: dict = {"kind": kind, "fraction": float(fraction) if fraction else 1.0}
+        name = item.replace(":", "-")
+        if owner:
+            spec["owners"] = [int(owner)]
+            name = f"{kind}-{fraction}-owner{owner}"
+        mutations[name] = spec
     return mutations
 
 
@@ -728,10 +837,10 @@ def main() -> None:
     parser.add_argument(
         "--mutate",
         action="append",
-        metavar="KIND[:FRACTION]",
+        metavar="KIND[:FRACTION[:OWNER]]",
         help="corrupt the KV of one prompt (zero or foreign, optionally only a leading fraction of "
-        "its regions) and report what the gate makes of it; repeat for several runs. Needs "
-        "--natural-prompts",
+        "its regions, optionally only what the context rank OWNER sends) and report what the gate "
+        "makes of it; repeat for several runs. Needs --natural-prompts",
     )
     parser.add_argument(
         "--mutation-target",

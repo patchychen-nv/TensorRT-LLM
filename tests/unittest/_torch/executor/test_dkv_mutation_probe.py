@@ -69,7 +69,8 @@ class _Sender:
 
     delivered: list[list[bytes]]
 
-    def __init__(self) -> None:
+    def __init__(self, instance_rank: int = 0) -> None:
+        self._instance_rank = instance_rank
         self.delivered = []
 
     def _deliver_kv_to_agent(self, write_meta):
@@ -171,6 +172,27 @@ def test_every_write_of_the_request_is_corrupted_and_recorded(tmp_path: Path) ->
     assert sorted(record["peer_rank"] for record in _records(tmp_path)) == [0, 1]
 
 
+def test_only_the_owners_that_the_spec_names_corrupt_what_they_send(tmp_path: Path) -> None:
+    module, _ = _install(tmp_path, kind="zero", owners=[1, 3])
+    senders = [module.Sender(rank) for rank in range(4)]
+    for rank, sender in enumerate(senders):
+        sender._deliver_kv_to_agent(_write(130, [bytes([rank + 1]) * 4]))
+    assert [sender.delivered for sender in senders] == [
+        [[b"\x01" * 4]],
+        [[b"\x00" * 4]],
+        [[b"\x03" * 4]],
+        [[b"\x00" * 4]],
+    ]
+    assert sorted(record["owner"] for record in _records(tmp_path)) == [1, 3]
+
+
+def test_without_owners_every_sender_corrupts_and_names_itself(tmp_path: Path) -> None:
+    module, _ = _install(tmp_path, kind="zero")
+    for rank in (0, 1):
+        module.Sender(rank)._deliver_kv_to_agent(_write(130, [b"\x05" * 4]))
+    assert sorted(record["owner"] for record in _records(tmp_path)) == [0, 1]
+
+
 def test_foreign_fills_regions_with_the_regions_of_the_same_size_of_the_previous_request(
     tmp_path: Path,
 ) -> None:
@@ -226,6 +248,7 @@ def test_writes_without_kv_regions_are_left_alone(tmp_path: Path) -> None:
         ({"kind": "flip"}, "Unknown KV mutation kind"),
         ({"kind": "zero", "fraction": 0.0}, "must be in"),
         ({"kind": "zero", "fraction": 1.5}, "must be in"),
+        ({"kind": "zero", "owners": ["0"]}, "integer ranks"),
     ],
 )
 def test_a_bad_spec_is_rejected(tmp_path: Path, spec: dict, match: str) -> None:

@@ -29,3 +29,6 @@ l0_gb300_multi_nodes_node2_gpu8:
   - dkv/test_dkv_gate.py::test_dkv_aggregate_1000_steps[deepseek-v4-g8] TIMEOUT (90)
   - dkv/test_dkv_gate.py::test_dkv_sequential_precision[deepseek-v3-lite-g8] TIMEOUT (60)
   - dkv/test_dkv_gate.py::test_dkv_sequential_precision[deepseek-v4-g8] TIMEOUT (120)
+  # DKV layer split across eight ranks: a request reads a prefix that a rank of the other node
+  # cached.
+  - dkv/test_dkv_layer_split.py::test_a_request_reads_the_prefix_that_a_request_of_another_rank_cached[g8] TIMEOUT (90)

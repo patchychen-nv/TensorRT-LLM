@@ -15,6 +15,9 @@ them. The spec is a JSON object:
                prompts.
 ``fraction``   share of the transferred regions to corrupt, taken from the front of the transfer
                order (default 1).
+``owners``     ranks of the context group whose senders corrupt what they send (default: all). In a
+               layer-split group every rank sends the layers it owns, so one owner can be corrupted
+               alone.
 ``record_dir`` directory that receives one JSON line per corrupted write.
 """
 
@@ -91,6 +94,9 @@ def install_sender_mutation(module, spec: dict) -> None:
     fraction = float(spec.get("fraction", 1.0))
     if not 0.0 < fraction <= 1.0:
         raise ValueError("The corrupted fraction of the KV regions must be in (0, 1]")
+    owners = spec.get("owners")
+    if owners is not None and not all(isinstance(owner, int) for owner in owners):
+        raise ValueError("The owners of a KV mutation are the integer ranks of the context group")
     sender = module.Sender
     if getattr(sender, "_dkv_mutation_installed", False):
         return
@@ -102,7 +108,7 @@ def install_sender_mutation(module, spec: dict) -> None:
     lock = threading.Lock()
     original = sender._deliver_kv_to_agent
 
-    def mutate(write_meta) -> None:
+    def mutate(write_meta, owner: int) -> None:
         pointers = write_meta.src_ptrs.tolist()
         sizes = write_meta.sizes.tolist()
         # The forward that wrote this KV may still be running on another stream.
@@ -126,6 +132,7 @@ def install_sender_mutation(module, spec: dict) -> None:
             "kind": spec["kind"],
             "prompt_len": spec["prompt_len"],
             "unique_rid": write_meta.unique_rid,
+            "owner": owner,
             "peer_rank": write_meta.peer_rank,
             "regions": len(pointers),
             "corrupted_regions": count,
@@ -137,7 +144,8 @@ def install_sender_mutation(module, spec: dict) -> None:
     @wraps(original)
     def deliver(self, write_meta):
         if write_meta.meta_type == module.WriteMetaType.KV and write_meta.src_ptrs.size > 0:
-            mutate(write_meta)
+            if owners is None or self._instance_rank in owners:
+                mutate(write_meta, self._instance_rank)
         return original(self, write_meta)
 
     sender._deliver_kv_to_agent = deliver

@@ -114,6 +114,10 @@ l0_gb300_multi_gpus:
   - dkv/test_dkv_layer_split.py::test_a_writeback_that_arrives_damaged_at_its_owner_fails_the_group_and_is_named[zero] TIMEOUT (60)
   - dkv/test_dkv_layer_split.py::test_a_fetch_that_arrives_damaged_at_the_compute_rank_fails_the_group_and_is_named[flip] TIMEOUT (60)
   - dkv/test_dkv_layer_split.py::test_a_fetch_that_arrives_damaged_at_the_compute_rank_fails_the_group_and_is_named[zero] TIMEOUT (60)
+  # A layer-split context group hands its KV to a generation group: every rank sends its layers.
+  - dkv/test_dkv_layer_split.py::test_a_layer_split_context_group_hands_generation_the_same_kv_as_an_adp_group TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_a_layer_split_context_group_hands_generation_the_prefix_that_another_rank_cached TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_the_transfer_gate_fails_when_a_layer_split_group_hands_over_corrupted_kv TIMEOUT (120)
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_v2_kv_events TIMEOUT (15)
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_dkv_v2_kv_events TIMEOUT (15)
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_dkv_v2_kv_events_under_pressure TIMEOUT (25)

@@ -732,9 +732,14 @@ received and copied locally, the host seconds of the hooks of the forward pass (
 what the data plane adds to a pass that is bound by the host) and the host seconds that the end
 of an iteration waited for the data stream (`drain_seconds`).
 
-The tests are `tests/integration/defs/dkv/test_dkv_layer_split.py` (DeepSeek-V4 on two ranks,
-judged against the replicated group by the rules above, and the bursts and the aggregate soak
-of the replicated layout), the multi-GPU probe `tests/unittest/_torch/multi_gpu/test_dkv_dataplane_tp.py`,
+The tests are `tests/integration/defs/dkv/test_dkv_layer_split.py` (DeepSeek-V4 on two to eight
+ranks, judged against the replicated group by the rules above: precision with and without chunked
+prompts, prefixes that a request reads from the cache of another rank and from the host tier,
+conversations whose turns alternate over the ranks, the bursts and the aggregate soak of the
+replicated layout, a message that is damaged on arrival in either direction, and a layer-split
+context group that hands its KV to an ordinary generation worker, with a timeout and a
+cancellation, with prefix reuse, and with the KV that all ranks or one rank send corrupted), the
+multi-GPU probe `tests/unittest/_torch/multi_gpu/test_dkv_dataplane_tp.py`,
 which runs the data plane between real ranks without a model and compares every page with a
 pattern (`DKV_DATAPLANE_SOAK=<iterations>` turns on a long run), and CPU tests that run every
 rank's streamer on threads (`tests/unittest/_torch/executor/test_dkv_streamer.py`).

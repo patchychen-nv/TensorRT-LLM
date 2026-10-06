@@ -9,6 +9,7 @@ the suites of the replicated layout on it and judge it against the replicated gr
 run-to-run noise of the model.
 """
 
+import dataclasses
 import json
 import os
 import signal
@@ -33,11 +34,14 @@ from .dkv_models import (
     make_dkv_llm,
 )
 from .dkv_precision import (
+    MEAN_EXTRA_SIGMAS,
+    PrecisionPolicy,
     PrecisionRun,
     assert_known_answers,
     assess_prompt_separation,
     build_burst_prompts,
     build_precision_prompts,
+    build_prefix_pairs,
     compare_precision_runs,
     failing_requests,
 )
@@ -45,6 +49,8 @@ from .dkv_workloads import multi_turn_workload, run_workload
 from .test_dkv_concurrency import _BURSTS, _Burst, run_burst
 from .test_dkv_gate import run_aggregate_soak, run_precision_passes
 from .test_dkv_host_tier import run_host_tier_case
+from .test_dkv_mutation import run_corrupted_transfer_gate
+from .test_dkv_transfer import run_context_reuse_gate, run_context_transfer_gate
 
 _GROUP_SIZE = 2
 # The pairs of requests of the cross-rank reuse gate. A request has one compared position, and the
@@ -63,6 +69,16 @@ def _require(model: DkvModel, group_size: int = _GROUP_SIZE) -> None:
         pytest.skip(f"The layer-split gates need {group_size} GPUs")
     if not Path(model.path()).is_dir():
         pytest.skip(f"{model.pytest_id} checkpoint is not available at {model.path()}")
+
+
+def _precision(model: DkvModel) -> PrecisionPolicy:
+    """The precision policy of the model, with the mean of the extra distance judged by its spread.
+
+    The gates of the layer split compare a few requests, and the mean over them scatters by about
+    half of what the policy allows, so a correct group would fail now and then without it.
+    """
+    assert model.precision is not None
+    return dataclasses.replace(model.precision, mean_extra_sigmas=MEAN_EXTRA_SIGMAS)
 
 
 def _layer_split(monkeypatch: pytest.MonkeyPatch, fill: str = "") -> None:
@@ -115,7 +131,7 @@ def test_the_layer_split_answers_like_the_replicated_group(
         model, dkv_enabled=True, prompts=prompts, passes=1, group_size=group_size
     )
 
-    result = compare_precision_runs(control, replay, split, model.precision)
+    result = compare_precision_runs(control, replay, split, _precision(model))
     assess_prompt_separation(control, result["mean_adp_self_tv"], model.precision)
     assert_known_answers(control, answers, tokenizer.decode, "DKV replicated")
     assert_known_answers(split, answers, tokenizer.decode, "DKV layer split")
@@ -146,7 +162,7 @@ def test_the_layer_split_answers_chunked_prompts_like_the_replicated_group(
         model, dkv_enabled=True, prompts=prompts, passes=1, group_size=_GROUP_SIZE, **chunked
     )
 
-    result = compare_precision_runs(control, replay, split, model.precision)
+    result = compare_precision_runs(control, replay, split, _precision(model))
     assess_prompt_separation(control, result["mean_adp_self_tv"], model.precision)
     assert_known_answers(split, answers, tokenizer.decode, "DKV layer split, chunked")
     print(f"layer split precision, chunked prompts: {result}")
@@ -228,13 +244,9 @@ def _cross_rank_pass(
     """
     block = model.tokens_per_block
     tokenizer = PromptTokenizer(model.path())
-    # The cache holds the end of a stored sequence, so the prompt ends where a block does.
-    firsts = build_burst_prompts(tokenizer.encode, _CROSS_RANK_PAIRS, [3 * block])
-    suffix = tokenizer.encode(" and", False)[:1]
+    pairs = build_prefix_pairs(tokenizer.encode, _CROSS_RANK_PAIRS, 3 * block)
     prompts = [
-        (prompt, rank)
-        for first in firsts
-        for prompt, rank in ((first, 0), (first + suffix, group_size - 1))
+        (prompt, 0 if index % 2 == 0 else group_size - 1) for index, prompt in enumerate(pairs)
     ]
     sampling = SamplingParams(
         max_tokens=1, temperature=0, ignore_eos=True, return_generation_logits=True
@@ -290,7 +302,7 @@ def test_a_request_reads_the_prefix_that_a_request_of_another_rank_cached(
     assert cached[0::2] == [0] * _CROSS_RANK_PAIRS and all(
         value >= 3 * block for value in cached[1::2]
     ), f"No prefix hit across ranks: {cached}"
-    result = compare_precision_runs(control, replay, reused, model.precision)
+    result = compare_precision_runs(control, replay, reused, _precision(model))
     print(f"layer split, prefix reused across ranks: {result}")
 
 
@@ -310,6 +322,11 @@ def test_the_replicated_layout_fails_the_comparison_of_the_prefix_reused_across_
     failing = failing_requests(control, replay, reused, model.precision)
     print(
         f"replicated layout, prefix reused across ranks: failing requests {failing} of {len(cached)}"
+    )
+    # The requests that found the prefix in the cache are the ones that read pages nobody wrote.
+    hits = set(range(1, len(cached), 2))
+    assert hits <= set(failing), (
+        f"The comparison missed requests that read unwritten pages: {failing}"
     )
     with pytest.raises(AssertionError):
         compare_precision_runs(control, replay, reused, model.precision)
@@ -534,3 +551,43 @@ def test_a_fetch_that_arrives_damaged_at_the_compute_rank_fails_the_group_and_is
     assert "DKV_GROUP_CHILD_DONE" not in output, "the group served the damaged fetch"
     assert f"F({layer})/" in output and "checksums differ" in output, output[-4000:]
     assert "owner rank 1, compute rank 0" in output, output[-4000:]
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_a_layer_split_context_group_hands_generation_the_same_kv_as_an_adp_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every rank of the group sends the layers it owns, and generation answers as it would after ADP.
+
+    Each context rank holds the KV of its own layers only, so a request reaches generation as one
+    transfer per rank. The group is published to generation as a pipeline of that many stages. The
+    run ends with a timeout and a cancellation, which every rank has to end together.
+    """
+    _layer_split(monkeypatch)
+    run_context_transfer_gate(tmp_path, DEEPSEEK_V4, _precision(DEEPSEEK_V4))
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_a_layer_split_context_group_hands_generation_the_prefix_that_another_rank_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The KV that a request found in the cache of the group reaches generation as well.
+
+    The second prompt of a pair runs on another rank than the first, finds the whole first prompt
+    in the cache, and every rank of the group sends its layers of it, the cached pages included.
+    """
+    _layer_split(monkeypatch)
+    run_context_reuse_gate(tmp_path, DEEPSEEK_V4, _precision(DEEPSEEK_V4))
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_the_transfer_gate_fails_when_a_layer_split_group_hands_over_corrupted_kv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The precision gate sees a request whose KV the ranks of the group send damaged.
+
+    The KV is zeroed or replaced by another request's at all ranks of the group, and at each rank
+    alone.
+    """
+    _layer_split(monkeypatch)
+    run_corrupted_transfer_gate(tmp_path, DEEPSEEK_V4)

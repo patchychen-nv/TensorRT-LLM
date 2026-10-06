@@ -3,6 +3,8 @@
 """Numerical acceptance rules and the discriminating prompt set for the DKV test suites."""
 
 import itertools
+import math
+import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TypedDict
@@ -33,7 +35,8 @@ class PrecisionPolicy:
     tokens is compared up to the first position where the three runs choose different tokens, since
     later positions no longer share a prefix. The total-variation (TV) distance of the softmax
     distributions between DKV and ADP may exceed the ADP run-to-run distance by at most
-    ``max_mean_extra_tv`` on average and ``max_prompt_extra_tv`` for any single prompt.
+    ``max_mean_extra_tv`` on average, with ``mean_extra_sigmas`` standard errors of that average on
+    top, and ``max_prompt_extra_tv`` for any single prompt.
     """
 
     name: str
@@ -45,6 +48,13 @@ class PrecisionPolicy:
     max_adp_self_tv: float = 0.2
     max_mean_extra_tv: float = 0.02
     max_prompt_extra_tv: float = 0.25
+    # The mean of the extra distance over a few prompts scatters by the spread of the prompts divided
+    # by the square root of their number, which for fourteen prompts of a noisy model is about half
+    # of ``max_mean_extra_tv``, so a correct run exceeds it now and then. With sigmas the mean may lie
+    # above it by that many standard errors, estimated from the prompts. A bias that every prompt
+    # shares has no spread and gets no allowance, and a prompt that is far off is the business of
+    # ``max_prompt_extra_tv``.
+    mean_extra_sigmas: float = 0.0
     # Different prompts must be far apart compared with the noise, or the gate cannot tell a request
     # that read another request's KV from a correct one.
     min_prompt_separation: float = 0.5
@@ -53,6 +63,9 @@ class PrecisionPolicy:
 
 EXACT_POLICY = PrecisionPolicy("exact")
 NOISY_POLICY = PrecisionPolicy("noisy", noisy=True)
+# The ``mean_extra_sigmas`` of the gates that compare a few prompts: a correct run lies above the
+# allowance by two standard errors about once in forty.
+MEAN_EXTRA_SIGMAS = 2.0
 
 
 def validate_precision_inputs(
@@ -94,7 +107,7 @@ def validate_precision_inputs(
         first_blocks[block] = index
 
 
-def _validate_run(run: PrecisionRun, label: str) -> None:
+def _validate_run(run: PrecisionRun, label: str, *, finite: bool = True) -> None:
     assert len(run["tokens"]) == len(run["logits"]) > 0, (
         f"{label} requires one token sequence and logits tensor per request"
     )
@@ -104,7 +117,7 @@ def _validate_run(run: PrecisionRun, label: str) -> None:
         assert values.ndim == 2 and values.shape[0] == len(tokens) and values.shape[1] > 0, (
             f"{label} request {index} logits must have shape [generated tokens, vocabulary]"
         )
-        assert values.is_floating_point() and torch.isfinite(values).all(), (
+        assert values.is_floating_point() and (not finite or torch.isfinite(values).all()), (
             f"{label} request {index} logits must be finite floating-point values"
         )
 
@@ -214,6 +227,14 @@ def _paired_tv_summary(control: PrecisionRun, replay: PrecisionRun, dkv: Precisi
     }
 
 
+def mean_extra_limit(policy: PrecisionPolicy, extras: Sequence[float]) -> float:
+    """The largest mean extra distance that the policy accepts for these per-prompt distances."""
+    limit = policy.max_mean_extra_tv
+    if policy.mean_extra_sigmas and len(extras) > 1:
+        limit += policy.mean_extra_sigmas * statistics.stdev(extras) / math.sqrt(len(extras))
+    return limit
+
+
 def _compared_request(runs: Sequence[PrecisionRun], index: int) -> tuple[int, torch.Tensor, bool]:
     """How many positions of one request the runs can be compared on, and what they saw there.
 
@@ -256,9 +277,11 @@ def _compare_noisy(
         f"Only {decisive_positions} of {compared_positions} compared positions have a top-two "
         f"margin of at least {policy.min_margin}; the gate cannot compare tokens"
     )
-    assert summary["mean_extra_tv"] <= policy.max_mean_extra_tv, (
-        f"DKV differs from ADP by {summary['mean_extra_tv']:.4f} more than ADP differs from itself "
-        f"(ADP differs from itself by {summary['mean_adp_self_tv']:.4f}; by prompt: "
+    limit = mean_extra_limit(policy, summary["extra_tv_by_prompt"])
+    assert summary["mean_extra_tv"] <= limit, (
+        f"DKV differs from ADP by {summary['mean_extra_tv']:.4f} more than ADP differs from itself, "
+        f"of which {limit:.4f} is allowed (ADP differs from itself by "
+        f"{summary['mean_adp_self_tv']:.4f}; by prompt: "
         f"{[round(value, 4) for value in summary['extra_tv_by_prompt']]})"
     )
     assert summary["max_extra_tv"] <= policy.max_prompt_extra_tv, (
@@ -320,18 +343,25 @@ def failing_requests(
     a whole, such as the mean extra distance, stay with ``compare_precision_runs``.
     """
     bitwise_control = validate_adp_control(control, replay, policy)
-    _validate_run(dkv, "DKV")
+    # Corrupted KV may turn the logits of a request into NaN or infinity, which is a violation.
+    _validate_run(dkv, "DKV", finite=False)
     _validate_matching_logits(control, dkv, "ADP/DKV")
     failing = []
     if policy.noisy:
         extra_tv = _paired_tv_summary(control, replay, dkv)["extra_tv_by_prompt"]
         for index in range(len(control["logits"])):
+            if not torch.isfinite(dkv["logits"][index]).all():
+                failing.append(index)
+                continue
             _, margins, flipped = _compared_request((control, replay, dkv), index)
             decisive_flip = flipped and margins[-1] >= policy.min_margin
             if decisive_flip or extra_tv[index] > policy.max_prompt_extra_tv:
                 failing.append(index)
         return failing
     for index in range(len(control["logits"])):
+        if not torch.isfinite(dkv["logits"][index]).all():
+            failing.append(index)
+            continue
         first, second, actual = (run["logits"][index] for run in (control, replay, dkv))
         if bitwise_control:
             same_logits = torch.equal(first, actual)
@@ -343,6 +373,33 @@ def failing_requests(
         if control["tokens"][index] != dkv["tokens"][index] or not same_logits:
             failing.append(index)
     return failing
+
+
+def far_requests(
+    control: PrecisionRun,
+    replay: PrecisionRun,
+    dkv: PrecisionRun,
+    policy: PrecisionPolicy = EXACT_POLICY,
+) -> list[int]:
+    """Indices of the requests whose DKV result lies farther from the controls than noise reaches.
+
+    ``failing_requests`` also names a flip at a top-two margin of ``min_margin``, which the noise of
+    a model can cause with nobody's KV corrupted, so a test that corrupts one request cannot hold
+    the others to it. The distance limit ``max_prompt_extra_tv`` of a noisy policy is beyond what
+    that noise reaches. Under an exact policy there is no noise, and these are the failing requests.
+    """
+    if not policy.noisy:
+        return failing_requests(control, replay, dkv, policy)
+    validate_adp_control(control, replay, policy)
+    _validate_run(dkv, "DKV", finite=False)
+    _validate_matching_logits(control, dkv, "ADP/DKV")
+    extra_tv = _paired_tv_summary(control, replay, dkv)["extra_tv_by_prompt"]
+    return [
+        index
+        for index in range(len(control["logits"]))
+        if not torch.isfinite(dkv["logits"][index]).all()
+        or extra_tv[index] > policy.max_prompt_extra_tv
+    ]
 
 
 # Real English paragraphs and code of different lengths and styles. Distinct, natural prompts keep
@@ -469,6 +526,28 @@ def build_burst_prompts(
             ids.extend(encode(" " + _PARAGRAPHS[paragraph % len(_PARAGRAPHS)], False))
             paragraph += 1
         prompts.append(ids[:length])
+    return prompts
+
+
+def build_prefix_pairs(
+    encode: Callable[[str, bool], list[int]],
+    pairs: int,
+    prefix_tokens: int,
+    tails: Sequence[str] | None = None,
+) -> list[list[int]]:
+    """Prompts in pairs, the second of a pair the first with something more.
+
+    The first prompt of a pair has ``prefix_tokens`` tokens, which should end where a block does,
+    because the cache holds the end of a stored sequence. No two pairs share a leading block. A cache
+    that stored the first prompt holds the whole of it for the second. The second prompt is the
+    first with one token more, or with the text of ``tails``, taken in turn, when they are given.
+    """
+    prompts = []
+    for index, first in enumerate(build_burst_prompts(encode, pairs, [prefix_tokens])):
+        tail = (
+            encode(" and", False)[:1] if tails is None else encode(tails[index % len(tails)], False)
+        )
+        prompts.extend([first, first + tail])
     return prompts
 
 
