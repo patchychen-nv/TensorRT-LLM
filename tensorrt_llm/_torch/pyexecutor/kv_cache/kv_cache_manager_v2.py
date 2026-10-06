@@ -1344,6 +1344,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_cuda_graph_batch_size: Optional[int] = None,
         dkv_group_size: Optional[int] = None,
         lifecycle_slot_counts: Optional[LifecycleSlotCountsSource] = None,
+        owned_layers: Optional[Sequence[int]] = None,
         **kwargs,
     ) -> None:
         if dkv_group_size is not None and dkv_group_size < 2:
@@ -1377,6 +1378,19 @@ class KVCacheManagerV2(BaseResourceManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
         )
+        if owned_layers is not None:
+            # Under the layer-split layout of DKV a rank stores the KV of the layers it owns only.
+            if mapping.has_pp():
+                raise ValueError("owned_layers needs pp_size == 1, got a pipeline-parallel mapping")
+            if not owned_layers:
+                raise ValueError("owned_layers must name at least one layer")
+            unknown = sorted(set(owned_layers) - set(self.pp_layers))
+            if unknown or len(set(owned_layers)) != len(owned_layers):
+                raise ValueError(
+                    f"owned_layers {list(owned_layers)} must be distinct layers of the model "
+                    f"(layers {self.pp_layers[0]}..{self.pp_layers[-1]}), not {unknown}"
+                )
+            self.pp_layers = sorted(owned_layers)
         self.is_draft = is_draft
 
         # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
