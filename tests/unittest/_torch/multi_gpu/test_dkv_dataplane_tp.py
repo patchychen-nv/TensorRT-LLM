@@ -19,13 +19,19 @@ a ``DkvStreamer`` that moves pages over NCCL. Instead of the attention of a laye
 the pages the streamer fetched into the slot of the layer, checks them against a pattern that
 depends on the request, the layer, the cache role and the block, and writes the pattern into the
 pages the new tokens touch. Prompts are prefilled in chunks over several iterations, so every
-iteration but the first fetches what an earlier one wrote back. After the last iteration the pages
-in the cache manager of the owner of each layer must hold the pattern.
+iteration but the first fetches what an earlier one wrote back. When the prompt of a request is
+done, the pages in the cache manager of the owner of each layer must hold the pattern; then the
+request is freed and its pages are free to be taken by the requests that come next.
+
+``DKV_DATAPLANE_SOAK=<iterations>`` runs the long test: requests arrive and leave on every
+iteration for that many iterations on four ranks.
 """
 
+import os
 import pickle
 import sys
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import cloudpickle
 import pytest
@@ -64,6 +70,8 @@ _RATIOS = [4, 128, 1] * 4
 _CHUNK = 128
 _TOKENS_PER_BLOCK = 128
 _TIMEOUT = 120.0
+# The most errors a rank reports; a fault that corrupts one page tends to corrupt many.
+_MAX_ERRORS = 20
 
 
 @dataclass(frozen=True)
@@ -78,15 +86,37 @@ class Scenario:
     # The fault: ``(rank, n)`` flips a byte of the n-th message that the rank receives.
     flip: tuple[int, int] = (-1, -1)
 
-    def batch(self, iteration: int) -> list[PlanRequest]:
-        """The global scheduled batch of an iteration, with a dummy for every idle rank."""
-        requests = []
+    @classmethod
+    def soak(cls, group_size: int, ring_depth: int, iterations: int) -> "Scenario":
+        """Three requests arrive on every iteration and stay for one to three of them."""
+        count = 3 * iterations
+        lengths = (90, 200, 380)
+        prompts = {request_id: lengths[request_id % 3] for request_id in range(1, count + 1)}
+        return cls(
+            group_size,
+            ring_depth,
+            prompts,
+            {request_id: request_id % group_size for request_id in prompts},
+            {request_id: request_id // 3 for request_id in prompts},
+        )
+
+    @cached_property
+    def _schedule(self) -> dict[int, list[tuple[int, int, int]]]:
+        """``(request, history, chunk)`` of the requests that compute in each iteration."""
+        schedule: dict[int, list[tuple[int, int, int]]] = {}
         for request_id, prompt in self.prompts.items():
             start = self.arrival.get(request_id, 0)
-            progress = min(prompt, max(0, iteration - start) * _CHUNK)
-            if iteration >= start and progress < prompt:
-                chunk = min(_CHUNK, prompt - progress)
-                requests.append(PlanRequest(request_id, self.ranks[request_id], progress, chunk))
+            for step, history in enumerate(range(0, prompt, _CHUNK)):
+                chunk = min(_CHUNK, prompt - history)
+                schedule.setdefault(start + step, []).append((request_id, history, chunk))
+        return schedule
+
+    def batch(self, iteration: int) -> list[PlanRequest]:
+        """The global scheduled batch of an iteration, with a dummy for every idle rank."""
+        requests = [
+            PlanRequest(request_id, self.ranks[request_id], history, chunk)
+            for request_id, history, chunk in self._schedule.get(iteration, [])
+        ]
         busy = {request.compute_rank for request in requests}
         for rank in range(self.group_size):
             if rank not in busy:
@@ -95,10 +125,7 @@ class Scenario:
 
     @property
     def iterations(self) -> int:
-        return max(
-            self.arrival.get(request_id, 0) + -(-prompt // _CHUNK)
-            for request_id, prompt in self.prompts.items()
-        )
+        return max(self._schedule) + 1
 
 
 def _pattern(request_id: int, layer: int, index: int, blocks: list[int], nbytes: int):
@@ -185,8 +212,37 @@ def _record_writes(written, batch, layout, manager) -> None:
             for component in layout.components_of(kind):
                 for layer in layout.layers_of(kind):
                     if (layer, component.attention_type) in manager._layer_attn_to_layer_id:
-                        key = (request.request_id, layer, component.attention_type)
-                        written.setdefault(key, set()).update(range(first, first + count))
+                        pages = written.setdefault(request.request_id, {})
+                        pages.setdefault((layer, component.attention_type), set()).update(
+                            range(first, first + count)
+                        )
+
+
+def _check_request_pages(rank, layout, manager, request_id, written) -> list[str]:
+    """The pages of a request in the cache manager of this rank hold what the compute ranks wrote."""
+    problems = []
+    for (layer, attention_type), blocks in sorted(
+        written.items(), key=lambda item: (item[0][0], item[0][1].value)
+    ):
+        component = next(
+            c
+            for c in layout.components
+            if c.attention_type is attention_type and layer in layout.layers_of(c.kind)
+        )
+        slot = layout.components.index(component)
+        indices = manager.get_cache_indices(request_id, layer, attention_type)
+        buffer = manager.get_buffers(layer, attention_type)
+        for block in sorted(blocks):
+            if block >= len(indices) or indices[block] == BAD_PAGE_INDEX:
+                continue
+            page = buffer[indices[block]].view(torch.uint8).reshape(-1)
+            expected = _pattern(request_id, layer, slot, [block], layout.page_bytes(component))[0]
+            if not torch.equal(page, expected):
+                problems.append(
+                    f"rank {rank}: block {block} of request {request_id} in layer {layer} "
+                    f"({attention_type.name}) was not written back"
+                )
+    return problems
 
 
 class _FlippingTransport:
@@ -234,26 +290,24 @@ def _probe_rank(scenario: Scenario) -> dict:
         data_stream=data_stream,
     )
     view.dkv_streamer = streamer
-    requests = {
-        request_id: LlmRequest(
-            request_id=request_id,
-            max_new_tokens=16,
-            input_tokens=list(range(prompt)),
-            sampling_config=SamplingConfig(),
-            is_streaming=False,
-        )
-        for request_id, prompt in scenario.prompts.items()
-    }
+    requests: dict[int, LlmRequest] = {}
     errors: list[str] = []
-    written: dict[tuple[int, int, object], set[int]] = {}
+    written: dict[int, dict] = {}
     try:
         for iteration in range(scenario.iterations):
             batch = scenario.batch(iteration)
             real = [request for request in batch if not request.is_dummy]
             scheduled = ScheduledRequests()
             for plan_request in real:
-                request = requests[plan_request.request_id]
-                if request.py_request_id not in manager.kv_cache_map:
+                request = requests.get(plan_request.request_id)
+                if request is None:
+                    request = requests[plan_request.request_id] = LlmRequest(
+                        request_id=plan_request.request_id,
+                        max_new_tokens=16,
+                        input_tokens=list(range(scenario.prompts[plan_request.request_id])),
+                        sampling_config=SamplingConfig(),
+                        is_streaming=False,
+                    )
                     assert manager.prepare_context(request)
                 request.context_chunk_size = plan_request.context_chunk_size
                 assert manager.resize_context(request, plan_request.context_chunk_size)
@@ -279,7 +333,7 @@ def _probe_rank(scenario: Scenario) -> dict:
             torch.cuda.synchronize()
             for layer, request_id, component, blocks, wrong in checks:
                 for block, bad in zip(blocks, wrong.tolist()):
-                    if bad:
+                    if bad and len(errors) < _MAX_ERRORS:
                         errors.append(
                             f"rank {rank}, iteration {iteration}: block {block} of request "
                             f"{request_id} in layer {layer} ({component.attention_type.name}) was "
@@ -292,7 +346,20 @@ def _probe_rank(scenario: Scenario) -> dict:
                     request.add_new_token(0, 0)
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
             manager.update_context_resources(scheduled)
-        errors.extend(_check_owner_pages(rank, layout, manager, written))
+            for plan_request in real:
+                request = requests[plan_request.request_id]
+                if request.context_remaining_length == 0:
+                    errors.extend(
+                        _check_request_pages(
+                            rank,
+                            layout,
+                            manager,
+                            request.py_request_id,
+                            written.pop(request.py_request_id),
+                        )[: _MAX_ERRORS - len(errors)]
+                    )
+                    manager.free_resources(request)
+                    del requests[request.py_request_id]
         stats = streamer.stats
         return {
             "errors": errors,
@@ -306,34 +373,6 @@ def _probe_rank(scenario: Scenario) -> dict:
             if request.py_request_id in manager.kv_cache_map:
                 manager.free_resources(request)
         manager.shutdown()
-
-
-def _check_owner_pages(rank, layout, manager, written) -> list[str]:
-    problems = []
-    for (request_id, layer, attention_type), blocks in sorted(
-        written.items(), key=lambda item: (item[0][0], item[0][1], item[0][2].value)
-    ):
-        if (layer, attention_type) not in manager._layer_attn_to_layer_id:
-            continue
-        component = next(
-            c
-            for c in layout.components
-            if c.attention_type is attention_type and layer in layout.layers_of(c.kind)
-        )
-        slot = layout.components.index(component)
-        indices = manager.get_cache_indices(request_id, layer, attention_type)
-        buffer = manager.get_buffers(layer, attention_type)
-        for block in sorted(blocks):
-            if block >= len(indices) or indices[block] == BAD_PAGE_INDEX:
-                continue
-            page = buffer[indices[block]].view(torch.uint8).reshape(-1)
-            expected = _pattern(request_id, layer, slot, [block], layout.page_bytes(component))[0]
-            if not torch.equal(page, expected):
-                problems.append(
-                    f"rank {rank}: block {block} of request {request_id} in layer {layer} "
-                    f"({attention_type.name}) was not written back"
-                )
-    return problems
 
 
 def _spread(group_size: int, prompts: dict[int, int]) -> dict[int, int]:
@@ -372,3 +411,19 @@ def test_a_byte_flipped_in_a_received_message_is_noticed(
     scenario = Scenario(2, 2, {1: 400, 2: 520}, {1: 0, 2: 1}, flip=(0, number))
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * 2, timeout=900))
     assert any(result["errors"] for result in results), "the flipped byte went unnoticed"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DKV_DATAPLANE_SOAK"), reason="DKV_DATAPLANE_SOAK is not set"
+)
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_a_soak_of_requests_that_come_and_go_neither_hangs_nor_corrupts(
+    mpi_pool_executor: MPIPoolExecutor,
+) -> None:
+    if torch.cuda.device_count() < 4:
+        pytest.skip("Requires four GPUs")
+    scenario = Scenario.soak(4, 2, int(os.environ["DKV_DATAPLANE_SOAK"]))
+    results = list(mpi_pool_executor.map(_probe_rank, [scenario] * 4, timeout=7200))
+    for rank, result in enumerate(results):
+        assert result["errors"] == [], f"rank {rank}"
+        assert result["iterations"] == scenario.iterations
