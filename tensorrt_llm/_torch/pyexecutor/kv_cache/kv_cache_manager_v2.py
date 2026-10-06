@@ -4661,13 +4661,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_dkv_startup_settings(self) -> dict[str, object]:
         """Process-level choices that every rank of a DKV group must make identically."""
-        return {"kv_cache_backend": KV_CACHE_MANAGER_V2_BACKEND}
+        return {}
 
     def get_dkv_config_fingerprint(self) -> list[tuple]:
         """Return rank-independent capacity and layout records for the DKV startup check."""
         config = self.kv_cache_manager_py_config
         records = [
-            ("backend", KV_CACHE_MANAGER_V2_BACKEND),
             ("dkv_group_size", self.dkv_group_size),
             ("tokens_per_block", self.tokens_per_block, config.tokens_per_block),
             ("dtype", str(self.dtype)),

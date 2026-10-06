@@ -35,7 +35,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    CapacitySchedulerPolicy,
+    DkvConfig,
+    KvCacheConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -751,21 +756,23 @@ class TestKVCacheV2SchedulerCrossParam:
         assert scheduler.cross_kv_cache_manager is cross_mgr
 
     @pytest.mark.parametrize(
-        ("cache_transceiver_config", "enable_recompute_pause"),
+        ("cache_transceiver_config", "dkv_config", "enable_recompute_pause"),
         [
-            (None, True),
-            (SimpleNamespace(backend="NIXL"), False),
+            (None, None, True),
+            (SimpleNamespace(backend="NIXL"), None, False),
+            (None, DkvConfig(), False),
         ],
     )
     def test_factory_forwards_v2_scheduler_gates(
-        self, cache_transceiver_config, enable_recompute_pause
+        self, cache_transceiver_config, dkv_config, enable_recompute_pause
     ):
         """The executor factory must forward encoder and disagg scheduler gates.
 
         Without this, V2 enc-dec requests are filtered by the default
         CONTEXT_INIT state gate before the encoder loop can see them.
         Recompute pause is disabled for disaggregated serving because a
-        generation worker must not replay context locally.
+        generation worker must not replay context locally, and for DKV, whose
+        replicated scheduler has its own stall recovery.
         """
         from tensorrt_llm._torch.pyexecutor._util import create_py_executor_instance
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -788,6 +795,10 @@ class TestKVCacheV2SchedulerCrossParam:
             skip_tokenizer_init=True,
             disable_overlap_scheduler=True,
         )
+        if dkv_config is not None:
+            # The DKV validators need a multi-rank configuration; only the scheduler gate is
+            # under test, so set the field without validating it.
+            llm_args = llm_args.model_copy(update={"dkv_config": dkv_config})
 
         with (
             patch(

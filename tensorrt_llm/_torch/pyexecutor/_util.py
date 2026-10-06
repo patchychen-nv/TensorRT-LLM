@@ -3948,7 +3948,10 @@ def create_py_executor_instance(
             no_schedule_until_state=no_schedule_until_state,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             # A disaggregated generation worker must not replay context locally.
-            enable_recompute_pause=not is_disagg,
+            # DKV replicates the scheduler's decisions on every rank and has its own
+            # stall recovery, so it does not preempt either.
+            enable_recompute_pause=not is_disagg
+            and llm_args.dkv_config is None,
             dkv_group_size=mapping.tp_size
             if llm_args.dkv_config is not None else None,
         )

@@ -15,7 +15,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager imp
 )
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import DeepseekV4AttentionType
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from .test_deepseek_v4_cache_manager import TestDeepseekV4CacheManager as _ManagerFactory
 

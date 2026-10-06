@@ -30,7 +30,6 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheLevel
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 _TOKENS_PER_BLOCK = 4
 _PAGE_BYTES = 2 << 20
@@ -40,7 +39,7 @@ _PAGE_BYTES = 2 << 20
 def _manager(num_pages: int) -> Iterator[KVCacheManagerV2]:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    init_cuda_once()
+    torch.cuda.init()
     manager = KVCacheManagerV2(
         KvCacheConfig(
             enable_block_reuse=False,
