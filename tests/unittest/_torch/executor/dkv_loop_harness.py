@@ -31,7 +31,13 @@ from dkv_test_utils import LockstepTpGroup, make_request
 
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.pyexecutor.dkv import DkvInvariantChecker
+from tensorrt_llm._torch.pyexecutor.dkv import DkvInvariantChecker, compute_ownership
+from tensorrt_llm._torch.pyexecutor.dkv_plan import (
+    PageCost,
+    build_dkv_plan,
+    layer_types_from_compress_ratios,
+    plan_fingerprint,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import FinishReason, LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
@@ -157,6 +163,54 @@ class LoopScript:
     # transfer complete from this iteration on.
     context_only: set[int] = field(default_factory=set)
     transfer_done_iteration: int = 0
+    # The layer-split layout: the loop plans the data plane of every iteration and drains it.
+    streamer: bool = False
+    # ``(rank, iteration)`` at which that rank plans without the first request of the batch.
+    plan_skew: tuple[int, int] | None = None
+
+
+class _PageCosts:
+    """A plan cost model of invented sizes: some pages to fetch, some to write back."""
+
+    def page_cost(self, layer: int, kind, history: int, chunk: int) -> PageCost:
+        return PageCost(512, history // 4 % 3, 1 + chunk // 4)
+
+
+class PlanStreamer:
+    """What the loop sees of ``DkvStreamer``: it builds the plan, takes it and is drained."""
+
+    NUM_LAYERS = 6
+
+    def __init__(self, executor: PyExecutor, group_size: int, skew, record) -> None:
+        self._executor = executor
+        self._group_size = group_size
+        self._skew = skew
+        self._record = record
+        self._owners = compute_ownership(self.NUM_LAYERS, group_size)
+        self._layer_types = layer_types_from_compress_ratios([1, 4, 128] * 2)
+        self.plans: list = []
+        self.planned: list = []
+
+    def plan_for(self, requests):
+        requests = list(requests)
+        if self._skew == (self._executor.dist.tp_rank, self._executor.iter_counter):
+            requests = requests[1:]
+        self.planned.append(requests)
+        return build_dkv_plan(
+            requests,
+            self._owners,
+            self._layer_types,
+            _PageCosts(),
+            group_size=self._group_size,
+            ring_depth=2,
+        )
+
+    def set_plan(self, plan) -> None:
+        self.plans.append(plan)
+        self._record("plan", plan_fingerprint(plan))
+
+    def drain(self, timeout: float) -> None:
+        self._record("drain", timeout)
 
 
 @dataclass
@@ -307,6 +361,9 @@ def build_loop_executor(dist, script: LoopScript, run: RankRun) -> PyExecutor:
     pages.on_free = lambda request_id: record("free", request_id)
     if script.context_only:
         _attach_transceiver(executor, script, run, record)
+    if script.streamer:
+        executor.dkv_streamer = PlanStreamer(executor, dist.tp_size, script.plan_skew, record)
+        executor.dkv_staging_settings = {"transport_timeout_s": 7.0}
 
     def ids(batch: ScheduledRequests) -> list[tuple[int, bool]]:
         return [(req.py_request_id, req.is_dummy) for req in batch.all_requests()]

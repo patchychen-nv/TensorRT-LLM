@@ -208,3 +208,83 @@ def test_a_kv_stall_is_recovered_in_lockstep_and_every_request_still_completes(
     )
     assert all(run.final_pages == run.initial_pages for run in runs)
     assert all(run.pages.freed == runs[0].pages.freed for run in runs)
+
+
+# The layer-split layout: the loop plans the data plane of an iteration once the pages are
+# allocated, and drains it after S-sample, before the commits that may free a page.
+
+_BUSY_LAYER_SPLIT = [
+    "control",
+    "schedule",
+    "forward_batch",
+    "prepare_resources",
+    "plan",
+    "forward",
+    "sample_sync",
+    "drain",
+    "context_commit",
+    "update_resources",
+]
+
+
+@pytest.mark.parametrize("group_size", [2, 4, 8])
+def test_the_data_plane_is_planned_before_the_forward_and_drained_before_the_commits(
+    group_size: int,
+) -> None:
+    arrivals = _arrivals(group_size, (2, 1, 0, 3, 2))
+    runs = run_loop(group_size, LoopScript(arrivals, max_num_tokens=16, streamer=True))
+    phases = [_phases(run) for run in runs]
+    assert all(rank == phases[0] for rank in phases), "ranks entered different phases"
+    assert any(names == _BUSY_LAYER_SPLIT for names in phases[0].values())
+    for iteration, names in phases[0].items():
+        assert names in (_BUSY_LAYER_SPLIT, _IDLE, ["control", "schedule"]), (iteration, names)
+    # The plan is a function of the replicated batch: every rank derived the same one.
+    fingerprints = [
+        [(iteration, value) for iteration, name, value in run.events if name == "plan"]
+        for run in runs
+    ]
+    assert fingerprints[0] and all(rank == fingerprints[0] for rank in fingerprints)
+    assert all(run.final_pages == run.initial_pages for run in runs)
+
+
+@pytest.mark.parametrize("group_size", [2, 4])
+def test_an_idle_rank_is_in_the_plan_as_the_owner_of_its_layers(group_size: int) -> None:
+    # Every request computes on rank 0, so every other rank runs its resident dummy.
+    arrivals = [[(10, 0, 8)], [(11, 0, 8)], [], []]
+    runs = run_loop(group_size, LoopScript(arrivals, max_num_tokens=16, streamer=True))
+    for run in runs:
+        dummies = {r.py_request_id for r in run.executor._dkv_forward_dummies[1:]}
+        for plan in run.executor.dkv_streamer.plans:
+            idle = [request for request in plan.requests if request.is_dummy]
+            assert {request.request_id for request in idle} == dummies
+            assert sorted(request.compute_rank for request in idle) == list(range(1, group_size))
+            real = [request for request in plan.requests if not request.is_dummy]
+            assert all(request.compute_rank == 0 for request in real)
+            # Layers that another rank owns are fetched from it and written back to it.
+            assert any(transfer.owner != 0 for step in plan.steps for transfer in step.transfers)
+
+
+def test_the_drain_has_the_deadline_of_the_startup_settings() -> None:
+    arrivals = _arrivals(2, (2, 1))
+    runs = run_loop(2, LoopScript(arrivals, max_num_tokens=16, streamer=True))
+    deadlines = {value for run in runs for _, name, value in run.events if name == "drain"}
+    assert deadlines == {7.0}
+
+
+def test_the_plan_check_names_the_iteration_where_the_plans_of_the_ranks_differ() -> None:
+    arrivals = _arrivals(2, (2, 2, 1, 0))
+    with pytest.raises(RuntimeError, match=r"iter 1, tags=.*data plane plan"):
+        run_loop(
+            2, LoopScript(arrivals, max_num_tokens=16, debug=True, streamer=True, plan_skew=(1, 1))
+        )
+
+
+def test_a_plan_that_differs_goes_unnoticed_without_the_debug_check() -> None:
+    # Without the check the divergence shows as a hang of the data plane, which the drain and the
+    # hang detector bound; the loop itself carries on.
+    arrivals = _arrivals(2, (2, 2, 1, 0))
+    runs = run_loop(
+        2, LoopScript(arrivals, max_num_tokens=16, debug=False, streamer=True, plan_skew=(1, 1))
+    )
+    fingerprints = [[value for _, name, value in run.events if name == "plan"] for run in runs]
+    assert fingerprints[0] != fingerprints[1]

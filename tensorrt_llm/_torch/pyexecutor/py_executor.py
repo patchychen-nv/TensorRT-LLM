@@ -84,6 +84,7 @@ from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dkv import (DkvControlDigest, DkvControlPayload, DkvInvariantChecker,
                   compute_ownership, digest_request_ids, ownership_fingerprint,
                   sync_dkv_control, sync_dkv_sample_results, validate_ownership)
+from .dkv_plan import PlanRequest, plan_fingerprint
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
@@ -413,6 +414,9 @@ class PyExecutor:
     # Whether DKV stores each layer's KV only on its owner rank (``kv_layout="layer_split"``) rather
     # than on every rank. Read it the same way as ``dkv_enabled``.
     dkv_layer_split: bool = False
+    # The data plane that moves the KV of the layers between their owners and the ranks that compute
+    # them under the layer-split layout; ``None`` otherwise.
+    dkv_streamer = None
 
     def __init__(
             self,
@@ -4914,6 +4918,11 @@ class PyExecutor:
                     # trtllm-serve /start_profile expose per-iteration
                     # boundaries with a consistent category and label
                     # format.
+                    if self.dkv_streamer is not None:
+                        # The pages of the batch are allocated; the data plane
+                        # of the iteration starts with the first layer.
+                        self.dkv_streamer.set_plan(
+                            self._dkv_plan(scheduled_batch))
                     with self._step_scope(forward_batch):
                         if scheduled_batch.encoder_requests:
                             self._submit_encoder_step(
@@ -4973,6 +4982,12 @@ class PyExecutor:
 
                     if dkv_enabled:
                         self._sync_dkv_samples(scheduled_batch, forward_batch)
+                        if self.dkv_streamer is not None:
+                            # Nothing may free or move a page while the data
+                            # plane is still reading or writing it.
+                            self.dkv_streamer.drain(
+                                self.dkv_staging_settings["transport_timeout_s"]
+                            )
 
                     if self._is_kv_manager_v2:
                         # Finalize V2 context KV before disagg transfer/response
@@ -6194,8 +6209,18 @@ class PyExecutor:
         and ``TRTLLM_DKV_STAGING_FILL=nan`` overwrites the slots of a layer with NaN before its
         pages are fetched, so a page that is read without having been fetched or written turns
         the output into NaN.
+
+        Under ``kv_layout="layer_split"`` the same staging area serves the real layout: the cache
+        manager of a rank holds only the layers it owns and a ``DkvStreamer`` moves the pages
+        between the owners and the ranks that compute (see ``_initialize_dkv_layer_split``).
+        ``TRTLLM_DKV_TRANSPORT_TIMEOUT_S`` bounds how long the host waits for the data plane at
+        the end of an iteration.
         """
         self.dkv_staging_settings: dict[str, object] = {}
+        self.dkv_streamer = None
+        if getattr(self, "dkv_layer_split", False) is True:
+            self._initialize_dkv_layer_split()
+            return
         if os.environ.get("TRTLLM_DKV_STAGING_LOOPBACK", "0") != "1":
             return
         if not self.dkv_enabled:
@@ -6204,8 +6229,6 @@ class PyExecutor:
             return
         from ..attention.backends.sparse.deepseek_v4.cache_manager import \
             DeepseekV4CacheManager
-        from .dkv_staging import (DkvStagedKvView, StagingGeometry,
-                                  StagingLayout, StagingPool)
         from .dkv_streamer import LoopbackStreamer
 
         manager = self.kv_cache_manager
@@ -6217,9 +6240,21 @@ class PyExecutor:
             raise ValueError(
                 "TRTLLM_DKV_STAGING_LOOPBACK is not supported with CUDA graphs; "
                 "set cuda_graph_config to null")
-        settings = {
-            "staging_loopback":
-            True,
+        settings = {"staging_loopback": True, **self._dkv_staging_settings()}
+        pool, view = self._create_dkv_staged_view(settings)
+        view.dkv_streamer = LoopbackStreamer(manager,
+                                             view,
+                                             fill=settings["staging_fill"])
+        self._install_dkv_staged_view(view, settings)
+        logger.info(
+            f"DKV staging loopback: {pool.bytes_reserved / (1 << 20):.0f} MiB, "
+            f"ring depth {settings['staging_depth']}, "
+            f"{settings['staging_tokens']} staged tokens per iteration")
+
+    def _dkv_staging_settings(self) -> dict[str, object]:
+        """What the ranks must agree on to build the same staging area."""
+        manager = self.kv_cache_manager
+        return {
             "staging_depth":
             int(os.environ.get("TRTLLM_DKV_STAGING_DEPTH", "2")),
             "staging_tokens":
@@ -6231,24 +6266,98 @@ class PyExecutor:
             "staging_fill":
             os.environ.get("TRTLLM_DKV_STAGING_FILL", ""),
         }
+
+    def _create_dkv_staged_view(self, settings: dict[str, object]):
+        """The staging buffers of this rank and the cache manager the attention backend sees."""
+        from .dkv_staging import (DkvStagedKvView, StagingGeometry,
+                                  StagingLayout, StagingPool)
+
         geometry = StagingGeometry.from_cache_manager(
-            manager,
+            self.kv_cache_manager,
             max_staging_tokens=settings["staging_tokens"],
             ring_depth=settings["staging_depth"])
         pool = StagingPool(StagingLayout(geometry), device=self.device_id)
-        view = DkvStagedKvView(manager, pool)
-        view.dkv_streamer = LoopbackStreamer(manager,
-                                             view,
-                                             fill=settings["staging_fill"])
-        manager.dkv_staged_view = view
+        return pool, DkvStagedKvView(self.kv_cache_manager, pool)
+
+    def _install_dkv_staged_view(self, view, settings: dict[str, object]):
+        """Make the attention layers read their KV through ``view``."""
+        self.kv_cache_manager.dkv_staged_view = view
         # Metadata built on the real manager earlier would not read the view.
         self.model_engine.attn_metadata = None
         self.model_engine.dkv_staging = True
         self.dkv_staging_settings = settings
+
+    def _initialize_dkv_layer_split(self) -> None:
+        """Run the layers of this rank on the staging area and connect it to the other ranks.
+
+        The communicator of the data plane is created here, by every rank at the same time, before
+        the first forward pass and before any other communicator is active on the device. The
+        warm-up exchange makes every pair of ranks connect now, so that no connection is made
+        lazily in the middle of a forward pass.
+        """
+        from .dkv_streamer import DkvStreamer
+        from .dkv_transport import nccl_p2p_transport
+
+        self._validate_dkv_layer_split_runtime()
+        manager = self.kv_cache_manager
+        group_size = self.dist.tp_size
+        rank = self.dist.tp_rank
+        settings = {
+            "layer_split":
+            True,
+            **self._dkv_staging_settings(),
+            "transport_timeout_s":
+            float(os.environ.get("TRTLLM_DKV_TRANSPORT_TIMEOUT_S", "60")),
+        }
+        pool, view = self._create_dkv_staged_view(settings)
+        with torch.cuda.device(self.device_id):
+            transport = nccl_p2p_transport(group_size, rank)
+            data_stream = torch.cuda.Stream()
+            transport.warmup(data_stream)
+        view.dkv_streamer = self.dkv_streamer = DkvStreamer(
+            manager,
+            view,
+            transport,
+            compute_ownership(manager.num_layers, group_size),
+            rank,
+            group_size=group_size,
+            data_stream=data_stream,
+            fill=settings["staging_fill"])
+        self._install_dkv_staged_view(view, settings)
         logger.info(
-            f"DKV staging loopback: {pool.bytes_reserved / (1 << 20):.0f} MiB, "
+            f"DKV layer split: staging {pool.bytes_reserved / (1 << 20):.0f} MiB, "
             f"ring depth {settings['staging_depth']}, "
-            f"{settings['staging_tokens']} staged tokens per iteration")
+            f"{settings['staging_tokens']} staged tokens per iteration, "
+            f"rank {rank} owns {len(manager.pp_layers)} of {manager.num_layers} layers"
+        )
+
+    def _dkv_plan(self, scheduled_batch: ScheduledRequests):
+        """The data plane of the iteration: what moves between which ranks, in which order.
+
+        Built by every rank from the global scheduled batch alone, so all ranks derive the same
+        plan without communicating. An idle rank still runs a forward pass on its resident dummy,
+        and takes part as the owner of its layers.
+        """
+        if any(not request.is_dummy
+               for request in scheduled_batch.generation_requests):
+            raise RuntimeError(
+                "dkv_config layer_split does not support generation yet")
+        requests = []
+        busy = set()
+        for request in scheduled_batch.context_requests:
+            busy.add(request.py_dkv_compute_rank)
+            requests.append(
+                PlanRequest(request.py_request_id, request.py_dkv_compute_rank,
+                            request.context_current_position,
+                            request.context_chunk_size))
+        for rank, dummy in enumerate(self._dkv_forward_dummies):
+            if rank not in busy:
+                requests.append(
+                    PlanRequest(dummy.py_request_id, rank, 0, 1, is_dummy=True))
+        plan = self.dkv_streamer.plan_for(requests)
+        self._dkv_invariant_checker.check(self.iter_counter, "data plane plan",
+                                          plan_fingerprint(plan))
+        return plan
 
     def _validate_dkv_layer_split_runtime(self) -> None:
         """Validate what the layer-split layout needs beyond the replicated one.
