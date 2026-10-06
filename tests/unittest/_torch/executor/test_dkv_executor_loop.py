@@ -279,6 +279,67 @@ def test_the_plan_check_names_the_iteration_where_the_plans_of_the_ranks_differ(
         )
 
 
+def _check_data_plane(group_size: int, records_of, *, enabled: bool = True):
+    """Run the executor's comparison of the data plane checksums on lockstep ranks."""
+    from types import SimpleNamespace
+
+    from dkv_test_utils import LockstepTpGroup
+
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    def rank_main(dist) -> None:
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.dist = dist
+        executor.iter_counter = 7
+        executor.dkv_streamer = SimpleNamespace(last_plan=None)
+        executor._dkv_invariant_checker = SimpleNamespace(enabled=enabled)
+        executor._check_dkv_data_plane(records_of(dist.tp_rank))
+
+    return LockstepTpGroup(group_size).run(rank_main)
+
+
+_MESSAGE = (1, 4, 0, 0, 1)  # the writeback of layer 4 for the state, from rank 1 to the owner 0
+
+
+def _records(rank: int, damaged_stored: bool = False) -> list:
+    if rank == 1:
+        return [(_MESSAGE, "sent", 5)]
+    return [(_MESSAGE, "received", 5), (_MESSAGE, "stored", 6 if damaged_stored else 5)]
+
+
+def test_the_executor_accepts_checksums_that_agree_across_the_ranks() -> None:
+    _check_data_plane(2, lambda rank: _records(rank))
+
+
+def test_the_executor_names_the_message_whose_checksums_differ() -> None:
+    with pytest.raises(RuntimeError, match=r"checksums differ at iteration 7") as caught:
+        _check_data_plane(2, lambda rank: _records(rank, damaged_stored=True))
+    assert "W(4)/state" in str(caught.value) and "rank 0 has stored 0x6, not 0x5" in str(
+        caught.value
+    )
+
+
+def test_the_executor_compares_nothing_when_the_checks_are_off() -> None:
+    # Not even a collective: a rank that is off would otherwise wait for peers that are not.
+    _check_data_plane(2, lambda rank: _records(rank, damaged_stored=True), enabled=False)
+
+
+def test_a_commit_before_the_drain_fails_the_debug_check_on_every_rank() -> None:
+    arrivals = _arrivals(2, (2, 2, 1, 0))
+    with pytest.raises(
+        RuntimeError, match="the context commit while the data plane .* not drained"
+    ):
+        run_loop(
+            2, LoopScript(arrivals, max_num_tokens=16, debug=True, streamer=True, skip_drain=True)
+        )
+
+
+def test_a_commit_before_the_drain_is_not_checked_without_debug() -> None:
+    arrivals = _arrivals(2, (2, 2, 1, 0))
+    runs = run_loop(2, LoopScript(arrivals, max_num_tokens=16, streamer=True, skip_drain=True))
+    assert all(run.final_pages == run.initial_pages for run in runs)
+
+
 def test_a_plan_that_differs_goes_unnoticed_without_the_debug_check() -> None:
     # Without the check the divergence shows as a hang of the data plane, which the drain and the
     # hang detector bound; the loop itself carries on.

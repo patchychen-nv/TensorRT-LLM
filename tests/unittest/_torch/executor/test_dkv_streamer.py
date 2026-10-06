@@ -25,6 +25,7 @@ mutations at the end remove one of the events of the streamer and the test has t
 """
 
 import threading
+from collections import Counter
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -37,10 +38,11 @@ from dkv_fake_dataplane import (
     FakeNetwork,
     FakeStream,
     FakeTransport,
+    HostDataPlaneDebug,
 )
 
 from tensorrt_llm._torch.pyexecutor.dkv import compute_ownership, owned_layers
-from tensorrt_llm._torch.pyexecutor.dkv_plan import PlanRequest
+from tensorrt_llm._torch.pyexecutor.dkv_plan import Direction, PlanRequest
 from tensorrt_llm._torch.pyexecutor.dkv_staging import (
     BAD_PAGE_INDEX,
     StagingGeometry,
@@ -48,9 +50,12 @@ from tensorrt_llm._torch.pyexecutor.dkv_staging import (
     StagingPool,
 )
 from tensorrt_llm._torch.pyexecutor.dkv_streamer import (
+    DataPlaneFault,
     DkvStreamer,
     LayoutCostModel,
+    find_data_plane_mismatches,
     max_message_bytes,
+    message_checksum,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -158,6 +163,9 @@ class RankReport:
     errors: list[str]
     largest_message: int
     buffer_bytes: int
+    # The checksum records and the plan of every iteration, when the run is in debug.
+    records: list = field(default_factory=list)
+    plans: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -169,6 +177,9 @@ class Options:
     deaf: str = ""
     # The fault: ``(rank, n)`` flips a byte of the n-th message that the rank sends.
     corrupt: tuple[int, int] = (-1, -1)
+    # Checksum every message at both ends; ``fault`` damages a message after it was received.
+    debug: bool = False
+    fault: DataPlaneFault | None = None
 
 
 def _corrupting(transport: FakeTransport, rank: int, options: Options) -> FakeTransport:
@@ -218,9 +229,13 @@ def _run_rank(
         copier=FakeCopier(),
         data_stream=data_stream,
         current_stream=lambda: exec_stream,
+        debug=HostDataPlaneDebug(data_stream) if options.debug else None,
+        fault=options.fault,
     )
     written: dict[tuple[int, int, object], set[int]] = {}
     errors: list[str] = []
+    records: list = []
+    plans: list = []
     try:
         for iteration in range(scenario.iterations):
             batch = scenario.batch(iteration)
@@ -232,7 +247,7 @@ def _run_rank(
                         request.context_current_position,
                         request.context_chunk_size,
                     )
-            streamer.set_plan(streamer.plan_for(batch))
+            streamer.set_plan(streamer.plan_for(batch), iteration)
             placement = [(r.context_current_position, r.context_chunk_size) for r in local]
             spans = {kind: layout.request_spans(kind, placement) for kind in layout.kinds}
             barrier.wait(timeout=_TIMEOUT)
@@ -247,14 +262,17 @@ def _run_rank(
                 exec_stream.enqueue(_attention(layer, local, spans, layout, pool))
             _record_writes(written, batch, layout, manager)
             streamer.end_forward()
-            streamer.drain(_TIMEOUT)
+            records.append(streamer.drain(_TIMEOUT))
+            plans.append(streamer.last_plan)
             exec_stream.synchronize()
             for stream in (data_stream, exec_stream):
                 errors.extend(f"{stream.name}: {error}" for error in stream.errors)
                 stream.errors.clear()
         errors.extend(_check_owner_pages(rank, layout, manager, written))
         largest = max((size for sizes in network.sent.values() for size in sizes), default=0)
-        return RankReport(streamer.stats, errors, largest, streamer._send_buffer.numel())
+        return RankReport(
+            streamer.stats, errors, largest, streamer._send_buffer.numel(), records, plans
+        )
     finally:
         exec_stream.close()
         data_stream.close()
@@ -469,8 +487,9 @@ class _Single:
         self.owners = compute_ownership(len(_RATIOS), 1)
         self.data = FakeStream("data", timeout=1.0)
         self.exec = FakeStream("exec", timeout=1.0)
+        self.manager = FakeKvManager(self.layout, range(len(_RATIOS)), pages=8)
         self.streamer = DkvStreamer(
-            FakeKvManager(self.layout, range(len(_RATIOS)), pages=8),
+            self.manager,
             SimpleNamespace(layout=self.layout, pool=self.pool),
             FakeTransport(FakeNetwork(1), 0),
             self.owners,
@@ -532,12 +551,169 @@ def test_a_staged_batch_that_is_not_the_one_of_the_plan_is_rejected(single) -> N
         streamer.begin_iteration([1], [128], [64], single.spans([(128, 64)]))
 
 
+def test_the_data_plane_is_idle_only_when_it_is_drained(single) -> None:
+    streamer = single.streamer
+    single.manager.prepare(1, 0, 128)
+    streamer.assert_idle("a page is freed")
+    streamer.set_plan(streamer.plan_for([PlanRequest(1, 0, 0, 128)]))
+    with pytest.raises(RuntimeError, match="a page is freed while the data plane of rank 0"):
+        streamer.assert_idle("a page is freed")
+    streamer.begin_iteration([1], [0], [128], single.spans([(0, 128)]))
+    for layer in range(len(_RATIOS)):
+        streamer.on_layer(layer)
+    streamer.end_forward()
+    # The plan is carried out, but the host has not seen the data stream finish.
+    with pytest.raises(RuntimeError, match="not drained"):
+        streamer.assert_idle("a page is moved")
+    streamer.drain(5.0)
+    streamer.assert_idle("a page is moved")
+
+
 def test_drain_gives_up_when_the_data_stream_never_finishes(single) -> None:
     streamer = single.streamer
     single.data.wait_event(FakeEvent())
     streamer._data_done = single.data.record_event()
     with pytest.raises(RuntimeError, match="did not finish"):
         streamer.drain(0.05)
+
+
+# The debug checksums: every message at both ends and on the pages it came from or went to
+
+
+def _mismatches(reports: list[RankReport]) -> list[str]:
+    problems = []
+    for iteration in range(len(reports[0].records)):
+        problems += find_data_plane_mismatches(
+            [report.records[iteration] for report in reports], reports[0].plans[iteration]
+        )
+    return problems
+
+
+@pytest.mark.parametrize("group_size", [1, 2, 3])
+def test_the_checksums_of_a_healthy_run_agree(group_size: int) -> None:
+    prompts = {1: 400, 2: 520, 3: 130}
+    scenario = Scenario(group_size, 2, prompts, _spread(group_size, prompts))
+    reports = run_group(scenario, Options(debug=True, data_jitter=0.001))
+    assert [report.errors for report in reports] == [[]] * group_size
+    assert _mismatches(reports) == []
+    roles = Counter(
+        role for report in reports for records in report.records for _, role, _ in records
+    )
+    # The test is not vacuous: every message was checksummed where it was packed, where it arrived
+    # and in the pages it was unpacked into, and every local copy at both of its ends.
+    if group_size > 1:
+        assert roles["sent"] == roles["received"] > 0
+        assert roles["stored"] == roles["received"] + roles["source"]
+    assert roles["source"] > 0
+
+
+@pytest.mark.parametrize("kind", ["flip", "zero"])
+@pytest.mark.parametrize(
+    ("direction", "iteration", "layer", "rank", "messages"),
+    [
+        # The layer has a message for each of its deadline classes: one for a layer with sliding
+        # window attention only (5), two for a layer compressed 128 times (2) and three for one
+        # compressed 4 times (1, 6).
+        (Direction.WRITEBACK, 0, 5, 1, 1),
+        (Direction.FETCH, 1, 1, 1, 3),
+        (Direction.FETCH, 1, 6, 0, 3),
+        (Direction.WRITEBACK, 1, 2, 0, 2),
+    ],
+)
+def test_a_damaged_message_is_named_by_the_checksums(
+    kind: str, direction: Direction, iteration: int, layer: int, rank: int, messages: int
+) -> None:
+    scenario = Scenario(2, 2, {1: 400, 2: 520}, {1: 0, 2: 1})
+    fault = DataPlaneFault(iteration, layer, direction, kind, rank)
+    problems = _mismatches(run_group(scenario, Options(debug=True, fault=fault)))
+    label = ("F" if direction is Direction.FETCH else "W") + f"({layer})/"
+    # Each damaged message arrived different from what was sent, and so did the pages it was
+    # unpacked into; nothing else differs.
+    assert len(problems) == 2 * messages and all(label in problem for problem in problems), problems
+    assert all(f"rank {rank} has " in problem for problem in problems), problems
+
+
+def test_a_run_whose_fault_never_happens_has_no_mismatch() -> None:
+    scenario = Scenario(2, 2, {1: 400, 2: 520}, {1: 0, 2: 1})
+    fault = DataPlaneFault(99, 1, Direction.FETCH)
+    assert _mismatches(run_group(scenario, Options(debug=True, fault=fault))) == []
+
+
+def test_the_mismatch_finder_names_what_differs_and_what_is_missing() -> None:
+    fetch = (int(Direction.FETCH), 3, 2, 0, 1)
+    assert (
+        find_data_plane_mismatches(
+            [[(fetch, "sent", 7)], [(fetch, "received", 7), (fetch, "stored", 7)]]
+        )
+        == []
+    )
+    (problem,) = find_data_plane_mismatches(
+        [[(fetch, "sent", 7)], [(fetch, "received", 7), (fetch, "stored", 9)]]
+    )
+    assert "rank 1 has stored 0x9, not 0x7" in problem and "F(3)/attention_kv" in problem
+    assert "owner rank 0, compute rank 1" in problem
+    (problem,) = find_data_plane_mismatches([[(fetch, "sent", 7)], []])
+    assert "recorded ['sent'] instead of ['received', 'sent', 'stored']" in problem
+    local = (int(Direction.WRITEBACK), 1, 0, 2, 2)
+    assert find_data_plane_mismatches([[], [], [(local, "source", 5), (local, "stored", 5)]]) == []
+    (problem,) = find_data_plane_mismatches([[], [], [(local, "source", 5), (local, "stored", 6)]])
+    assert "W(1)/state" in problem and "rank 2 has stored" in problem
+
+
+def test_the_checksum_depends_on_every_word_and_on_its_position() -> None:
+    data = torch.arange(64, dtype=torch.uint8)
+    reference = message_checksum(data)
+    assert message_checksum(data.clone()) == reference
+    flipped = data.clone()
+    flipped[17] ^= 1
+    assert message_checksum(flipped) != reference
+    swapped = data.clone()
+    swapped[:8], swapped[8:16] = data[8:16].clone(), data[:8].clone()
+    assert message_checksum(swapped) != reference
+    assert message_checksum(torch.zeros(64, dtype=torch.uint8)) != message_checksum(
+        torch.zeros(72, dtype=torch.uint8)
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("3:7:fetch", DataPlaneFault(3, 7, Direction.FETCH)),
+        ("0:2:writeback:zero:1", DataPlaneFault(0, 2, Direction.WRITEBACK, "zero", 1)),
+        ("5:0:fetch:flip", DataPlaneFault(5, 0, Direction.FETCH, "flip", None)),
+    ],
+)
+def test_a_fault_is_read_from_its_text(text: str, expected: DataPlaneFault) -> None:
+    assert DataPlaneFault.parse(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "1:2", "1:2:both", "a:2:fetch", "1:2:fetch:melt", "1:2:fetch:flip:x", "1:2:3:4:5:6"],
+)
+def test_a_fault_that_is_not_in_the_form_is_rejected(text: str) -> None:
+    with pytest.raises(ValueError, match="iteration:layer"):
+        DataPlaneFault.parse(text)
+
+
+def test_a_fault_needs_the_checksums_to_be_noticed() -> None:
+    layout = StagingLayout(_geometry(2))
+    stream = FakeStream("never used")
+    try:
+        with pytest.raises(ValueError, match="only noticed by the checksums"):
+            DkvStreamer(
+                FakeKvManager(layout, range(len(_RATIOS)), pages=2),
+                SimpleNamespace(layout=layout, pool=StagingPool(layout, device="cpu")),
+                FakeTransport(FakeNetwork(1), 0),
+                compute_ownership(len(_RATIOS), 1),
+                0,
+                group_size=1,
+                copier=FakeCopier(),
+                data_stream=stream,
+                fault=DataPlaneFault(0, 0, Direction.FETCH),
+            )
+    finally:
+        stream.close()
 
 
 # The cost model and the sizes the plan relies on

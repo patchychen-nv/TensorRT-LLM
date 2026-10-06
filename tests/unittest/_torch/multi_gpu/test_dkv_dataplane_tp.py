@@ -54,10 +54,16 @@ from tensorrt_llm._torch.pyexecutor.dkv_staging import (
     StagingLayout,
     StagingPool,
 )
-from tensorrt_llm._torch.pyexecutor.dkv_streamer import DkvStreamer
+from tensorrt_llm._torch.pyexecutor.dkv_streamer import (
+    DataPlaneFault,
+    DeviceDataPlaneDebug,
+    DkvStreamer,
+    find_data_plane_mismatches,
+)
 from tensorrt_llm._torch.pyexecutor.dkv_transport import nccl_p2p_transport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
@@ -85,6 +91,10 @@ class Scenario:
     arrival: dict[int, int] = field(default_factory=dict)
     # The fault: ``(rank, n)`` flips a byte of the n-th message that the rank receives.
     flip: tuple[int, int] = (-1, -1)
+    # The fault the streamer injects: ``"iteration:layer:fetch|writeback[:flip|zero[:rank]]"``.
+    fault: str = ""
+    # Checksum every message at both ends and compare the ranks' records after every iteration.
+    debug: bool = False
 
     @classmethod
     def soak(cls, group_size: int, ring_depth: int, iterations: int) -> "Scenario":
@@ -288,6 +298,8 @@ def _probe_rank(scenario: Scenario) -> dict:
         rank,
         group_size=group_size,
         data_stream=data_stream,
+        debug=DeviceDataPlaneDebug(data_stream) if scenario.debug else None,
+        fault=DataPlaneFault.parse(scenario.fault) if scenario.fault else None,
     )
     view.dkv_streamer = streamer
     requests: dict[int, LlmRequest] = {}
@@ -329,8 +341,14 @@ def _probe_rank(scenario: Scenario) -> dict:
                 _attention(layer, local, spans, layout, pool, checks)
             _record_writes(written, real, layout, manager)
             streamer.end_forward()
-            streamer.drain(_TIMEOUT)
+            records = streamer.drain(_TIMEOUT)
             torch.cuda.synchronize()
+            if scenario.debug:
+                # The compare is a collective, so every rank takes part in every iteration.
+                for problem in find_data_plane_mismatches(
+                    mpi_comm().allgather(records), streamer.last_plan
+                )[: _MAX_ERRORS - len(errors)]:
+                    errors.append(f"iteration {iteration}: checksums: {problem}")
             for layer, request_id, component, blocks, wrong in checks:
                 for block, bad in zip(blocks, wrong.tolist()):
                     if bad and len(errors) < _MAX_ERRORS:
@@ -392,7 +410,7 @@ def test_the_pages_of_every_layer_reach_the_compute_rank_and_come_back(
     if torch.cuda.device_count() < group_size:
         pytest.skip(f"Requires {group_size} GPUs")
     ranks = _spread(group_size, _PROMPTS) if placement == "spread" else {rid: 0 for rid in _PROMPTS}
-    scenario = Scenario(group_size, ring_depth, _PROMPTS, ranks, arrival={4: 1, 5: 2})
+    scenario = Scenario(group_size, ring_depth, _PROMPTS, ranks, arrival={4: 1, 5: 2}, debug=True)
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * group_size, timeout=900))
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"
@@ -408,9 +426,38 @@ def test_a_byte_flipped_in_a_received_message_is_noticed(
 ) -> None:
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two GPUs")
-    scenario = Scenario(2, 2, {1: 400, 2: 520}, {1: 0, 2: 1}, flip=(0, number))
+    scenario = Scenario(2, 2, {1: 400, 2: 520}, {1: 0, 2: 1}, flip=(0, number), debug=True)
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * 2, timeout=900))
-    assert any(result["errors"] for result in results), "the flipped byte went unnoticed"
+    errors = [error for result in results for error in result["errors"]]
+    assert errors, "the flipped byte went unnoticed"
+    # The checksums see it as well as the pattern does, and name the message.
+    assert any("checksums" in error for error in errors), errors
+
+
+@pytest.mark.parametrize("kind", ["flip", "zero"])
+@pytest.mark.parametrize("owner", range(4))
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_a_writeback_that_arrives_damaged_at_an_owner_is_named_by_the_checksums(
+    mpi_pool_executor: MPIPoolExecutor, owner: int, kind: str
+) -> None:
+    """The writeback of a layer is damaged on arrival at its owner, for the owner of each rank."""
+    if torch.cuda.device_count() < 4:
+        pytest.skip("Requires four GPUs")
+    group_size = 4
+    layer = compute_ownership(len(_RATIOS), group_size).index(owner)
+    scenario = Scenario(
+        group_size,
+        2,
+        _PROMPTS,
+        _spread(group_size, _PROMPTS),
+        fault=f"0:{layer}:writeback:{kind}:{owner}",
+        debug=True,
+    )
+    results = list(mpi_pool_executor.map(_probe_rank, [scenario] * group_size, timeout=900))
+    errors = [error for result in results for error in result["errors"]]
+    named = [error for error in errors if "checksums" in error and f"W({layer})/" in error]
+    assert named, errors
+    assert all(f"rank {owner} has" in error for error in named), named
 
 
 @pytest.mark.skipif(

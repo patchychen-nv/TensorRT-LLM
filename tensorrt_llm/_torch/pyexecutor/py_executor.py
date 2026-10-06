@@ -82,8 +82,9 @@ from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dkv import (DkvControlDigest, DkvControlPayload, DkvInvariantChecker,
-                  compute_ownership, digest_request_ids, ownership_fingerprint,
-                  sync_dkv_control, sync_dkv_sample_results, validate_ownership)
+                  compute_ownership, digest_request_ids, dkv_debug_enabled,
+                  ownership_fingerprint, sync_dkv_control,
+                  sync_dkv_sample_results, validate_ownership)
 from .dkv_plan import PlanRequest, plan_fingerprint
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
@@ -2716,7 +2717,12 @@ class PyExecutor:
         snapshot = getattr(self.kv_cache_manager,
                            "get_dkv_measurement_snapshot", None)
         result = snapshot() if callable(snapshot) else None
-        return result if isinstance(result, dict) else None
+        if not isinstance(result, dict):
+            return None
+        if self.dkv_streamer is not None:
+            # What the data plane of the layer-split layout has moved on this rank.
+            result["data_plane"] = dataclasses.asdict(self.dkv_streamer.stats)
+        return result
 
     def _process_iter_stats(
         self,
@@ -3778,6 +3784,17 @@ class PyExecutor:
             raise RuntimeError(
                 f"DKV invariant violation: request {request.py_request_id} freed "
                 "outside a replicated commit window")
+        if getattr(self, "dkv_enabled", False) is True:
+            self._check_dkv_data_plane_idle(
+                f"request {request.py_request_id} is freed")
+
+    def _check_dkv_data_plane_idle(self, what: str) -> None:
+        """Debug: no page is freed or moved while the data plane is still running."""
+        if self.dkv_streamer is None:
+            return
+        checker = self._dkv_invariant_checker
+        if checker is not None and checker.enabled:
+            self.dkv_streamer.assert_idle(what)
 
     def _stage_dkv_sampler_error(self, message: str,
                                  requests: Iterable[LlmRequest]) -> None:
@@ -4023,6 +4040,8 @@ class PyExecutor:
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Commit one context frontier to target and draft caches."""
+        if getattr(self, "dkv_enabled", False) is True:
+            self._check_dkv_data_plane_idle("the context commit")
         self.kv_cache_manager.update_context_resources(scheduled_batch)
         if self.enable_joint_kv_cache_reuse:
             self.draft_kv_cache_manager.update_context_resources(
@@ -4922,7 +4941,7 @@ class PyExecutor:
                         # The pages of the batch are allocated; the data plane
                         # of the iteration starts with the first layer.
                         self.dkv_streamer.set_plan(
-                            self._dkv_plan(scheduled_batch))
+                            self._dkv_plan(scheduled_batch), self.iter_counter)
                     with self._step_scope(forward_batch):
                         if scheduled_batch.encoder_requests:
                             self._submit_encoder_step(
@@ -4985,9 +5004,10 @@ class PyExecutor:
                         if self.dkv_streamer is not None:
                             # Nothing may free or move a page while the data
                             # plane is still reading or writing it.
-                            self.dkv_streamer.drain(
-                                self.dkv_staging_settings["transport_timeout_s"]
-                            )
+                            self._check_dkv_data_plane(
+                                self.dkv_streamer.drain(
+                                    self.dkv_staging_settings[
+                                        "transport_timeout_s"]))
 
                     if self._is_kv_manager_v2:
                         # Finalize V2 context KV before disagg transfer/response
@@ -6295,7 +6315,8 @@ class PyExecutor:
         warm-up exchange makes every pair of ranks connect now, so that no connection is made
         lazily in the middle of a forward pass.
         """
-        from .dkv_streamer import DkvStreamer
+        from .dkv_streamer import (DataPlaneFault, DeviceDataPlaneDebug,
+                                   DkvStreamer)
         from .dkv_transport import nccl_p2p_transport
 
         self._validate_dkv_layer_split_runtime()
@@ -6308,7 +6329,15 @@ class PyExecutor:
             **self._dkv_staging_settings(),
             "transport_timeout_s":
             float(os.environ.get("TRTLLM_DKV_TRANSPORT_TIMEOUT_S", "60")),
+            "fault":
+            os.environ.get("TRTLLM_DKV_FAULT", ""),
         }
+        fault = (DataPlaneFault.parse(settings["fault"])
+                 if settings["fault"] else None)
+        if fault is not None and not dkv_debug_enabled():
+            raise ValueError(
+                "TRTLLM_DKV_FAULT needs TRTLLM_DKV_DEBUG=1: only the checksums "
+                "of the debug checks notice a damaged message")
         pool, view = self._create_dkv_staged_view(settings)
         with torch.cuda.device(self.device_id):
             transport = nccl_p2p_transport(group_size, rank)
@@ -6322,7 +6351,10 @@ class PyExecutor:
             rank,
             group_size=group_size,
             data_stream=data_stream,
-            fill=settings["staging_fill"])
+            fill=settings["staging_fill"],
+            debug=(DeviceDataPlaneDebug(data_stream)
+                   if dkv_debug_enabled() else None),
+            fault=fault)
         self._install_dkv_staged_view(view, settings)
         logger.info(
             f"DKV layer split: staging {pool.bytes_reserved / (1 << 20):.0f} MiB, "
@@ -6330,6 +6362,25 @@ class PyExecutor:
             f"{settings['staging_tokens']} staged tokens per iteration, "
             f"rank {rank} owns {len(manager.pp_layers)} of {manager.num_layers} layers"
         )
+
+    def _check_dkv_data_plane(self, records) -> None:
+        """Compare the checksums of the messages of the iteration across the ranks (debug).
+
+        Each message was checksummed by the rank that packed it, by the rank that received it and
+        on the pages it went to, so a damaged message, a page at the wrong place and ranks that
+        ran different plans all show as records that differ or are missing.
+        """
+        if not self._dkv_invariant_checker.enabled:
+            return
+        from .dkv_streamer import find_data_plane_mismatches
+
+        problems = find_data_plane_mismatches(self.dist.tp_allgather(records),
+                                              self.dkv_streamer.last_plan)
+        if problems:
+            message = (f"DKV data plane checksums differ at iteration "
+                       f"{self.iter_counter}:\n  " + "\n  ".join(problems))
+            logger.error(message)
+            raise RuntimeError(message)
 
     def _dkv_plan(self, scheduled_batch: ScheduledRequests):
         """The data plane of the iteration: what moves between which ranks, in which order.

@@ -30,12 +30,13 @@ forward pass by events.
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import torch
 
 from .dkv_plan import (
     DEADLINE_OF_KIND,
+    DeadlineClass,
     Direction,
     DkvPlan,
     OpAction,
@@ -46,6 +47,7 @@ from .dkv_plan import (
     Transfer,
     build_dkv_plan,
     layer_types_from_compress_ratios,
+    step_label,
 )
 from .dkv_staging import (
     BAD_PAGE_INDEX,
@@ -236,6 +238,170 @@ class _MessagePage(NamedTuple):
     offset: int
 
 
+# The multiplier of the position of a word in the checksum: 2**64 divided by the golden ratio.
+_CHECKSUM_STRIDE = -7046029254386353131
+
+
+def message_checksum(data: torch.Tensor) -> torch.Tensor:
+    """A 64-bit checksum of ``data``, a tensor of bytes whose size is a multiple of 8.
+
+    The words are combined with their position, so exchanged words change it, and a changed word
+    always does, since the exclusive or with a constant is a bijection of the word.
+    """
+    words = data.view(torch.int64)
+    positions = torch.arange(1, words.numel() + 1, dtype=torch.int64, device=data.device)
+    return (words ^ (positions * _CHECKSUM_STRIDE)).sum()
+
+
+class DataPlaneDebug(Protocol):
+    """The checks of the data plane that run on its stream and cost a pass over every message."""
+
+    def checksum(self, key: tuple, role: str, data: torch.Tensor) -> None:
+        """Record the checksum of ``data`` for the message ``key`` in the role ``role``.
+
+        The checksum is computed on the data stream, when it gets to it.
+        """
+        ...
+
+    def corrupt(self, data: torch.Tensor, kind: str) -> None:
+        """Damage ``data`` on the data stream: ``"flip"`` one byte or ``"zero"`` all of them."""
+        ...
+
+    def collect(self) -> list[tuple[tuple, str, int]]:
+        """The ``(message, role, checksum)`` records of the finished iteration; clears them."""
+        ...
+
+
+class DeviceDataPlaneDebug:
+    """``DataPlaneDebug`` for CUDA tensors: the checks run on ``stream``."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._pending: list[tuple[tuple, str, torch.Tensor]] = []
+
+    def checksum(self, key: tuple, role: str, data: torch.Tensor) -> None:
+        with torch.cuda.stream(self._stream):
+            self._pending.append((key, role, message_checksum(data)))
+
+    def corrupt(self, data: torch.Tensor, kind: str) -> None:
+        with torch.cuda.stream(self._stream):
+            if kind == "zero":
+                data.zero_()
+            else:
+                data[data.numel() // 2].bitwise_xor_(0xFF)
+
+    def collect(self) -> list[tuple[tuple, str, int]]:
+        pending, self._pending = self._pending, []
+        if not pending:
+            return []
+        # The data stream is done: the host has seen the event that ends the iteration.
+        values = torch.stack([value for _, _, value in pending]).tolist()
+        return [(key, role, int(value)) for (key, role, _), value in zip(pending, values)]
+
+
+_FAULT_KINDS = ("flip", "zero")
+_DIRECTIONS = {"fetch": Direction.FETCH, "writeback": Direction.WRITEBACK}
+
+
+@dataclass(frozen=True)
+class DataPlaneFault:
+    """A message to damage after it was received, to see that the checksums notice.
+
+    Attributes:
+        iteration: The iteration of the executor.
+        layer: The layer whose message is damaged.
+        direction: Whether the damaged message is a fetch or a writeback.
+        kind: ``"flip"`` one byte or ``"zero"`` the message.
+        rank: The rank that receives the message; ``None``: whichever receives it.
+    """
+
+    iteration: int
+    layer: int
+    direction: Direction
+    kind: str = "flip"
+    rank: int | None = None
+
+    @classmethod
+    def parse(cls, text: str) -> "DataPlaneFault":
+        """Read ``iteration:layer:fetch|writeback[:flip|zero[:rank]]``."""
+        parts = text.split(":")
+        try:
+            if not 3 <= len(parts) <= 5 or parts[2] not in _DIRECTIONS:
+                raise ValueError
+            kind = parts[3] if len(parts) > 3 else "flip"
+            if kind not in _FAULT_KINDS:
+                raise ValueError
+            return cls(
+                int(parts[0]),
+                int(parts[1]),
+                _DIRECTIONS[parts[2]],
+                kind,
+                int(parts[4]) if len(parts) > 4 else None,
+            )
+        except ValueError:
+            raise ValueError(
+                f"{text!r} is not iteration:layer:fetch|writeback[:flip|zero[:rank]]"
+            ) from None
+
+
+def message_key(transfer: Transfer) -> tuple[int, int, int, int, int]:
+    """What names a message in every iteration: the same on its two ends."""
+    return (
+        int(transfer.direction),
+        transfer.layer,
+        int(transfer.deadline),
+        transfer.owner,
+        transfer.compute,
+    )
+
+
+def find_data_plane_mismatches(
+    records_by_rank: Sequence[Sequence[tuple[tuple, str, int]]], plan: DkvPlan | None = None
+) -> list[str]:
+    """Describe the messages of an iteration whose checksums disagree.
+
+    A message that crossed ranks has the checksum of what the sender packed, of what the receiver
+    got, and of the pages the receiver unpacked it into read back; a message that was copied on one
+    rank has the checksum of the source pages and of the destination pages. Each of them has to be
+    equal. A message that one end recorded and the other did not, which means that the two ranks
+    did not run the same plan, is reported as well.
+    """
+    roles_of: dict[tuple, dict[str, list[tuple[int, int]]]] = {}
+    for rank, records in enumerate(records_by_rank):
+        for key, role, value in records:
+            roles_of.setdefault(tuple(key), {}).setdefault(role, []).append((rank, value))
+    segments = {}
+    if plan is not None:
+        for step in plan.steps:
+            for transfer in step.transfers:
+                segments[message_key(transfer)] = transfer
+    problems = []
+    for key, roles in sorted(roles_of.items()):
+        direction, layer, deadline, owner, compute = key
+        name = f"{step_label(Direction(direction), layer)}/{DeadlineClass(deadline).name.lower()}"
+        transfer = segments.get(key)
+        requests = (
+            sorted({segment.request_id for segment in transfer.segments}) if transfer else "?"
+        )
+        where = f"{name} of requests {requests} (owner rank {owner}, compute rank {compute})"
+        if owner == compute:
+            expected = {"source", "stored"}
+        else:
+            expected = {"sent", "received", "stored"}
+        if set(roles) != expected or any(len(entries) != 1 for entries in roles.values()):
+            problems.append(f"{where}: recorded {sorted(roles)} instead of {sorted(expected)}")
+            continue
+        values = {role: entries[0][1] for role, entries in roles.items()}
+        reference = values["source" if owner == compute else "sent"]
+        for role in sorted(expected):
+            if values[role] != reference:
+                rank = roles[role][0][0]
+                problems.append(
+                    f"{where}: rank {rank} has {role} {values[role]:#x}, not {reference:#x}"
+                )
+    return problems
+
+
 class DkvStreamer:
     """Carries out the data plane of the ``layer_split`` layout around the layers of a forward pass.
 
@@ -279,6 +445,8 @@ class DkvStreamer:
         data_stream=None,
         current_stream: Callable[[], object] | None = None,
         fill: str = "",
+        debug: DataPlaneDebug | None = None,
+        fault: DataPlaneFault | None = None,
     ) -> None:
         """Build the streamer of ``rank``.
 
@@ -293,6 +461,9 @@ class DkvStreamer:
             data_stream: The CUDA stream of the data plane; a new one by default.
             current_stream: Returns the stream of the forward pass; the current stream by default.
             fill: ``"zero"`` or ``"nan"`` overwrites a layer's slots before they are fetched.
+            debug: Checksums every message at both ends and the pages it came from or went to;
+                ``drain`` returns the records for the executor to compare across the ranks.
+            fault: A message to damage after it was received; it needs ``debug``.
         """
         layout = view.layout
         owners = tuple(owner_of_layer)
@@ -303,6 +474,8 @@ class DkvStreamer:
             )
         if not 0 <= rank < group_size:
             raise ValueError(f"rank {rank} is not in a group of {group_size} ranks")
+        if fault is not None and debug is None:
+            raise ValueError("a data plane fault is only noticed by the checksums of debug")
         self._manager = manager
         self._layout = layout
         self._pool = view.pool
@@ -320,6 +493,12 @@ class DkvStreamer:
         device = view.pool.buffer.device
         self._send_buffer = torch.empty(size, dtype=torch.uint8, device=device)
         self._recv_buffer = torch.empty(size, dtype=torch.uint8, device=device)
+        self._debug = debug
+        self._fault = fault
+        # Where the pages of a message are read back to checksum them.
+        self._scratch = torch.empty(size, dtype=torch.uint8, device=device) if debug else None
+        self._iteration = 0
+        self.last_plan: DkvPlan | None = None
         self.stats = DataPlaneStats()
         self._plan: DkvPlan | None = None
         self._requests: dict[int, PlanRequest] = {}
@@ -345,8 +524,8 @@ class DkvStreamer:
             ring_depth=self._layout.geometry.ring_depth,
         )
 
-    def set_plan(self, plan: DkvPlan) -> None:
-        """Carry out ``plan`` in the next forward pass.
+    def set_plan(self, plan: DkvPlan, iteration: int = 0) -> None:
+        """Carry out ``plan`` in the next forward pass, the pass of iteration ``iteration``.
 
         Raises:
             RuntimeError: The previous plan has not been carried out, or ``plan`` was built for a
@@ -365,6 +544,7 @@ class DkvStreamer:
                 f"ring depth {self._layout.geometry.ring_depth} and owners {self._owners}"
             )
         self._plan = plan
+        self._iteration = iteration
         self._requests = {request.request_id: request for request in plan.requests}
         self._computes = any(
             request.compute_rank == self._rank and not request.is_dummy for request in plan.requests
@@ -436,11 +616,29 @@ class DkvStreamer:
         for step in plan.end_steps():
             self._issue(step)
         self._data_done = self._data_stream.record_event()
+        self.last_plan = plan
         self._plan = None
         self.stats.iterations += 1
 
-    def drain(self, timeout: float) -> None:
+    def assert_idle(self, what: str) -> None:
+        """Raise unless the data plane of the last iteration is done and no iteration is open.
+
+        A page may only be freed or moved by the cache manager while the data plane is idle.
+
+        Raises:
+            RuntimeError: ``what`` is about to happen while the data plane is still running.
+        """
+        if self._plan is not None or self._data_done is not None:
+            raise RuntimeError(
+                f"DKV invariant violation: {what} while the data plane of rank {self._rank} "
+                "is not drained"
+            )
+
+    def drain(self, timeout: float) -> list[tuple[tuple, str, int]]:
         """Wait until the data stream has finished the last forward pass.
+
+        Returns:
+            The checksum records of the iteration when the streamer is in debug, else nothing.
 
         Raises:
             RuntimeError: The data stream is not done after ``timeout`` seconds, which means that a
@@ -448,7 +646,7 @@ class DkvStreamer:
         """
         done, self._data_done = self._data_done, None
         if done is None:
-            return
+            return []
         deadline = time.monotonic() + timeout
         while not done.query():
             if time.monotonic() >= deadline:
@@ -456,6 +654,7 @@ class DkvStreamer:
                     f"rank {self._rank}: the DKV data plane did not finish within {timeout} s"
                 )
             time.sleep(self._POLL_SECONDS)
+        return self._debug.collect() if self._debug is not None else []
 
     # ---- issuing the steps ----------------------------------------------------------------
 
@@ -481,16 +680,19 @@ class DkvStreamer:
     def _run(self, op: RankOp) -> None:
         transfer = op.transfer
         pages = self._message_pages(transfer)
+        key = message_key(transfer)
         if op.action is OpAction.LOCAL:
             fetch = transfer.direction is Direction.FETCH
-            pairs = []
-            for page in pages:
-                pool = self._pool_address(transfer.layer, page)
-                staging = self._staging_address(transfer.layer, page)
-                pairs.append(
-                    (page.component, staging, pool) if fetch else (page.component, pool, staging)
-                )
-            self._copy(pairs)
+            pool = [self._pool_address(transfer.layer, page) for page in pages]
+            staging = [self._staging_address(transfer.layer, page) for page in pages]
+            source, destination = (pool, staging) if fetch else (staging, pool)
+            if self._debug is not None:
+                self._checksum_pages(key, "source", transfer.nbytes, pages, source)
+            self._copy(
+                [(page.component, to, at) for page, to, at in zip(pages, destination, source)]
+            )
+            if self._debug is not None:
+                self._checksum_pages(key, "stored", transfer.nbytes, pages, destination)
             self.stats.local_copies += 1
             self.stats.bytes_local += transfer.nbytes
             return
@@ -499,25 +701,46 @@ class DkvStreamer:
         buffer = self._send_buffer if sending else self._recv_buffer
         message = buffer[: transfer.nbytes]
         base = buffer.data_ptr()
-        pairs = []
-        for page in pages:
-            page_at = page_address(transfer.layer, page)
-            message_at = base + page.offset
-            pairs.append(
-                (page.component, message_at, page_at)
-                if sending
-                else (page.component, page_at, message_at)
-            )
+        page_at = [page_address(transfer.layer, page) for page in pages]
         if sending:
-            self._copy(pairs)
+            self._copy(
+                [(page.component, base + page.offset, at) for page, at in zip(pages, page_at)]
+            )
+            if self._debug is not None:
+                self._debug.checksum(key, "sent", message)
             self._transport.send(message, op.peer, self._data_stream)
             self.stats.messages_sent += 1
             self.stats.bytes_sent += transfer.nbytes
         else:
             self._transport.recv(message, op.peer, self._data_stream)
-            self._copy(pairs)
+            if self._fault is not None and self._is_faulty(transfer):
+                self._debug.corrupt(message, self._fault.kind)
+            if self._debug is not None:
+                self._debug.checksum(key, "received", message)
+            self._copy(
+                [(page.component, at, base + page.offset) for page, at in zip(pages, page_at)]
+            )
+            if self._debug is not None:
+                self._checksum_pages(key, "stored", transfer.nbytes, pages, page_at)
             self.stats.messages_received += 1
             self.stats.bytes_received += transfer.nbytes
+
+    def _is_faulty(self, transfer: Transfer) -> bool:
+        fault = self._fault
+        return (
+            fault.iteration == self._iteration
+            and fault.layer == transfer.layer
+            and fault.direction is transfer.direction
+            and fault.rank in (None, self._rank)
+        )
+
+    def _checksum_pages(
+        self, key: tuple, role: str, nbytes: int, pages: Sequence[_MessagePage], addresses
+    ) -> None:
+        """Read the pages at ``addresses`` back into the order of a message and checksum them."""
+        base = self._scratch.data_ptr()
+        self._copy([(page.component, base + page.offset, at) for page, at in zip(pages, addresses)])
+        self._debug.checksum(key, role, self._scratch[:nbytes])
 
     def _copy(self, pairs: Sequence[tuple[StagingComponent, int, int]]) -> None:
         """Copy the pages ``(component, destination, source)``, one launch per page size."""

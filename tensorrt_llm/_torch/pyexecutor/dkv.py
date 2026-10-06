@@ -420,6 +420,11 @@ def _bounded_repr(value: object) -> str:
     return text
 
 
+def dkv_debug_enabled() -> bool:
+    """Whether ``TRTLLM_DKV_DEBUG`` asks for the per-iteration consistency checks."""
+    return os.environ.get("TRTLLM_DKV_DEBUG", "0") not in ("0", "false", "False")
+
+
 class DkvInvariantChecker:
     """Cross-rank consistency checker for DKV; per-iteration checks are debug-only.
 
@@ -441,7 +446,7 @@ class DkvInvariantChecker:
     ) -> None:
         self.dist = dist
         if enabled is None:
-            enabled = os.environ.get("TRTLLM_DKV_DEBUG", "0") not in ("0", "false", "False")
+            enabled = dkv_debug_enabled()
         self.enabled = enabled
         settings = tuple(sorted((startup_settings or {}).items()))
         by_rank = self.dist.tp_allgather((self.enabled, settings))

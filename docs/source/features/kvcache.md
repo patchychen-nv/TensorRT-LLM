@@ -386,11 +386,9 @@ slots, and request statistics use only the local compute-rank batch. An idle
 rank forwards its resident dummy so all ranks participate in model collectives.
 Only the compute rank constructs a response. A DKV context worker can send its
 computed KV to an ordinary generation worker. `dkv_config.kv_layout` names the
-layout of the KV data: `replicated`, the default and the only layout that runs,
-keeps every layer on every rank; `layer_split` would keep each layer on its owner
-rank only and move KV between ranks per layer, and is rejected until it is
-implemented. Distributed layer ownership and KV data movement between DKV
-replicas are not implemented yet.
+layout of the KV data: `replicated`, the default, keeps every layer on every rank;
+`layer_split` keeps each layer on its owner rank only and moves the KV of a layer
+between ranks around its attention (see **Layer split** below).
 
 Two collectives keep the replicas aligned. **S-sample** is the single all-gather
 after sampling in every iteration that has a batch: each compute rank publishes
@@ -697,6 +695,38 @@ output into NaN. The ranks compare these switches when they start. The loopback 
 DeepSeek-V4 with and without it and judge the two groups by the rules above, and a
 layer-level test runs the attention layers on the cache manager and on its staged view and
 requires the same outputs and pages.
+
+**Layer split (DeepSeek-V4).** With `kv_layout: layer_split` the model's layers are divided
+into contiguous ranges over the ranks of the group, and the cache manager of a rank holds the
+KV of the layers it owns only, so a group stores one copy of the KV of every request instead
+of one per rank. The request is still computed on its compute rank: around the attention of
+each layer, the rank that owns the layer sends the cached KV the layer reads to the compute
+rank (a fetch), and the compute rank sends the pages its new tokens wrote back (a writeback).
+Both run on a data stream of their own over NCCL point-to-point messages, in an order that
+every rank derives from the replicated scheduling state, so no rank exchanges the plan; the
+host waits for the data stream at the end of every iteration, before a page can be freed or
+moved. The ranks agree on the number of pages of every KV life cycle, since the layers they
+hold differ in bytes. The layout needs DeepSeek-V4 on SM100 or SM103, `cuda_graph_config: null`,
+no `torch_compile_config`, no cache transceiver (the context-transfer path is not available
+yet) and every rank to own layers of every KV life cycle, which limits the group size.
+
+`TRTLLM_DKV_STAGING_TOKENS`, `TRTLLM_DKV_STAGING_DEPTH` and `TRTLLM_DKV_STAGING_FILL` work as
+for the loopback. `TRTLLM_DKV_TRANSPORT_TIMEOUT_S` (default 60) is how long the host waits for
+the data plane at the end of an iteration before it fails; set it below the hang detector
+timeout. With `TRTLLM_DKV_DEBUG=1` every message is checksummed where it was packed, where it
+arrived and on the pages it was unpacked into, the ranks compare the checksums after every
+iteration, and a damaged message is named with its layer, direction and requests. To see that
+the check works, `TRTLLM_DKV_FAULT=<iteration>:<layer>:<fetch|writeback>[:<flip|zero>[:<rank>]]`
+damages one received message. With `TRTLLM_DKV_MEASUREMENT=1` the `dkvMeasurement` of an
+iteration-stats row also carries `data_plane`, the messages and bytes the rank has sent,
+received and copied locally.
+
+The tests are `tests/integration/defs/dkv/test_dkv_layer_split.py` (DeepSeek-V4 on two ranks,
+judged against the replicated group by the rules above, and the bursts and the aggregate soak
+of the replicated layout), the multi-GPU probe `tests/unittest/_torch/multi_gpu/test_dkv_dataplane_tp.py`,
+which runs the data plane between real ranks without a model and compares every page with a
+pattern (`DKV_DATAPLANE_SOAK=<iterations>` turns on a long run), and CPU tests that run every
+rank's streamer on threads (`tests/unittest/_torch/executor/test_dkv_streamer.py`).
 
 **Consistency checks.** The checker always rejects inconsistent enable flags and
 inconsistent process-level settings (the dual-ledger switch, `TLLM_METRICS_ALL_RANKS`,

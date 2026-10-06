@@ -189,6 +189,35 @@ class FakeCopier:
         FakeStream.of_handle(stream).enqueue(work)
 
 
+class HostDataPlaneDebug:
+    """``DataPlaneDebug`` on host memory: the checks run on the fake stream, in its order."""
+
+    def __init__(self, stream: FakeStream) -> None:
+        self._stream = stream
+        self._records: list[tuple[tuple, str, int]] = []
+
+    def checksum(self, key: tuple, role: str, data: torch.Tensor) -> None:
+        from tensorrt_llm._torch.pyexecutor.dkv_streamer import message_checksum
+
+        def work() -> None:
+            self._records.append((key, role, int(message_checksum(data))))
+
+        self._stream.enqueue(work)
+
+    def corrupt(self, data: torch.Tensor, kind: str) -> None:
+        def work() -> None:
+            if kind == "zero":
+                data.zero_()
+            else:
+                data[data.numel() // 2] ^= 0xFF
+
+        self._stream.enqueue(work)
+
+    def collect(self) -> list[tuple[tuple, str, int]]:
+        records, self._records = self._records, []
+        return records
+
+
 class FakeKvManager:
     """The pages of the layers one rank owns, in host memory, in the shape the streamer reads.
 

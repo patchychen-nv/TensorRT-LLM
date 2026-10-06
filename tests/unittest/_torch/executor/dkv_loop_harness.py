@@ -167,6 +167,8 @@ class LoopScript:
     streamer: bool = False
     # ``(rank, iteration)`` at which that rank plans without the first request of the batch.
     plan_skew: tuple[int, int] | None = None
+    # The loop does not drain the data plane before the commits (the streamer ignores the drain).
+    skip_drain: bool = False
 
 
 class _PageCosts:
@@ -181,15 +183,20 @@ class PlanStreamer:
 
     NUM_LAYERS = 6
 
-    def __init__(self, executor: PyExecutor, group_size: int, skew, record) -> None:
+    def __init__(
+        self, executor: PyExecutor, group_size: int, skew, record, skip_drain: bool = False
+    ) -> None:
         self._executor = executor
         self._group_size = group_size
         self._skew = skew
         self._record = record
+        self._skip_drain = skip_drain
+        self._drained = True
         self._owners = compute_ownership(self.NUM_LAYERS, group_size)
         self._layer_types = layer_types_from_compress_ratios([1, 4, 128] * 2)
         self.plans: list = []
         self.planned: list = []
+        self.last_plan = None
 
     def plan_for(self, requests):
         requests = list(requests)
@@ -205,12 +212,23 @@ class PlanStreamer:
             ring_depth=2,
         )
 
-    def set_plan(self, plan) -> None:
+    def set_plan(self, plan, iteration: int = 0) -> None:
         self.plans.append(plan)
+        self.last_plan = plan
+        self._drained = False
         self._record("plan", plan_fingerprint(plan))
 
-    def drain(self, timeout: float) -> None:
+    def drain(self, timeout: float) -> list:
         self._record("drain", timeout)
+        self._drained = not self._skip_drain
+        return []
+
+    def assert_idle(self, what: str) -> None:
+        if not self._drained:
+            raise RuntimeError(
+                f"DKV invariant violation: {what} while the data plane of rank "
+                f"{self._executor.dist.tp_rank} is not drained"
+            )
 
 
 @dataclass
@@ -362,7 +380,9 @@ def build_loop_executor(dist, script: LoopScript, run: RankRun) -> PyExecutor:
     if script.context_only:
         _attach_transceiver(executor, script, run, record)
     if script.streamer:
-        executor.dkv_streamer = PlanStreamer(executor, dist.tp_size, script.plan_skew, record)
+        executor.dkv_streamer = PlanStreamer(
+            executor, dist.tp_size, script.plan_skew, record, script.skip_drain
+        )
         executor.dkv_staging_settings = {"transport_timeout_s": 7.0}
 
     def ids(batch: ScheduledRequests) -> list[tuple[int, bool]]:
@@ -416,7 +436,13 @@ def build_loop_executor(dist, script: LoopScript, run: RankRun) -> PyExecutor:
         setattr(executor, name, Mock(return_value=None))
     executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
     executor._can_pause_for_rebalance = Mock(return_value=False)
-    executor._update_v2_context_resources = Mock(side_effect=lambda batch: record("context_commit"))
+
+    def update_v2_context_resources(batch: ScheduledRequests) -> None:
+        # The check that the real method makes before it commits the context.
+        executor._check_dkv_data_plane_idle("the context commit")
+        record("context_commit")
+
+    executor._update_v2_context_resources = Mock(side_effect=update_v2_context_resources)
 
     real_forward_batch = executor._dkv_forward_batch
 

@@ -565,3 +565,25 @@ def test_measurement_snapshot_is_exported_whenever_the_manager_collects_a_dict(
     executor.dkv_enabled = dkv_enabled
     executor.kv_cache_manager = manager
     assert executor._dkv_measurement_snapshot() == expected
+
+
+def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_moved() -> None:
+    from tensorrt_llm._torch.pyexecutor.dkv_streamer import DataPlaneStats
+
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.dkv_enabled = True
+    executor.kv_cache_manager = SimpleNamespace(get_dkv_measurement_snapshot=lambda: {"rank": 1})
+    executor.dkv_streamer = SimpleNamespace(
+        stats=DataPlaneStats(iterations=3, messages_sent=4, bytes_sent=4096, bytes_local=512)
+    )
+    snapshot = executor._dkv_measurement_snapshot()
+    assert snapshot["rank"] == 1
+    assert snapshot["data_plane"] == {
+        "iterations": 3,
+        "messages_sent": 4,
+        "messages_received": 0,
+        "bytes_sent": 4096,
+        "bytes_received": 0,
+        "local_copies": 0,
+        "bytes_local": 512,
+    }
