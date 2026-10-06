@@ -83,16 +83,26 @@ MODEL_IDS = [model.pytest_id for model in MODELS]
 PRECISION_MODELS = [model for model in MODELS if model.precision is not None]
 
 
+# The switches of the layer-split staging area; a test that sets one reaches every worker.
+STAGING_SWITCHES = (
+    "TRTLLM_DKV_STAGING_LOOPBACK",
+    "TRTLLM_DKV_STAGING_DEPTH",
+    "TRTLLM_DKV_STAGING_TOKENS",
+    "TRTLLM_DKV_STAGING_FILL",
+)
+
+
 def dkv_worker_env(*, measurement: bool = False) -> dict[str, str]:
     """The DKV switches a test turns on, as ``env_overrides`` for the LLM.
 
     Ranks that were launched through MPI do not see the environment a test sets, so the LLM carries
-    these to every worker.
+    these to every worker, the staging switches among them when the test has set them.
     """
     env = {"TRTLLM_DKV_DEBUG": "1", "TRTLLM_DKV_DUAL_LEDGER": "1"}
     if measurement:
         # Each rank's own pool snapshot rides on the iteration stats.
         env["TRTLLM_DKV_MEASUREMENT"] = "1"
+    env.update({key: os.environ[key] for key in STAGING_SWITCHES if key in os.environ})
     return env
 
 

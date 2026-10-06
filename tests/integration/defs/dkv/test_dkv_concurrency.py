@@ -126,6 +126,11 @@ def _probe_free_pages(llm, prompt: list[int], sampling, group_size: int, seen: l
 def test_dkv_concurrent_burst_answers_every_request_once_and_leaks_nothing(
     monkeypatch, capfd, model: DkvModel, burst: _Burst
 ) -> None:
+    run_burst(monkeypatch, capfd, model, burst)
+
+
+def run_burst(monkeypatch, capfd, model: DkvModel, burst: _Burst) -> None:
+    """Throw ``burst`` at a DKV group of ``model`` and check the answers and the free pages."""
     if available_gpus() < burst.group_size:
         pytest.skip(f"The {burst.pytest_id} burst needs {burst.group_size} GPUs")
     if not Path(model.path()).is_dir():

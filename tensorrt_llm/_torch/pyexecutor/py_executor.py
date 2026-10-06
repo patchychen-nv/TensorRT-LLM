@@ -867,6 +867,9 @@ class PyExecutor:
                     "Speculative decoding with CUDA graph is not supported "
                     "for encoder-decoder models.")
 
+        # The warm-up forward passes already read the staged view of the cache.
+        self._initialize_dkv_staging()
+
         # Synchronize all ranks before warmup. This prevents a PP
         # communication deadlock when ranks on the last PP stage are delayed
         # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
@@ -6178,6 +6181,75 @@ class PyExecutor:
         if layer_split:
             self._validate_dkv_layer_split_runtime()
 
+    def _initialize_dkv_staging(self) -> None:
+        """Stage the KV of the layers for the attention backend, when DKV asks for it.
+
+        ``TRTLLM_DKV_STAGING_LOOPBACK=1`` runs the replicated layout through the staging area:
+        every rank owns every layer, so each layer's cached pages are copied from the rank's own
+        cache manager into the staging slot before its attention and the pages the new tokens
+        wrote are copied back. It exists to prove the staging path on its own, without any
+        transfer between ranks. ``TRTLLM_DKV_STAGING_DEPTH`` sets the ring depth,
+        ``TRTLLM_DKV_STAGING_TOKENS`` the cached and new tokens, summed over its requests, that one
+        rank may stage in an iteration (default: every request of the batch at ``max_seq_len``)
+        and ``TRTLLM_DKV_STAGING_FILL=nan`` overwrites the slots of a layer with NaN before its
+        pages are fetched, so a page that is read without having been fetched or written turns
+        the output into NaN.
+        """
+        self.dkv_staging_settings: dict[str, object] = {}
+        if os.environ.get("TRTLLM_DKV_STAGING_LOOPBACK", "0") != "1":
+            return
+        if not self.dkv_enabled:
+            logger.warning(
+                "TRTLLM_DKV_STAGING_LOOPBACK is ignored without dkv_config")
+            return
+        from ..attention.backends.sparse.deepseek_v4.cache_manager import \
+            DeepseekV4CacheManager
+        from .dkv_staging import (DkvStagedKvView, StagingGeometry,
+                                  StagingLayout, StagingPool)
+        from .dkv_streamer import LoopbackStreamer
+
+        manager = self.kv_cache_manager
+        if type(manager) is not DeepseekV4CacheManager:
+            raise ValueError(
+                "TRTLLM_DKV_STAGING_LOOPBACK is not supported with "
+                f"{type(manager).__name__}; use DeepseekV4CacheManager.")
+        if self.llm_args.cuda_graph_config is not None:
+            raise ValueError(
+                "TRTLLM_DKV_STAGING_LOOPBACK is not supported with CUDA graphs; "
+                "set cuda_graph_config to null")
+        settings = {
+            "staging_loopback":
+            True,
+            "staging_depth":
+            int(os.environ.get("TRTLLM_DKV_STAGING_DEPTH", "2")),
+            "staging_tokens":
+            int(
+                os.environ.get(
+                    "TRTLLM_DKV_STAGING_TOKENS",
+                    max(manager.max_batch_size * manager.max_seq_len,
+                        manager.max_num_tokens))),
+            "staging_fill":
+            os.environ.get("TRTLLM_DKV_STAGING_FILL", ""),
+        }
+        geometry = StagingGeometry.from_cache_manager(
+            manager,
+            max_staging_tokens=settings["staging_tokens"],
+            ring_depth=settings["staging_depth"])
+        pool = StagingPool(StagingLayout(geometry), device=self.device_id)
+        view = DkvStagedKvView(manager, pool)
+        view.dkv_streamer = LoopbackStreamer(manager,
+                                             view,
+                                             fill=settings["staging_fill"])
+        manager.dkv_staged_view = view
+        # Metadata built on the real manager earlier would not read the view.
+        self.model_engine.attn_metadata = None
+        self.model_engine.dkv_staging = True
+        self.dkv_staging_settings = settings
+        logger.info(
+            f"DKV staging loopback: {pool.bytes_reserved / (1 << 20):.0f} MiB, "
+            f"ring depth {settings['staging_depth']}, "
+            f"{settings['staging_tokens']} staged tokens per iteration")
+
     def _validate_dkv_layer_split_runtime(self) -> None:
         """Validate what the layer-split layout needs beyond the replicated one.
 
@@ -6252,6 +6324,7 @@ class PyExecutor:
                                                 "0") == "1",
             **self.kv_cache_manager.get_dkv_startup_settings(),
         }
+        startup_settings.update(getattr(self, "dkv_staging_settings", {}))
         if getattr(self, "dkv_layer_split", False) is True:
             # Every rank derives the ownership table on its own, so the ranks
             # must agree on it before any of them relies on it.

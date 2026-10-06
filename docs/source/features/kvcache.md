@@ -680,6 +680,24 @@ model. Multi-turn runs on it are listed as invalid by the no-eviction check, bec
 blocks are also removed as a conversation grows; the number of capacity-dropped
 pages, which stays zero, shows that nothing was evicted.
 
+**Staging loopback (DeepSeek-V4).** The layer-split layout runs the attention of a layer on
+a staging area and not on the pages of the cache manager: before the layer, its cached
+pages are copied into its slot of the staging area, and after the layer the pages the new
+tokens wrote are copied back. `TRTLLM_DKV_STAGING_LOOPBACK=1` runs the replicated layout
+through that path, with every rank owning every layer, so the staging path is judged alone
+and without any transfer between ranks. It needs the DeepSeek-V4 cache manager, an FP8 or
+BF16 KV cache (not `fp8_ds_mla` or NVFP4) and `cuda_graph_config: null`. The slots hold the
+cached and the new tokens of one iteration: `TRTLLM_DKV_STAGING_TOKENS` bounds their sum
+over the requests of a rank (default: every request of the batch at `max_seq_len`, which
+no iteration exceeds, so `StagingOverflow` only follows from a lower value). `TRTLLM_DKV_STAGING_DEPTH` sets how many
+layers of a kind can use the staging area at once (default 2).
+`TRTLLM_DKV_STAGING_FILL=nan` overwrites the slots of a layer with NaN before its pages are
+fetched, so a page that the layer reads without it having been fetched or written turns the
+output into NaN. The ranks compare these switches when they start. The loopback gates run
+DeepSeek-V4 with and without it and judge the two groups by the rules above, and a
+layer-level test runs the attention layers on the cache manager and on its staged view and
+requires the same outputs and pages.
+
 **Consistency checks.** The checker always rejects inconsistent enable flags and
 inconsistent process-level settings (the dual-ledger switch, `TLLM_METRICS_ALL_RANKS`,
 and the KV manager backend) at construction. Set `TRTLLM_DKV_DEBUG=1` on every
