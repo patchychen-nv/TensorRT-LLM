@@ -586,7 +586,8 @@ class DkvStreamer:
                     f"{request.context_current_position} cached and {request.context_chunk_size} "
                     f"new tokens, the staged batch has (cached, new) = {staged}"
                 )
-        self._begin()
+        if not self._begun:
+            self._begin()
 
     def on_layer(self, layer: int) -> None:
         """Called at the top of a layer, on the stream of the forward pass."""

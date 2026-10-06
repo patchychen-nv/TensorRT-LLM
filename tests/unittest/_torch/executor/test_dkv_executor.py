@@ -358,6 +358,27 @@ def test_a_staging_area_below_one_request_of_max_seq_len_is_rejected(monkeypatch
         executor._dkv_staging_settings()
 
 
+@pytest.mark.parametrize("checks", [False, True])
+def test_the_plan_is_fingerprinted_only_when_the_checks_are_on(monkeypatch, checks: bool) -> None:
+    fingerprinted = []
+    checked = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.plan_fingerprint",
+        lambda plan: fingerprinted.append(plan) or "fingerprint",
+    )
+    executor = PyExecutor.__new__(PyExecutor)
+    executor._dkv_invariant_checker = SimpleNamespace(
+        enabled=checks, check=lambda *args: checked.append(args)
+    )
+    executor.dkv_streamer = SimpleNamespace(plan_for=lambda requests: "plan")
+    executor._dkv_forward_dummies = []
+    executor.iter_counter = 3
+    batch = SimpleNamespace(context_requests=[], generation_requests=[])
+    assert executor._dkv_plan(batch) == "plan"
+    assert fingerprinted == (["plan"] if checks else [])
+    assert checked == ([(3, "data plane plan", "fingerprint")] if checks else [])
+
+
 def test_the_staged_view_publishes_its_token_budget_to_the_scheduler() -> None:
     executor = _staging_executor()
     executor.model_engine = SimpleNamespace()

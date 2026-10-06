@@ -11,6 +11,7 @@ from tensorrt_llm._torch.pyexecutor.dkv_metrics import (
     DkvMeasurementCounters,
     build_dkv_measurement_report,
 )
+from tensorrt_llm._torch.pyexecutor.dkv_types import LifecycleKey
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _dkv_group_size_of,
@@ -663,6 +664,27 @@ def _snapshot_manager(*, fixed_counts: bool) -> KVCacheManagerV2:
     stats = SimpleNamespace(slot_sizes=(128,), total=8, free=6, evictable=0, available=6)
     manager._dkv_pool_statistics = lambda level: [(None, stats)]
     return manager
+
+
+def test_the_life_cycle_keys_are_read_off_the_config_once(monkeypatch) -> None:
+    keys = [LifecycleKey(False, 128, 0, False), LifecycleKey(False, 0, 0, False)]
+    calls = []
+
+    def layouts(config):
+        calls.append(config)
+        return [SimpleNamespace(key=key) for key in keys]
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.lifecycle_layouts", layouts
+    )
+    manager = _snapshot_manager(fixed_counts=True)
+    del manager._dkv_pool_statistics
+    manager.kv_cache_manager_py_config = object()
+    manager.impl.get_storage_statistics = lambda level: ["first", "second"]
+    for level in range(3):
+        statistics = manager._dkv_pool_statistics(level)
+        assert [key for key, _ in statistics] == sorted(keys)
+    assert len(calls) == 1
 
 
 def test_the_snapshot_of_a_rank_that_holds_some_layers_says_how_many() -> None:

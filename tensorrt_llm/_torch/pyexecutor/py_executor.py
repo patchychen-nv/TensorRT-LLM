@@ -83,7 +83,7 @@ from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dkv import (DkvControlDigest, DkvControlPayload, DkvInvariantChecker,
                   compute_ownership, digest_request_ids, dkv_debug_enabled,
-                  ownership_fingerprint, sync_dkv_control,
+                  owned_layers, ownership_fingerprint, sync_dkv_control,
                   sync_dkv_sample_results, validate_ownership)
 from .dkv_plan import PlanRequest, plan_fingerprint
 from .dwdp import DwdpManager
@@ -6419,8 +6419,10 @@ class PyExecutor:
                 requests.append(
                     PlanRequest(dummy.py_request_id, rank, 0, 1, is_dummy=True))
         plan = self.dkv_streamer.plan_for(requests)
-        self._dkv_invariant_checker.check(self.iter_counter, "data plane plan",
-                                          plan_fingerprint(plan))
+        if self._dkv_invariant_checker.enabled:
+            self._dkv_invariant_checker.check(self.iter_counter,
+                                              "data plane plan",
+                                              plan_fingerprint(plan))
         return plan
 
     def _validate_dkv_layer_split_runtime(self) -> None:
@@ -6450,9 +6452,15 @@ class PyExecutor:
         if sm_version not in (100, 103):
             raise ValueError(
                 f"SM{sm_version} {suffix}; only SM100 and SM103 are supported")
-        validate_ownership(
-            compute_ownership(manager.num_layers, mapping.tp_size),
-            manager.get_layer_life_cycle_keys(), mapping.tp_size)
+        owners = compute_ownership(manager.num_layers, mapping.tp_size)
+        validate_ownership(owners, manager.get_layer_life_cycle_keys(),
+                           mapping.tp_size)
+        expected_layers = owned_layers(owners, self.dist.tp_rank)
+        if tuple(manager.pp_layers) != expected_layers:
+            raise ValueError(
+                f"The cache manager holds layers {list(manager.pp_layers)}, "
+                f"but the ownership table gives this rank {list(expected_layers)}"
+            )
         nccl_moe = sorted({
             type(module.comm).__name__
             for module in self.model_engine.model.modules()

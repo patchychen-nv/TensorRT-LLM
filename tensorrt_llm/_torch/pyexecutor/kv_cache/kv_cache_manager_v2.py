@@ -1303,6 +1303,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # Whether the page counts are fixed per life cycle (``lifecycle_slot_counts``): every pool
     # group then holds one life cycle, and the DKV digest and fingerprints name it by its key.
     _fixed_lifecycle_counts = False
+    # The keys of its life cycles in life cycle id order, read off the config on first use.
+    _dkv_lifecycle_keys: list | None = None
     _dkv_trace_enabled = False
     _dkv_measurement: DkvMeasurementCounters | None = None
     # What the attention backend reads instead of this manager when DKV stages the layers' KV
@@ -4741,7 +4743,11 @@ class KVCacheManagerV2(BaseResourceManager):
         statistics = self.impl.get_storage_statistics(CacheLevel(level))
         if not self._fixed_lifecycle_counts:
             return [(None, entry) for entry in statistics]
-        keys = [layout.key for layout in lifecycle_layouts(self.kv_cache_manager_py_config)]
+        keys = self._dkv_lifecycle_keys
+        if keys is None:
+            keys = self._dkv_lifecycle_keys = [
+                layout.key for layout in lifecycle_layouts(self.kv_cache_manager_py_config)
+            ]
         assert len(keys) == len(statistics), (
             f"{len(statistics)} pool groups at cache level {level} for {len(keys)} life cycles"
         )

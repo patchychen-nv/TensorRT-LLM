@@ -551,6 +551,19 @@ def test_a_staged_batch_that_is_not_the_one_of_the_plan_is_rejected(single) -> N
         streamer.begin_iteration([1], [128], [64], single.spans([(128, 64)]))
 
 
+def test_a_second_begin_of_the_same_iteration_does_not_issue_the_first_fetches_again(
+    single,
+) -> None:
+    streamer = single.streamer
+    single.manager.prepare(1, 128, 128)
+    streamer.set_plan(streamer.plan_for([PlanRequest(1, 0, 128, 128)]))
+    streamer.begin_iteration([1], [128], [128], single.spans([(128, 128)]))
+    copies = streamer.stats.local_copies
+    assert copies > 0
+    streamer.begin_iteration([1], [128], [128], single.spans([(128, 128)]))
+    assert streamer.stats.local_copies == copies
+
+
 def test_the_data_plane_is_idle_only_when_it_is_drained(single) -> None:
     streamer = single.streamer
     single.manager.prepare(1, 0, 128)

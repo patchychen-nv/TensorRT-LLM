@@ -3338,10 +3338,13 @@ class TestDkvRuntimeValidation:
         manager._enable_kv_cache_offload = False
         executor.dkv_layer_split = True
         executor.dist = types.SimpleNamespace(
+            tp_rank=0,
             mapping=types.SimpleNamespace(
                 world_size=world_size or tp_size, tp_size=tp_size, moe_ep_size=tp_size
-            )
+            ),
         )
+        # The layers the ownership table gives rank 0.
+        manager.pp_layers = list(range(43 // tp_size + (1 if 43 % tp_size else 0)))
         model = torch.nn.Module()
         if comm is not None:
             model.moe = torch.nn.Module()
@@ -3392,6 +3395,13 @@ class TestDkvRuntimeValidation:
         executor = self._make_layer_split_executor(tp_size=4, world_size=8)
         with patch(self._SM, return_value=103):
             with pytest.raises(ValueError, match=r"world_size \(8\) other than tp_size \(4\)"):
+                executor._validate_dkv_runtime()
+
+    def test_layer_split_rejects_a_cache_manager_that_holds_other_layers_than_its_table(self):
+        executor = self._make_layer_split_executor(tp_size=4)
+        executor.kv_cache_manager.pp_layers = [0, 1, 2]
+        with patch(self._SM, return_value=103):
+            with pytest.raises(ValueError, match="ownership table gives this rank"):
                 executor._validate_dkv_runtime()
 
     @pytest.mark.parametrize("sm_version", [80, 90, 120])
