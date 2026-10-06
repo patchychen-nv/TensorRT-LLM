@@ -163,6 +163,13 @@ class LoopScript:
     # transfer complete from this iteration on.
     context_only: set[int] = field(default_factory=set)
     transfer_done_iteration: int = 0
+    # Under the layer-split layout every rank sends the layers it owns of a context-only request,
+    # and the request is released once all of them have reported.
+    layer_split: bool = False
+    # Rank -> the iteration from which its transfers complete, instead of ``transfer_done_iteration``.
+    transfer_done_by_rank: dict[int, int] = field(default_factory=dict)
+    # ``(rank, iteration)``: from that iteration on, the transfers of that rank end in an error.
+    transfer_fails: tuple[int, int] | None = None
     # The layer-split layout: the loop plans the data plane of every iteration and drains it.
     streamer: bool = False
     # ``(rank, iteration)`` at which that rank plans without the first request of the batch.
@@ -250,16 +257,25 @@ class RankRun:
 def _attach_transceiver(executor: PyExecutor, script: LoopScript, run: RankRun, record) -> None:
     """Context-only requests send through a mock transceiver and the real coordinator.
 
-    Only the owner's transceiver is ever asked to send or to report status; its transfers
-    complete from ``script.transfer_done_iteration`` on.
+    Only the owner's transceiver is ever asked to send or to report status, unless the script is
+    layer-split, where every rank is. Its transfers complete from ``script.transfer_done_iteration``
+    (or the iteration its rank has in ``script.transfer_done_by_rank``) on, or end in an error from
+    the iteration of ``script.transfer_fails``.
     """
 
     def status(at_least: int) -> CtxTransferStatus:
         run.status_polls += 1
-        if executor.iter_counter < script.transfer_done_iteration:
-            return CtxTransferStatus([], [])
+        rank = executor.dist.tp_rank
         in_transfer = executor.async_transfer_manager.requests_in_transfer()
-        return CtxTransferStatus([rid for rid in run.sends if rid in in_transfer], [])
+        sent = [rid for rid in run.sends if rid in in_transfer]
+        if script.transfer_fails is not None and (
+            rank == script.transfer_fails[0] and executor.iter_counter >= script.transfer_fails[1]
+        ):
+            return CtxTransferStatus([], sent)
+        done_from = script.transfer_done_by_rank.get(rank, script.transfer_done_iteration)
+        if executor.iter_counter < done_from:
+            return CtxTransferStatus([], [])
+        return CtxTransferStatus(sent, [])
 
     def send(request: LlmRequest) -> None:
         run.sends.append(request.py_request_id)
@@ -377,6 +393,7 @@ def build_loop_executor(dist, script: LoopScript, run: RankRun) -> PyExecutor:
         run.events.append((executor.iter_counter, name, value))
 
     pages.on_free = lambda request_id: record("free", request_id)
+    executor.dkv_layer_split = script.layer_split
     if script.context_only:
         _attach_transceiver(executor, script, run, record)
     if script.streamer:
@@ -495,7 +512,9 @@ def build_loop_executor(dist, script: LoopScript, run: RankRun) -> PyExecutor:
     executor._sync_dkv_control = sync_control
     real_handle_errors = executor._handle_errors
 
-    def handle_errors(message, *args, **kwargs):
+    def handle_errors(message=None, *args, **kwargs):
+        # The coordinator names the message ``error_msg``; the loop passes it by position.
+        message = kwargs.pop("error_msg", message)
         requests = kwargs.get("requests")
         run.errors.append(
             (message, tuple(sorted(r.py_request_id for r in requests)) if requests else ())
