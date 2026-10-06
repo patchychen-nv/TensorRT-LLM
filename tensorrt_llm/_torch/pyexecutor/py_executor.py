@@ -28,6 +28,7 @@ except ImportError:
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
+                                 get_sm_version,
                                  get_steady_clock_now_in_seconds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
                                  mpi_disabled, nvtx_range,
@@ -81,7 +82,8 @@ from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dkv import (DkvControlDigest, DkvControlPayload, DkvInvariantChecker,
-                  digest_request_ids, sync_dkv_control, sync_dkv_sample_results)
+                  compute_ownership, digest_request_ids, ownership_fingerprint,
+                  sync_dkv_control, sync_dkv_sample_results, validate_ownership)
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
@@ -408,6 +410,9 @@ class PyExecutor:
     # it as ``getattr(self, "dkv_enabled", False) is True``: unit tests call them on stubs that
     # lack the attribute, and a test double that fabricates it must not enter the DKV path.
     dkv_enabled: bool = False
+    # Whether DKV stores each layer's KV only on its owner rank (``kv_layout="layer_split"``) rather
+    # than on every rank. Read it the same way as ``dkv_enabled``.
+    dkv_layer_split: bool = False
 
     def __init__(
             self,
@@ -564,8 +569,10 @@ class PyExecutor:
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
         # AutoDeploy's LlmArgs does not define dkv_config, hence the getattr.
-        self.dkv_enabled = getattr(self.llm_args, 'dkv_config',
-                                   None) is not None
+        dkv_config = getattr(self.llm_args, 'dkv_config', None)
+        self.dkv_enabled = dkv_config is not None
+        self.dkv_layer_split = (dkv_config is not None
+                                and dkv_config.kv_layout == "layer_split")
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
@@ -6150,7 +6157,12 @@ class PyExecutor:
         if self.attention_dp_enable_balance:
             raise ValueError(
                 "Attention-DP balancing is not supported with dkv_config yet.")
-        if self.kv_cache_manager.enable_block_reuse:
+        layer_split = getattr(self, "dkv_layer_split", False) is True
+        if not self.kv_cache_manager.enable_block_reuse:
+            logger.warning(
+                "DKV block reuse is disabled at runtime; prefix-hit metrics "
+                "will not measure cache reuse.")
+        elif not layer_split:
             logger.warning_once(
                 "DKV block reuse is enabled. A request that reuses a prefix "
                 "computed for a request owned by another rank reads KV content "
@@ -6158,15 +6170,54 @@ class PyExecutor:
                 "Disable kv_cache_config.enable_block_reuse when outputs must "
                 "be correct.",
                 key="dkv_block_reuse_enabled")
-        else:
-            logger.warning(
-                "DKV block reuse is disabled at runtime; prefix-hit metrics "
-                "will not measure cache reuse.")
         mapping = self.dist.mapping
         if mapping.moe_ep_size != mapping.tp_size:
             logger.warning(
                 f"DKV MoE expert parallel size ({mapping.moe_ep_size}) differs "
                 f"from the attention-DP group size ({mapping.tp_size}).")
+        if layer_split:
+            self._validate_dkv_layer_split_runtime()
+
+    def _validate_dkv_layer_split_runtime(self) -> None:
+        """Validate what the layer-split layout needs beyond the replicated one.
+
+        The cache manager must be DeepSeek-V4's, whose KV layout the staging
+        buffers mirror, on a GPU whose attention op reads it directly. Every
+        rank must be able to own layers of all life cycles (K1). The data plane
+        owns the only NCCL traffic that runs during a forward pass, so the MoE
+        layers must not communicate through NCCL themselves.
+        """
+        from ..attention.backends.sparse.deepseek_v4.cache_manager import \
+            DeepseekV4CacheManager
+        from ..moe.fused_moe.communication import AllGatherReduceScatter, NcclEP
+
+        suffix = "is not supported with dkv_config layer_split yet"
+        manager = self.kv_cache_manager
+        if type(manager) is not DeepseekV4CacheManager:
+            raise ValueError(f"{type(manager).__name__} {suffix}; use "
+                             "DeepseekV4CacheManager.")
+        mapping = self.dist.mapping
+        if mapping.world_size != mapping.tp_size:
+            raise ValueError(
+                f"world_size ({mapping.world_size}) other than tp_size "
+                f"({mapping.tp_size}) {suffix}")
+        sm_version = get_sm_version()
+        if sm_version not in (100, 103):
+            raise ValueError(
+                f"SM{sm_version} {suffix}; only SM100 and SM103 are supported")
+        validate_ownership(
+            compute_ownership(manager.num_layers, mapping.tp_size),
+            manager.get_layer_life_cycle_keys(), mapping.tp_size)
+        nccl_moe = sorted({
+            type(module.comm).__name__
+            for module in self.model_engine.model.modules()
+            if isinstance(getattr(module, "comm", None), (
+                AllGatherReduceScatter, NcclEP))
+        })
+        if nccl_moe:
+            raise ValueError(
+                f"MoE communication through {nccl_moe} {suffix}; the MoE layers "
+                "must not share NCCL with the KV data plane")
 
     def _validate_dkv_loop_features(self) -> None:
         """Reject features whose control flow is not replicated, before the first iteration."""
@@ -6195,15 +6246,20 @@ class PyExecutor:
 
     def _initialize_dkv_invariant_checker(self) -> None:
         """Check DKV startup configuration before entering the event loop."""
+        startup_settings = {
+            "dual_ledger": self.scheduler.dkv_dual_ledger_enabled,
+            "metrics_all_ranks": os.environ.get("TLLM_METRICS_ALL_RANKS",
+                                                "0") == "1",
+            **self.kv_cache_manager.get_dkv_startup_settings(),
+        }
+        if getattr(self, "dkv_layer_split", False) is True:
+            # Every rank derives the ownership table on its own, so the ranks
+            # must agree on it before any of them relies on it.
+            startup_settings["layer_ownership"] = ownership_fingerprint(
+                compute_ownership(self.kv_cache_manager.num_layers,
+                                  self.dist.mapping.tp_size))
         self._dkv_invariant_checker = DkvInvariantChecker(
-            self.dist,
-            startup_settings={
-                "dual_ledger":
-                self.scheduler.dkv_dual_ledger_enabled,
-                "metrics_all_ranks":
-                os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1",
-                **self.kv_cache_manager.get_dkv_startup_settings(),
-            })
+            self.dist, startup_settings=startup_settings)
         self._dkv_invariant_checker.check_many(
             -1, {
                 "startup configuration": {

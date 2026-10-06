@@ -226,7 +226,7 @@
         "num_tokens",
         "batch_size"
       ],
-      "capture_policy": "tuple[int|literal]",
+      "capture_policy": "list[tuple[int|literal]]",
       "kind": "categorical",
       "path": "cuda_graph_config.extra_model_inputs.shape"
     },
@@ -282,6 +282,15 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "dkv_config.attention_mode"
+    },
+    {
+      "allowed_values": [
+        "replicated",
+        "layer_split"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "dkv_config.kv_layout"
     },
     {
       "allowed_values": [
@@ -434,7 +443,7 @@
         "num_tokens",
         "batch_size"
       ],
-      "capture_policy": "tuple[int|literal]",
+      "capture_policy": "list[tuple[int|literal]]",
       "kind": "categorical",
       "path": "encoder_cuda_graph_config.extra_model_inputs.shape"
     },

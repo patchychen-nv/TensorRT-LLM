@@ -2045,6 +2045,15 @@ class DkvConfig(StrictBaseModel):
         "group. 'dp': one request is computed wholly on one rank (requires "
         "enable_attention_dp=True). 'sp': 128-token sequence-split compute "
         "(DKVSEP). Not implemented yet.")
+    kv_layout: Literal["replicated", "layer_split"] = Field(
+        default="replicated",
+        description="Where the KV data of the group lives. 'replicated': every "
+        "rank keeps the pages of every layer, but only the pages a rank "
+        "computed hold valid KV, so prefix reuse across ranks is visible "
+        "without its output being valid (a measurement layout). "
+        "'layer_split': each rank keeps only the KV of the layers it owns and "
+        "the compute rank fetches and writes back the rest per layer. Not "
+        "implemented yet.")
 
     @model_validator(mode='after')
     def validate_dkv_config(self) -> 'DkvConfig':
@@ -6773,11 +6782,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 and reuse_policy != "per_request"):
             remedy = "use 'per_request'"
             if reuse_policy != "per_conversation":
-                # Reuse across ranks yields invalid outputs, so a deployment
-                # that needs correct outputs should turn reuse off instead.
-                remedy += (" (outputs of requests that reuse a prefix computed "
-                           "on another rank are not valid), or set "
-                           "kv_cache_config.enable_block_reuse=False")
+                if self.dkv_config.kv_layout == "replicated":
+                    # Reuse across ranks yields invalid outputs, so a
+                    # deployment that needs correct outputs should turn reuse
+                    # off instead.
+                    remedy += (" (outputs of requests that reuse a prefix "
+                               "computed on another rank are not valid)")
+                remedy += ", or set kv_cache_config.enable_block_reuse=False"
             raise ValueError(
                 f"kv_cache_config.block_reuse_config.policy={reuse_policy!r} "
                 f"is not supported with dkv_config yet; {remedy}")
@@ -6806,7 +6817,46 @@ class TorchLlmArgs(BaseLlmArgs):
                     "dkv_config requires a finite kv_transfer_timeout_ms")
             # Replicated transfer completion depends on V2 session retirement.
             transceiver_config.transceiver_runtime = "PYTHON"
+        if self.dkv_config.kv_layout == "layer_split":
+            self._reject_dkv_layer_split_features()
+            raise ValueError(
+                "kv_layout='layer_split' is not supported with dkv_config yet")
         return self
+
+    def _reject_dkv_layer_split_features(self) -> None:
+        """Reject what the layer-split data plane cannot host.
+
+        The data plane is planned on the host and enqueued layer by layer, so
+        it cannot run inside a replayed CUDA graph or a compiled region. Its
+        staging buffers and its page budget follow the DeepSeek-V4 cache
+        layout that thop.attention reads on SM100/SM103.
+        """
+        suffix = "is not supported with dkv_config layer_split yet"
+        if self.cuda_graph_config is not None:
+            raise ValueError(
+                f"cuda_graph_config {suffix}; set cuda_graph_config to null "
+                "(its default is a non-empty CudaGraphConfig)")
+        # A piecewise prefill graph also sets torch_compile_config, so name the
+        # prefill backend first: it is the setting the user chose.
+        if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
+            raise ValueError(f"prefill_cuda_graph_backend {suffix}")
+        if self.torch_compile_config is not None:
+            raise ValueError(f"torch_compile_config {suffix}")
+        if getattr(self.sparse_attention_config, "enable_kv_cache_offload",
+                   False):
+            raise ValueError(
+                f"sparse_attention_config.enable_kv_cache_offload {suffix}")
+        if self.kv_cache_config.dtype in ("fp8_ds_mla", "nvfp4"):
+            raise ValueError(
+                f"kv_cache_config.dtype={self.kv_cache_config.dtype!r} {suffix}"
+            )
+        if os.environ.get("TRTLLM_DKV_DUAL_LEDGER", "1") != "1":
+            raise ValueError(f"TRTLLM_DKV_DUAL_LEDGER=0 {suffix}; the staging "
+                             "budget lives in the dual ledger")
+        transceiver_config = self.cache_transceiver_config
+        if (transceiver_config is not None
+                and transceiver_config.backend is not None):
+            raise ValueError(f"cache_transceiver_config.backend {suffix}")
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
