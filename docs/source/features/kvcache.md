@@ -728,7 +728,9 @@ iteration, and a damaged message is named with its layer, direction and requests
 the check works, `TRTLLM_DKV_FAULT=<iteration or *>:<layer>:<fetch|writeback>[:<flip|zero>[:<rank>]]`
 damages the received messages of one step (`*`: of every iteration). With `TRTLLM_DKV_MEASUREMENT=1` the `dkvMeasurement` of an
 iteration-stats row also carries `data_plane`, the messages and bytes the rank has sent,
-received and copied locally.
+received and copied locally, the host seconds of the hooks of the forward pass (`hook_seconds`:
+what the data plane adds to a pass that is bound by the host) and the host seconds that the end
+of an iteration waited for the data stream (`drain_seconds`).
 
 The tests are `tests/integration/defs/dkv/test_dkv_layer_split.py` (DeepSeek-V4 on two ranks,
 judged against the replicated group by the rules above, and the bursts and the aggregate soak

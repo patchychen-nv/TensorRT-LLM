@@ -27,6 +27,7 @@ the order the plan fixes for every rank, and it orders the data stream with the 
 forward pass by events.
 """
 
+import functools
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -218,7 +219,13 @@ def max_message_bytes(layout: StagingLayout) -> int:
 
 @dataclass
 class DataPlaneStats:
-    """What the data plane of one rank has moved since its streamer was built."""
+    """What the data plane of one rank has moved since its streamer was built, and what it cost.
+
+    ``hook_seconds`` is the host time of the hooks of the forward pass, which run between the
+    launches of its layers and so add to a pass that is bound by the host, and ``drain_seconds`` the
+    host time that ``drain`` waited for the data stream, the part of the data plane that the
+    forward pass did not hide.
+    """
 
     iterations: int = 0
     messages_sent: int = 0
@@ -227,6 +234,27 @@ class DataPlaneStats:
     bytes_received: int = 0
     local_copies: int = 0
     bytes_local: int = 0
+    hook_seconds: float = 0.0
+    drain_seconds: float = 0.0
+
+
+def _timed_hook(method):
+    """Add the host time of a hook of the forward pass to ``stats.hook_seconds``.
+
+    A pass without a plan, as in a warm-up, does nothing and costs nothing.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self._plan is None:
+            return method(self, *args, **kwargs)
+        started = time.perf_counter()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.stats.hook_seconds += time.perf_counter() - started
+
+    return wrapper
 
 
 class _Run(NamedTuple):
@@ -563,6 +591,7 @@ class DkvStreamer:
 
     # ---- hooks of the forward pass --------------------------------------------------------
 
+    @_timed_hook
     def begin_iteration(
         self,
         request_ids: Sequence[int],
@@ -594,6 +623,7 @@ class DkvStreamer:
         if not self._begun:
             self._begin()
 
+    @_timed_hook
     def on_layer(self, layer: int) -> None:
         """Called at the top of a layer, on the stream of the forward pass."""
         plan = self._plan
@@ -615,6 +645,7 @@ class DkvStreamer:
         if fetched is not None:
             stream.wait_event(fetched)
 
+    @_timed_hook
     def end_forward(self) -> None:
         """Called after the last layer: send back what the last layer produced."""
         plan = self._plan
@@ -657,13 +688,15 @@ class DkvStreamer:
         done, self._data_done = self._data_done, None
         if done is None:
             return []
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
         while not done.query():
             if time.monotonic() >= deadline:
                 raise RuntimeError(
                     f"rank {self._rank}: the DKV data plane did not finish within {timeout} s"
                 )
             time.sleep(self._POLL_SECONDS)
+        self.stats.drain_seconds += time.monotonic() - started
         return self._debug.collect() if self._debug is not None else []
 
     # ---- issuing the steps ----------------------------------------------------------------

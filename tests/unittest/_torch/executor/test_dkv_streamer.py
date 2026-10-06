@@ -439,6 +439,8 @@ def test_the_pages_of_every_layer_reach_the_compute_rank_and_come_back(
     assert sum(s.bytes_sent for s in stats) == sum(s.bytes_received for s in stats)
     assert sum(s.messages_sent for s in stats) == sum(s.messages_received for s in stats)
     assert all(s.iterations == scenario.iterations for s in stats)
+    # The hooks of the forward pass and the wait of the drain cost the host some time.
+    assert all(s.hook_seconds > 0 and s.drain_seconds >= 0 for s in stats)
     if group_size > 1:
         assert sum(s.bytes_sent for s in stats) > 0
     assert sum(s.bytes_local for s in stats) > 0
