@@ -5260,12 +5260,11 @@ class TestDkvConfig:
         config.update(kwargs)
         return cls._dkv_args(**config)
 
-    def test_layer_split_is_rejected_until_its_data_plane_exists(self) -> None:
-        with pytest.raises(
-                ValueError,
-                match="kv_layout='layer_split' is not supported with "
-                "dkv_config yet"):
-            self._layer_split_args()
+    def test_layer_split_is_accepted_when_its_data_plane_can_host_the_setup(
+            self) -> None:
+        args = self._layer_split_args()
+        assert args.dkv_config.kv_layout == "layer_split"
+        assert args.cuda_graph_config is None
 
     @pytest.mark.parametrize("kwargs, message", [
         ({

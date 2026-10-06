@@ -31,7 +31,7 @@ from .dkv_precision import (
     precision_placement,
     validate_precision_inputs,
 )
-from .dkv_stats import pool_free_pages
+from .dkv_stats import latest_snapshots, pool_free_pages
 
 # The attention-DP group sizes the gates run at; eight ranks take two four-GPU nodes.
 _GROUP_SIZES = (2, 8)
@@ -162,6 +162,10 @@ def run_aggregate_soak(model: DkvModel, *, iterations: int = 1000, group_size: i
         "forward_iterations": len(by_iteration),
         "baseline_free_blocks": baseline,
         "final_free_blocks": free_pages[-1],
+        # What the data plane of each rank moved, when the layout has one.
+        "data_plane": {
+            snapshot["rank"]: snapshot.get("data_plane") for snapshot in latest_snapshots(stats)
+        },
         "stats": stats,
     }
 

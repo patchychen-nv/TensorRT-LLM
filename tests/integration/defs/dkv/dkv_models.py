@@ -167,6 +167,8 @@ def make_dkv_llm(
     The defaults are the replicated-prefill configuration: V2 KV manager, per-request reuse policy,
     non-overlapped scheduling, no chunked prefill, no CUDA graphs, no autotuner. ``kv_cache``
     overrides ``KvCacheConfig`` fields and ``llm_kwargs`` override the LLM arguments.
+    ``DKV_TEST_KV_LAYOUT=layer_split`` in the environment of the test selects that layout for every
+    DKV LLM the test builds from then on, so a suite runs on it unchanged.
     """
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import KvCacheConfig
@@ -199,7 +201,9 @@ def make_dkv_llm(
         num_postprocess_workers=0,
         enable_iter_perf_stats=True,
         gather_generation_logits=gather_logits,
-        dkv_config=DkvConfig() if dkv else None,
+        dkv_config=DkvConfig(kv_layout=os.environ.get("DKV_TEST_KV_LAYOUT", "replicated"))
+        if dkv
+        else None,
         moe_config=moe_config or MoeConfig(),
         kv_cache_config=KvCacheConfig(**kv_options),
     )

@@ -93,6 +93,13 @@ l0_gb300_multi_gpus:
   - dkv/test_dkv_staging_loopback.py::test_the_staged_path_answers_every_request_of_a_burst_once_and_leaks_nothing[g2] TIMEOUT (60)
   - dkv/test_dkv_staging_loopback.py::test_the_staged_path_answers_every_request_of_a_burst_once_and_leaks_nothing[chunked-g2] TIMEOUT (60)
   - dkv/test_dkv_staging_loopback.py::test_the_staged_path_answers_every_request_of_a_burst_once_and_leaks_nothing[pressure-g2] TIMEOUT (60)
+  # DKV layer split on DeepSeek-V4: each rank keeps the KV of the layers it owns only.
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_like_the_replicated_group[layer-split] TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_like_the_replicated_group[layer-split-nan] TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_keeps_the_aggregate_lifetime_of_a_request TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_every_request_of_a_burst_once_and_leaks_nothing[g2] TIMEOUT (60)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_every_request_of_a_burst_once_and_leaks_nothing[chunked-g2] TIMEOUT (60)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_every_request_of_a_burst_once_and_leaks_nothing[pressure-g2] TIMEOUT (60)
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_v2_kv_events TIMEOUT (15)
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_dkv_v2_kv_events TIMEOUT (15)
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_dkv_v2_kv_events_under_pressure TIMEOUT (25)

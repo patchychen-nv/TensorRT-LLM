@@ -2052,8 +2052,9 @@ class DkvConfig(StrictBaseModel):
         "computed hold valid KV, so prefix reuse across ranks is visible "
         "without its output being valid (a measurement layout). "
         "'layer_split': each rank keeps only the KV of the layers it owns and "
-        "the compute rank fetches and writes back the rest per layer. Not "
-        "implemented yet.")
+        "the compute rank fetches and writes back the rest per layer. It "
+        "needs DeepSeek-V4 on SM100 or SM103, no CUDA graphs and no cache "
+        "transceiver.")
 
     @model_validator(mode='after')
     def validate_dkv_config(self) -> 'DkvConfig':
@@ -6819,8 +6820,6 @@ class TorchLlmArgs(BaseLlmArgs):
             transceiver_config.transceiver_runtime = "PYTHON"
         if self.dkv_config.kv_layout == "layer_split":
             self._reject_dkv_layer_split_features()
-            raise ValueError(
-                "kv_layout='layer_split' is not supported with dkv_config yet")
         return self
 
     def _reject_dkv_layer_split_features(self) -> None:
