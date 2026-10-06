@@ -206,36 +206,51 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Keep sparse and dense lifecycles in separate GPU pools even when slot sizes match.
-    struct PoolGroupKey
-    {
-        std::vector<size_t> slotSizes;
-        bool isSparse = false;
-
-        bool operator<(PoolGroupKey const& other) const
-        {
-            return std::tie(slotSizes, isSparse) < std::tie(other.slotSizes, other.isSparse);
-        }
-    };
-
-    std::map<PoolGroupKey, std::vector<SlotDescVariant>> poolGroups;
-    for (auto& sg : slotGroups)
-    {
-        auto const sizes = sg.slotSizeList();
-        auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
-        bool const isSparse = attn != nullptr && attn->isSparse;
-        poolGroups[{.slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
-    }
-
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.expansion = expansionMap;
 
-    for (auto& [key, variants] : poolGroups)
+    if (config.lifecycleSlotCounts.has_value())
     {
-        SlotDesc sd;
-        sd.variants = std::move(variants);
-        out.slotDescList.push_back(std::move(sd));
+        // Fixed page counts are given per life cycle, so every life cycle is its own pool group, whatever
+        // its slot size. slotGroups is in life cycle id order, which makes the pool group index the life
+        // cycle id.
+        for (auto& sg : slotGroups)
+        {
+            SlotDesc sd;
+            sd.variants.push_back(std::move(sg));
+            out.slotDescList.push_back(std::move(sd));
+        }
+    }
+    else
+    {
+        // Keep sparse and dense lifecycles in separate GPU pools even when slot sizes match.
+        struct PoolGroupKey
+        {
+            std::vector<size_t> slotSizes;
+            bool isSparse = false;
+
+            bool operator<(PoolGroupKey const& other) const
+            {
+                return std::tie(slotSizes, isSparse) < std::tie(other.slotSizes, other.isSparse);
+            }
+        };
+
+        std::map<PoolGroupKey, std::vector<SlotDescVariant>> poolGroups;
+        for (auto& sg : slotGroups)
+        {
+            auto const sizes = sg.slotSizeList();
+            auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
+            bool const isSparse = attn != nullptr && attn->isSparse;
+            poolGroups[{.slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
+        }
+
+        for (auto& [key, variants] : poolGroups)
+        {
+            SlotDesc sd;
+            sd.variants = std::move(variants);
+            out.slotDescList.push_back(std::move(sd));
+        }
     }
 
     // A21: Assert all life_cycle_ids across all SlotDescVariants are unique.
