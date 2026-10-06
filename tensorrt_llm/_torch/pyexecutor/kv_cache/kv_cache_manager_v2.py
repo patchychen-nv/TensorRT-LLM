@@ -134,6 +134,7 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
+from .lifecycle_slot_counts import lifecycle_layouts
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1299,6 +1300,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
     dkv_group_size: int | None = None
+    # Whether the page counts are fixed per life cycle (``lifecycle_slot_counts``): every pool
+    # group then holds one life cycle, and the DKV digest and fingerprints name it by its key.
+    _fixed_lifecycle_counts = False
     _dkv_trace_enabled = False
     _dkv_measurement: DkvMeasurementCounters | None = None
     # What the attention backend reads instead of this manager when DKV stages the layers' KV
@@ -1590,6 +1594,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
+        self._fixed_lifecycle_counts = lifecycle_slot_counts is not None
 
         max_util_for_resume = kv_cache_config.max_util_for_resume
         quota = sys.maxsize
@@ -1620,7 +1625,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # Sync resumable token capacity across ranks so the scheduler produces
         # identical batches. Normalize to tokens because cache costs vary
         # across PP ranks, including fixed per-rank costs.
-        if mapping.world_size > 1:
+        #
+        # Page counts fixed per life cycle replace this: the ranks agree on the counts, not on the
+        # bytes, since a rank that holds fewer layers needs fewer bytes for the same pages.
+        if mapping.world_size > 1 and lifecycle_slot_counts is None:
             dist = Distributed.get(mapping)
             quota = self._sync_device_quota(quota, max_util_for_resume, dist)
 
@@ -4708,13 +4716,35 @@ class KVCacheManagerV2(BaseResourceManager):
                 operation = _measured_dkv_context_operation(self, operation)
             setattr(self, name, _traced_dkv_operation(self, operation))
 
+    def _dkv_pool_statistics(self, level: int) -> list[tuple[object, object]]:
+        """The storage statistics of a cache level, each with the key that names its pool group.
+
+        With page counts fixed per life cycle every pool group holds one life cycle, and the pool
+        group index is the life cycle id. Life cycle ids and pool group numbers depend on the layers
+        a rank holds, so the statistics are named by the semantic key of the life cycle, which does
+        not, and ordered by it. Without fixed counts the pool groups keep their order and have no key.
+        """
+        statistics = self.impl.get_storage_statistics(CacheLevel(level))
+        if not self._fixed_lifecycle_counts:
+            return [(None, entry) for entry in statistics]
+        keys = [layout.key for layout in lifecycle_layouts(self.kv_cache_manager_py_config)]
+        assert len(keys) == len(statistics), (
+            f"{len(statistics)} pool groups at cache level {level} for {len(keys)} life cycles"
+        )
+        return sorted(zip(keys, statistics), key=lambda pair: pair[0])
+
     def get_dkv_startup_settings(self) -> dict[str, object]:
         """Process-level choices that every rank of a DKV group must make identically."""
         return {}
 
     def get_dkv_config_fingerprint(self) -> list[tuple]:
-        """Return rank-independent capacity and layout records for the DKV startup check."""
+        """Return rank-independent capacity and layout records for the DKV startup check.
+
+        With page counts fixed per life cycle the ranks hold different layers, so the records name
+        no layer, byte quota or pool group number: they are the pages of every semantic life cycle.
+        """
         config = self.kv_cache_manager_py_config
+        fixed_counts = self._fixed_lifecycle_counts
         records = [
             ("dkv_group_size", self.dkv_group_size),
             ("tokens_per_block", self.tokens_per_block, config.tokens_per_block),
@@ -4733,21 +4763,27 @@ class KVCacheManagerV2(BaseResourceManager):
             ("max_util_for_resume", config.max_util_for_resume),
             ("reuse", self.enable_block_reuse, str(self.block_reuse_policy)),
         ]
-        for layer in config.layers:
-            records.append(
-                (
-                    "layer",
-                    int(layer.layer_id),
-                    type(layer).__name__,
-                    layer.window_size if isinstance(layer, AttentionLayerConfig) else None,
-                    layer.num_sink_tokens if isinstance(layer, AttentionLayerConfig) else None,
-                    tuple(
-                        (str(buffer.role), buffer.size, buffer.tokens_per_block_override)
-                        for buffer in layer.buffers
-                    ),
+        if not fixed_counts:
+            for layer in config.layers:
+                records.append(
+                    (
+                        "layer",
+                        int(layer.layer_id),
+                        type(layer).__name__,
+                        layer.window_size if isinstance(layer, AttentionLayerConfig) else None,
+                        layer.num_sink_tokens if isinstance(layer, AttentionLayerConfig) else None,
+                        tuple(
+                            (str(buffer.role), buffer.size, buffer.tokens_per_block_override)
+                            for buffer in layer.buffers
+                        ),
+                    )
                 )
-            )
         for level, tier in enumerate(self.impl.cache_tier_list):
+            if fixed_counts:
+                records.append(("tier", level, _CACHE_TIER_NAMES[tier]))
+                for key, stats in self._dkv_pool_statistics(level):
+                    records.append(("pool", level, key, stats.total))
+                continue
             records.append(
                 (
                     "tier",
@@ -4779,8 +4815,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
         for level in range(len(self.impl.cache_tier_list)):
-            for pool, stats in enumerate(self.impl.get_storage_statistics(CacheLevel(level))):
-                records.append(("pool", level, pool, stats.total, stats.free, stats.evictable))
+            for pool, (key, stats) in enumerate(self._dkv_pool_statistics(level)):
+                records.append(
+                    ("pool", level, pool if key is None else key)
+                    + (stats.total, stats.free, stats.evictable)
+                )
         return records
 
     def get_dkv_control_digest(self) -> tuple[int, tuple[tuple[int, ...], ...]]:
@@ -4789,9 +4828,12 @@ class KVCacheManagerV2(BaseResourceManager):
         The public storage counters include recycled slots regardless of CUDA
         event readiness, so the digest does not depend on physical slot IDs or
         device progress. Its size and cost depend only on the configured pools.
+        With page counts fixed per life cycle the pool groups are listed in the
+        order of the semantic keys of their life cycles, so ranks that hold
+        different layers have the same digest.
         """
         free_pages = tuple(
-            tuple(stats.free for stats in self.impl.get_storage_statistics(CacheLevel(level)))
+            tuple(stats.free for _, stats in self._dkv_pool_statistics(level))
             for level in range(len(self.impl.cache_tier_list))
         )
         return self.index_mapper.size(), free_pages
@@ -4827,7 +4869,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     "evictable": stats.evictable,
                     "available": stats.available,
                 }
-                for stats in self.impl.get_storage_statistics(CacheLevel(level))
+                # With page counts fixed per life cycle a pool is named by the semantic key of its
+                # life cycle, which does not depend on the layers of the rank.
+                | ({} if key is None else {"key": list(key)})
+                for key, stats in self._dkv_pool_statistics(level)
             ]
             for level in range(len(self.impl.cache_tier_list))
         ]

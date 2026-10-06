@@ -136,13 +136,21 @@ def _prefix_metrics(counters: dict[str, int]) -> dict:
     }
 
 
+def _pool_signature(pool: dict) -> tuple:
+    """A pool of a replicated manager is told by its slot sizes; a pool named by the semantic key of
+    its life cycle (page counts fixed per life cycle) by that key, since the slot sizes of the same
+    life cycle differ between ranks that hold different layers."""
+    if "key" in pool:
+        return (tuple(pool["key"]), pool["total"])
+    return (tuple(pool["slot_sizes"]), pool["total"])
+
+
 def _capacity_signature(snapshot: dict) -> tuple:
     return (
         snapshot["tokens_per_block"],
         tuple(snapshot["cache_tiers"]),
         tuple(
-            tuple((tuple(pool["slot_sizes"]), pool["total"]) for pool in level)
-            for level in snapshot["pools_by_level"]
+            tuple(_pool_signature(pool) for pool in level) for level in snapshot["pools_by_level"]
         ),
     )
 
