@@ -208,6 +208,14 @@ class StagingLayout:
         """The model layers that have KV of this kind, in increasing order."""
         return self._layers[kind]
 
+    def components_of(self, kind: StagingKind) -> tuple[StagingComponent, ...]:
+        """The buffers a layer holds for ``kind``, in the order their regions are laid out."""
+        return tuple(component for component in self.components if component.kind is kind)
+
+    def kind_page_bytes(self, kind: StagingKind) -> int:
+        """The bytes of one page of every buffer of ``kind``: one block's worth of the kind."""
+        return sum(self.page_bytes(component) for component in self.components_of(kind))
+
     def slot_of(self, layer: int, kind: StagingKind) -> int:
         """The ring slot layer ``layer`` uses for this kind.
 
@@ -384,12 +392,14 @@ class StagingPool:
 
     def __init__(self, layout: StagingLayout, device: torch.device | str | int = "cuda") -> None:
         self.layout = layout
-        self.buffer = torch.empty(layout.total_bytes, dtype=torch.uint8, device=device)
-        if self.buffer.data_ptr() % REGION_ALIGNMENT:
-            raise RuntimeError(
-                f"The staging buffer starts at {self.buffer.data_ptr():#x}, which is not "
-                f"{REGION_ALIGNMENT}-byte aligned"
-            )
+        # A device allocation is aligned far beyond this; a host allocation, which the CPU tests
+        # use, may not be, so the buffer starts at the first aligned address of a slightly larger
+        # allocation.
+        self._allocation = torch.empty(
+            layout.total_bytes + REGION_ALIGNMENT, dtype=torch.uint8, device=device
+        )
+        start = -self._allocation.data_ptr() % REGION_ALIGNMENT
+        self.buffer = self._allocation[start : start + layout.total_bytes]
 
     @property
     def bytes_reserved(self) -> int:
@@ -476,10 +486,15 @@ class DkvStagedKvView:
         self.layer_offsets = {layer: layer for layer in range(num_layers)}
         self.max_attention_window_vec = list(manager.max_attention_window_vec)
         if len(self.max_attention_window_vec) != num_layers:
-            raise NotImplementedError(
-                "The staged view needs the attention windows of every layer; the manager has "
-                f"{len(self.max_attention_window_vec)} of {num_layers}"
-            )
+            # A manager that holds only the layers its rank owns knows their windows. That is the
+            # window of every layer when they all have the same one, as the layers of DeepSeek-V4
+            # do.
+            if len(set(self.max_attention_window_vec)) != 1:
+                raise NotImplementedError(
+                    "The staged view needs the attention windows of every layer; the manager has "
+                    f"{len(self.max_attention_window_vec)} of {num_layers} and they differ"
+                )
+            self.max_attention_window_vec = self.max_attention_window_vec[:1] * num_layers
         component = {(c.kind, c.attention_type): c for c in self.layout.components}
         swa = component[(StagingKind.SWA, DeepseekV4AttentionType.SWA)]
         self.swa_pool_ptr = pool.buffer.data_ptr() + self.layout.region_offset(swa)
