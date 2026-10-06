@@ -28,6 +28,7 @@ buffers (``StagingPool``), the cache manager the attention backend sees when the
 (``DkvPageCopier``). It does not decide when anything is copied.
 """
 
+import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -178,6 +179,26 @@ class StagingOverflow(ValueError):
     """The requests of an iteration do not fit the slots of a kind."""
 
 
+def _memoized(method):
+    """Remember the results of a pure method of a layout, per instance.
+
+    The data plane asks for the same sizes and offsets once per page; the arguments are hashable
+    and the results never change, since a layout is a function of its geometry.
+    """
+    name = f"_memo_{method.__name__}"
+
+    @functools.wraps(method)
+    def wrapper(self, *args):
+        memo = self.__dict__.setdefault(name, {})
+        try:
+            return memo[args]
+        except KeyError:
+            value = memo[args] = method(self, *args)
+            return value
+
+    return wrapper
+
+
 class StagingLayout:
     """Sizes, offsets and block tables of the staging area. A pure function of the geometry."""
 
@@ -208,14 +229,17 @@ class StagingLayout:
         """The model layers that have KV of this kind, in increasing order."""
         return self._layers[kind]
 
+    @_memoized
     def components_of(self, kind: StagingKind) -> tuple[StagingComponent, ...]:
         """The buffers a layer holds for ``kind``, in the order their regions are laid out."""
         return tuple(component for component in self.components if component.kind is kind)
 
+    @_memoized
     def kind_page_bytes(self, kind: StagingKind) -> int:
         """The bytes of one page of every buffer of ``kind``: one block's worth of the kind."""
         return sum(self.page_bytes(component) for component in self.components_of(kind))
 
+    @_memoized
     def slot_of(self, layer: int, kind: StagingKind) -> int:
         """The ring slot layer ``layer`` uses for this kind.
 
@@ -230,6 +254,7 @@ class StagingLayout:
 
     # ---- sizes ----------------------------------------------------------------------------
 
+    @_memoized
     def page_bytes(self, component: StagingComponent) -> int:
         """The bytes of one page of the component; equal to the cache manager's page."""
         geometry = self.geometry
@@ -251,6 +276,7 @@ class StagingLayout:
             rows //= ratio
         return token_bytes * rows
 
+    @_memoized
     def window(self, kind: StagingKind) -> int | None:
         """The window of a windowed kind in tokens, ``None`` for a kind that keeps the history."""
         geometry = self.geometry
@@ -261,6 +287,7 @@ class StagingLayout:
         factor = 2 if is_overlap_compressor(kind.compress_ratio) else 1
         return factor * kind.compress_ratio + geometry.max_draft_len
 
+    @_memoized
     def slot_pages(self, kind: StagingKind) -> int:
         """The pages of one slot: what the requests of any admitted iteration can take together."""
         geometry = self.geometry
@@ -291,6 +318,7 @@ class StagingLayout:
         """Where the component's ring starts in the pool."""
         return self._region_offsets[component]
 
+    @_memoized
     def layer_base_offset(self, layer: int, component: StagingComponent) -> int:
         """The byte offset in the pool of the pages layer ``layer`` is addressed from.
 
@@ -303,6 +331,7 @@ class StagingLayout:
             offset += self.slot_of(layer, component.kind) * self.slot_bytes(component)
         return offset
 
+    @_memoized
     def slot_page_offset(self, layer: int, kind: StagingKind) -> int:
         """The pages to add to the page index of a sliding-window kind for ``layer``'s slot."""
         if kind.shared_page_index:

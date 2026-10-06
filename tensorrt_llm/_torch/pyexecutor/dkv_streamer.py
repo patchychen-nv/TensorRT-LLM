@@ -229,12 +229,17 @@ class DataPlaneStats:
     bytes_local: int = 0
 
 
-class _MessagePage(NamedTuple):
-    """One page of a message: a block of a request in one buffer of a kind."""
+class _Run(NamedTuple):
+    """The pages of a message that one buffer of a kind holds for one request.
+
+    The pages are the blocks ``first`` to ``first + count - 1`` of the request, and the message
+    holds them back to back from byte ``offset``.
+    """
 
     component: StagingComponent
     request_id: int
-    block: int
+    first: int
+    count: int
     offset: int
 
 
@@ -555,7 +560,6 @@ class DkvStreamer:
         self._spans = {}
         self._fetch_done = {}
         self._indices = {}
-        self._page_tables = {}
 
     # ---- hooks of the forward pass --------------------------------------------------------
 
@@ -685,33 +689,33 @@ class DkvStreamer:
 
     def _run(self, op: RankOp) -> None:
         transfer = op.transfer
-        pages = self._message_pages(transfer)
+        layer = transfer.layer
+        runs = self._message_runs(transfer)
         key = message_key(transfer)
         if op.action is OpAction.LOCAL:
             fetch = transfer.direction is Direction.FETCH
-            pool = [self._pool_address(transfer.layer, page) for page in pages]
-            staging = [self._staging_address(transfer.layer, page) for page in pages]
+            pool = [self._pool_addresses(layer, run) for run in runs]
+            staging = [self._staging_addresses(layer, run) for run in runs]
             source, destination = (pool, staging) if fetch else (staging, pool)
             if self._debug is not None:
-                self._checksum_pages(key, "source", transfer.nbytes, pages, source)
-            self._copy(
-                [(page.component, to, at) for page, to, at in zip(pages, destination, source)]
-            )
+                self._checksum_pages(key, "source", transfer.nbytes, runs, source)
+            self._copy(runs, destination, source)
             if self._debug is not None:
-                self._checksum_pages(key, "stored", transfer.nbytes, pages, destination)
+                self._checksum_pages(key, "stored", transfer.nbytes, runs, destination)
             self.stats.local_copies += 1
             self.stats.bytes_local += transfer.nbytes
             return
         sending = op.action is OpAction.SEND
-        page_address = self._pool_address if op.rank == transfer.owner else self._staging_address
+        addresses_of = (
+            self._pool_addresses if op.rank == transfer.owner else self._staging_addresses
+        )
         buffer = self._send_buffer if sending else self._recv_buffer
         message = buffer[: transfer.nbytes]
         base = buffer.data_ptr()
-        page_at = [page_address(transfer.layer, page) for page in pages]
+        page_at = [addresses_of(layer, run) for run in runs]
+        in_message = [self._message_addresses(base, run) for run in runs]
         if sending:
-            self._copy(
-                [(page.component, base + page.offset, at) for page, at in zip(pages, page_at)]
-            )
+            self._copy(runs, in_message, page_at)
             if self._debug is not None:
                 self._debug.checksum(key, "sent", message)
             self._transport.send(message, op.peer, self._data_stream)
@@ -723,52 +727,55 @@ class DkvStreamer:
                 self._debug.corrupt(message, self._fault.kind)
             if self._debug is not None:
                 self._debug.checksum(key, "received", message)
-            self._copy(
-                [(page.component, at, base + page.offset) for page, at in zip(pages, page_at)]
-            )
+            self._copy(runs, page_at, in_message)
             if self._debug is not None:
-                self._checksum_pages(key, "stored", transfer.nbytes, pages, page_at)
+                self._checksum_pages(key, "stored", transfer.nbytes, runs, page_at)
             self.stats.messages_received += 1
             self.stats.bytes_received += transfer.nbytes
 
     def _is_faulty(self, transfer: Transfer) -> bool:
         fault = self._fault
         return (
-            fault.iteration == self._iteration
+            fault.iteration in (None, self._iteration)
             and fault.layer == transfer.layer
             and fault.direction is transfer.direction
             and fault.rank in (None, self._rank)
         )
 
     def _checksum_pages(
-        self, key: tuple, role: str, nbytes: int, pages: Sequence[_MessagePage], addresses
+        self, key: tuple, role: str, nbytes: int, runs: Sequence[_Run], addresses
     ) -> None:
         """Read the pages at ``addresses`` back into the order of a message and checksum them."""
         base = self._scratch.data_ptr()
-        self._copy([(page.component, base + page.offset, at) for page, at in zip(pages, addresses)])
+        self._copy(runs, [self._message_addresses(base, run) for run in runs], addresses)
         self._debug.checksum(key, role, self._scratch[:nbytes])
 
-    def _copy(self, pairs: Sequence[tuple[StagingComponent, int, int]]) -> None:
-        """Copy the pages ``(component, destination, source)``, one launch per page size."""
+    def _copy(self, runs: Sequence[_Run], destinations, sources) -> None:
+        """Copy the pages of each run from its ``sources`` to its ``destinations`` addresses.
+
+        There is one launch per page size, whatever the number of runs.
+        """
         by_size: dict[int, list[tuple[int, int]]] = {}
-        for component, destination, source in pairs:
-            by_size.setdefault(self._layout.page_bytes(component), []).append((destination, source))
+        for run, destination, source in zip(runs, destinations, sources):
+            by_size.setdefault(self._layout.page_bytes(run.component), []).extend(
+                zip(destination, source)
+            )
         stream = self._data_stream.cuda_stream
         for page_bytes, group in by_size.items():
             self._copier.copy(group, page_bytes, stream)
 
     # ---- where the pages are --------------------------------------------------------------
 
-    def _message_pages(self, transfer: Transfer) -> list[_MessagePage]:
+    def _message_runs(self, transfer: Transfer) -> list[_Run]:
         """The pages of a message in the order they are laid out, buffer by buffer in a segment."""
         layout = self._layout
         fetch = transfer.direction is Direction.FETCH
-        pages: list[_MessagePage] = []
+        span_of = layout.fetch_range if fetch else layout.writeback_range
+        runs: list[_Run] = []
         offset = 0
         for segment in transfer.segments:
             request = self._requests[segment.request_id]
             history, chunk = request.context_current_position, request.context_chunk_size
-            span_of = layout.fetch_range if fetch else layout.writeback_range
             first, count = span_of(segment.kind, history, chunk)
             if count != segment.pages:
                 raise RuntimeError(
@@ -776,58 +783,81 @@ class DkvStreamer:
                     f"{segment.pages} {segment.kind.label} pages in the plan, the layout {count}"
                 )
             for component in layout.components_of(segment.kind):
-                page_bytes = layout.page_bytes(component)
-                for block in range(first, first + count):
-                    pages.append(_MessagePage(component, segment.request_id, block, offset))
-                    offset += page_bytes
+                runs.append(_Run(component, segment.request_id, first, count, offset))
+                offset += count * layout.page_bytes(component)
         if offset != transfer.nbytes:
             raise RuntimeError(
                 f"rank {self._rank}: {transfer.label} has {transfer.nbytes} bytes in the plan, "
                 f"the layout {offset}"
             )
-        return pages
+        return runs
 
-    def _pool_address(self, layer: int, page: _MessagePage) -> int:
-        """The address of a page in the cache manager of this rank."""
-        attention_type = page.component.attention_type
-        key = (page.request_id, layer, attention_type)
+    def _message_addresses(self, base: int, run: _Run) -> range:
+        """The addresses of the pages of a run in a message buffer that starts at ``base``."""
+        page_bytes = self._layout.page_bytes(run.component)
+        begin = base + run.offset
+        return range(begin, begin + run.count * page_bytes, page_bytes)
+
+    def _pool_addresses(self, layer: int, run: _Run) -> list[int]:
+        """The addresses of the pages of a run in the cache manager of this rank."""
+        attention_type = run.component.attention_type
+        key = (run.request_id, layer, attention_type)
         indices = self._indices.get(key)
         if indices is None:
-            indices = self._manager.get_cache_indices(page.request_id, layer, attention_type)
+            indices = self._manager.get_cache_indices(run.request_id, layer, attention_type)
             self._indices[key] = indices
-        if page.block >= len(indices) or indices[page.block] == BAD_PAGE_INDEX:
+        chosen = indices[run.first : run.first + run.count]
+        if len(chosen) != run.count or BAD_PAGE_INDEX in chosen:
+            block = next(
+                block
+                for block in range(run.first, run.first + run.count)
+                if block >= len(indices) or indices[block] == BAD_PAGE_INDEX
+            )
             raise RuntimeError(
-                f"rank {self._rank}: the cache manager has no page for block {page.block} of "
-                f"request {page.request_id} in layer {layer} ({attention_type.name}), which the "
+                f"rank {self._rank}: the cache manager has no page for block {block} of "
+                f"request {run.request_id} in layer {layer} ({attention_type.name}), which the "
                 "plan moves"
             )
+        base, stride = self._page_table(layer, attention_type)
+        return [base + index * stride for index in chosen]
+
+    def _page_table(self, layer: int, attention_type) -> tuple[int, int]:
+        """Where the pages of a buffer of the cache manager start and how far apart they are.
+
+        The pools of the cache manager are allocated once, so this is looked up once.
+        """
         table = self._page_tables.get((layer, attention_type))
         if table is None:
             buffer = self._manager.get_buffers(layer, attention_type)
             table = (buffer.data_ptr(), buffer.stride(0) * buffer.element_size())
             self._page_tables[layer, attention_type] = table
-        return table[0] + indices[page.block] * table[1]
+        return table
 
-    def _staging_address(self, layer: int, page: _MessagePage) -> int:
-        """The address of a page in the slot of ``layer`` of this rank."""
+    def _staging_addresses(self, layer: int, run: _Run) -> range:
+        """The addresses of the pages of a run in the slot of ``layer`` of this rank."""
         layout = self._layout
-        component = page.component
-        index = self._local_index.get(page.request_id)
+        component = run.component
+        index = self._local_index.get(run.request_id)
         if index is None:
             raise RuntimeError(
-                f"rank {self._rank}: request {page.request_id} is not in the staged batch"
+                f"rank {self._rank}: request {run.request_id} is not in the staged batch"
             )
         span = self._spans[component.kind][index]
-        if not span.first_block <= page.block < span.first_block + span.num_pages:
+        if not (
+            span.first_block <= run.first
+            and run.first + run.count <= span.first_block + span.num_pages
+        ):
             raise RuntimeError(
-                f"rank {self._rank}: block {page.block} of request {page.request_id} is outside "
-                f"the staged blocks {span.first_block}..{span.first_block + span.num_pages - 1} "
-                f"of {component.kind.label}"
+                f"rank {self._rank}: blocks {run.first}..{run.first + run.count - 1} of request "
+                f"{run.request_id} are outside the staged blocks {span.first_block}.."
+                f"{span.first_block + span.num_pages - 1} of {component.kind.label}"
             )
+        page_bytes = layout.page_bytes(component)
         entry = (
             layout.slot_page_offset(layer, component.kind)
             + span.page_offset
-            + page.block
+            + run.first
             - span.first_block
         )
-        return self._pool.layer_pointer(layer, component) + entry * layout.page_bytes(component)
+        begin = self._pool.layer_pointer(layer, component) + entry * page_bytes
+        return range(begin, begin + run.count * page_bytes, page_bytes)
