@@ -195,9 +195,13 @@ def test_a_kv_stall_is_recovered_in_lockstep_and_every_request_still_completes(
     )
     with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger.warning") as warning:
         runs = run_loop(group_size, script)
-    restarted = {call.args[0].split("request ")[1].split(" ")[0] for call in warning.call_args_list}
+    # The patched logger sees every warning of the process, not only those of this loop.
+    recoveries = [
+        call.args[0] for call in warning.call_args_list if call.args[0].startswith("DKV stall")
+    ]
+    restarted = {message.split("request ")[1].split(" ")[0] for message in recoveries}
     assert restarted == {str(10 + group_size - 1)}, "only the last started request restarts"
-    assert len(warning.call_args_list) == group_size, "every rank logs the same recovery once"
+    assert len(recoveries) == group_size, "every rank logs the same recovery once"
     owners = {10 + rank: rank for rank in range(group_size)}
     assert Counter(request_id for request_id, _ in runs[0].emitted) == Counter(
         dict.fromkeys(owners, 1)
