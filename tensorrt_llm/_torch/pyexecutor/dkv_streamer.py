@@ -308,14 +308,14 @@ class DataPlaneFault:
     """A message to damage after it was received, to see that the checksums notice.
 
     Attributes:
-        iteration: The iteration of the executor.
+        iteration: The iteration of the executor; ``None``: every iteration.
         layer: The layer whose message is damaged.
         direction: Whether the damaged message is a fetch or a writeback.
         kind: ``"flip"`` one byte or ``"zero"`` the message.
         rank: The rank that receives the message; ``None``: whichever receives it.
     """
 
-    iteration: int
+    iteration: int | None
     layer: int
     direction: Direction
     kind: str = "flip"
@@ -323,7 +323,7 @@ class DataPlaneFault:
 
     @classmethod
     def parse(cls, text: str) -> "DataPlaneFault":
-        """Read ``iteration:layer:fetch|writeback[:flip|zero[:rank]]``."""
+        """Read ``iteration|*:layer:fetch|writeback[:flip|zero[:rank]]``."""
         parts = text.split(":")
         try:
             if not 3 <= len(parts) <= 5 or parts[2] not in _DIRECTIONS:
@@ -332,7 +332,7 @@ class DataPlaneFault:
             if kind not in _FAULT_KINDS:
                 raise ValueError
             return cls(
-                int(parts[0]),
+                None if parts[0] == "*" else int(parts[0]),
                 int(parts[1]),
                 _DIRECTIONS[parts[2]],
                 kind,
@@ -340,7 +340,7 @@ class DataPlaneFault:
             )
         except ValueError:
             raise ValueError(
-                f"{text!r} is not iteration:layer:fetch|writeback[:flip|zero[:rank]]"
+                f"{text!r} is not iteration|*:layer:fetch|writeback[:flip|zero[:rank]]"
             ) from None
 
 

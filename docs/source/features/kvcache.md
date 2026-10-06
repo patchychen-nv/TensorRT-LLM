@@ -720,8 +720,8 @@ the data plane at the end of an iteration before it fails; set it below the hang
 timeout. With `TRTLLM_DKV_DEBUG=1` every message is checksummed where it was packed, where it
 arrived and on the pages it was unpacked into, the ranks compare the checksums after every
 iteration, and a damaged message is named with its layer, direction and requests. To see that
-the check works, `TRTLLM_DKV_FAULT=<iteration>:<layer>:<fetch|writeback>[:<flip|zero>[:<rank>]]`
-damages one received message. With `TRTLLM_DKV_MEASUREMENT=1` the `dkvMeasurement` of an
+the check works, `TRTLLM_DKV_FAULT=<iteration or *>:<layer>:<fetch|writeback>[:<flip|zero>[:<rank>]]`
+damages the received messages of one step (`*`: of every iteration). With `TRTLLM_DKV_MEASUREMENT=1` the `dkvMeasurement` of an
 iteration-stats row also carries `data_plane`, the messages and bytes the rank has sent,
 received and copied locally.
 

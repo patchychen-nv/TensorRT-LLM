@@ -694,6 +694,7 @@ def test_the_checksum_depends_on_every_word_and_on_its_position() -> None:
         ("3:7:fetch", DataPlaneFault(3, 7, Direction.FETCH)),
         ("0:2:writeback:zero:1", DataPlaneFault(0, 2, Direction.WRITEBACK, "zero", 1)),
         ("5:0:fetch:flip", DataPlaneFault(5, 0, Direction.FETCH, "flip", None)),
+        ("*:3:writeback", DataPlaneFault(None, 3, Direction.WRITEBACK)),
     ],
 )
 def test_a_fault_is_read_from_its_text(text: str, expected: DataPlaneFault) -> None:
@@ -705,7 +706,7 @@ def test_a_fault_is_read_from_its_text(text: str, expected: DataPlaneFault) -> N
     ["", "1:2", "1:2:both", "a:2:fetch", "1:2:fetch:melt", "1:2:fetch:flip:x", "1:2:3:4:5:6"],
 )
 def test_a_fault_that_is_not_in_the_form_is_rejected(text: str) -> None:
-    with pytest.raises(ValueError, match="iteration:layer"):
+    with pytest.raises(ValueError, match="is not iteration"):
         DataPlaneFault.parse(text)
 
 
