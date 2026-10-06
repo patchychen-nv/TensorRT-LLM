@@ -17,7 +17,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _dkv_measurement_of,
     _measured_dkv_context_operation,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, KVCacheEventManager
 
 pytestmark = pytest.mark.cpu_only
 
@@ -196,6 +196,55 @@ def test_owner_aggregation_and_logical_residency() -> None:
     assert report["storage"]["unique_resident_blocks"] == 2
     assert report["storage"]["duplicate_storage_ratio"] == 0.5
     assert report["validity"]["prefix_hit_rate_proxy_valid"]
+
+
+def _layer_split_rows(held: tuple[int, int] = (22, 21), total: int = 43) -> list[dict]:
+    """Snapshots of a layer-split group: a pool is named by the key of its life cycle, and the slot
+    size of the same life cycle follows the layers of the rank."""
+    rows = [_snapshot(0), _snapshot(1)]
+    for row, layers in zip(rows, held):
+        row["layers_held"], row["layers_total"] = layers, total
+        for pool in row["pools_by_level"][0]:
+            pool["key"] = [False, 1024, 0, False]
+            pool["slot_sizes"] = [128 * layers]
+    return rows
+
+
+def test_a_block_that_every_rank_of_the_layer_split_holds_is_stored_once() -> None:
+    # Each rank holds both blocks, of the layers it owns: one copy of the model across the group.
+    report = _report(_layer_split_rows())
+    storage = report["storage"]
+    assert report["mode"] == "dkv_layer_split"
+    assert storage["resident_block_copies"] == 4
+    assert storage["unique_resident_blocks"] == 2
+    assert storage["duplicate_storage_ratio"] == 0
+    assert report["validity"]["prefix_hit_rate_proxy_valid"]
+
+
+def test_ranks_that_each_hold_every_layer_are_duplicates_in_either_layout() -> None:
+    storage = _report(_layer_split_rows(held=(43, 43)))["storage"]
+    assert storage["duplicate_storage_ratio"] == 0.5
+
+
+def test_the_replicated_layout_has_the_ratio_of_whole_copies() -> None:
+    report = _report()
+    assert report["mode"] == "dkv_replicated"
+    assert report["storage"]["duplicate_storage_ratio"] == 0.5
+
+
+def test_layer_split_ranks_with_other_page_counts_are_not_equal_replicas() -> None:
+    rows = _layer_split_rows()
+    rows[1]["pools_by_level"][0][0]["total"] += 1
+    report = _report(rows)
+    assert not report["validity"]["prefix_hit_rate_proxy_valid"]
+    assert "dkv_replica_capacity_mismatch" in report["validity"]["invalid_reasons"]
+
+
+def test_ranks_that_disagree_on_the_number_of_layers_are_rejected() -> None:
+    rows = _layer_split_rows()
+    rows[1]["layers_total"] = 44
+    with pytest.raises(ValueError, match="number of layers"):
+        _report(rows)
 
 
 def test_token_hit_rate_is_weighted_globally() -> None:
@@ -600,6 +649,30 @@ def test_dkv_state_reads_as_off_for_partial_managers_and_spec_doubles() -> None:
     manager = _manager()
     assert _dkv_group_size_of(manager) == 2
     assert _dkv_measurement_of(manager) is manager._dkv_measurement
+
+
+def _snapshot_manager(*, fixed_counts: bool) -> KVCacheManagerV2:
+    manager = _manager()
+    manager.mapping = SimpleNamespace(tp_rank=1, tp_size=2)
+    manager.impl = SimpleNamespace(cache_tier_list=[CacheTier.GPU_MEM])
+    manager.enable_block_reuse = True
+    manager.tokens_per_block = 128
+    manager.pp_layers = [22, 23, 24]
+    manager.num_layers = 43
+    manager._fixed_lifecycle_counts = fixed_counts
+    stats = SimpleNamespace(slot_sizes=(128,), total=8, free=6, evictable=0, available=6)
+    manager._dkv_pool_statistics = lambda level: [(None, stats)]
+    return manager
+
+
+def test_the_snapshot_of_a_rank_that_holds_some_layers_says_how_many() -> None:
+    snapshot = _snapshot_manager(fixed_counts=True).get_dkv_measurement_snapshot()
+    assert (snapshot["layers_held"], snapshot["layers_total"]) == (3, 43)
+
+
+def test_the_snapshot_of_a_replicated_rank_does_not_count_layers() -> None:
+    snapshot = _snapshot_manager(fixed_counts=False).get_dkv_measurement_snapshot()
+    assert "layers_held" not in snapshot and "layers_total" not in snapshot
 
 
 def _load_runner():

@@ -4891,6 +4891,13 @@ class KVCacheManagerV2(BaseResourceManager):
             for level in range(len(self.impl.cache_tier_list))
         ]
         observed = measurement.iteration_stats_observations > 0
+        # A rank that stores the layers it owns only (page counts fixed per life cycle) says how
+        # much of a copy of a block it holds.
+        layers_held = (
+            {"layers_held": len(self.pp_layers), "layers_total": self.num_layers}
+            if self._fixed_lifecycle_counts
+            else {}
+        )
         return {
             "rank": self.mapping.tp_rank,
             "group_size": self.mapping.tp_size,
@@ -4899,6 +4906,7 @@ class KVCacheManagerV2(BaseResourceManager):
             "tokens_per_block": self.tokens_per_block,
             "cache_tiers": [_CACHE_TIER_NAMES[tier] for tier in self.impl.cache_tier_list],
             "pools_by_level": pools,
+            **layers_held,
             "fresh_page_fill": os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "none"),
             "counters": measurement.snapshot(),
             "last_tier_capacity_dropped_pages": (

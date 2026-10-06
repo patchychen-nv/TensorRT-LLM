@@ -275,12 +275,23 @@ def _event_measurement(
     observable = all(complete) and len(hash_algorithms) <= 1
     copies = sum(map(len, residents))
     unique = len(set().union(*residents))
+    # A rank of the layer-split layout holds a page of every block, but only of the layers it owns.
+    # It stores ``layers_held / layers_total`` of a copy, so the copies add up to one only when every
+    # rank holds the block; a replicated rank stores a whole copy.
+    held = [row.get("layers_held", 1) for row in snapshots]
+    total = {row.get("layers_total", 1) for row in snapshots}
+    if len(total) != 1:
+        raise ValueError("The ranks disagree on the number of layers of the model")
+    (layers,) = total
+    stored = sum(len(resident) * layers_held for resident, layers_held in zip(residents, held))
     return {
         "complete_by_rank": complete,
         "complete": observable,
         "resident_block_copies": copies if observable else None,
         "unique_resident_blocks": unique if observable else None,
-        "duplicate_storage_ratio": _ratio(copies - unique, copies) if observable else None,
+        "duplicate_storage_ratio": (
+            _ratio(stored - unique * layers, stored) if observable else None
+        ),
         "resident_blocks_by_rank": list(map(len, residents)) if observable else None,
         "removed_blocks_by_rank": removed if observable else None,
         "removed_block_copies": sum(removed) if observable else None,
@@ -476,7 +487,11 @@ def build_dkv_measurement_report(
         reasons.append("dkv_replica_capacity_mismatch")
     return {
         "schema_version": 2,
-        "mode": "dkv_replicated" if dkv_enabled else "adp",
+        "mode": (
+            ("dkv_layer_split" if any("layers_held" in row for row in rows) else "dkv_replicated")
+            if dkv_enabled
+            else "adp"
+        ),
         "global": _prefix_metrics(global_counters),
         "load": {
             "scheduled_context_tokens_by_rank": [
@@ -529,7 +544,11 @@ def build_dkv_measurement_report(
                 "matched prefix tokens include every cache tier in storage.tier_scope.tiers; "
                 "no per-tier split is measured"
             ),
-            "duplicate_storage_ratio": "(resident rank copies - distinct blocks) / resident rank copies",
+            "duplicate_storage_ratio": (
+                "(stored copies - distinct blocks) / stored copies, where a rank stores "
+                "layers_held / layers_total of a copy (a whole copy under the replicated layout), "
+                "so it is zero when the layer-split layout holds every block once across the group"
+            ),
             "eviction_proxy": (
                 "removals invalidate the no-eviction proxy conservatively; "
                 "not a physical page eviction count"
