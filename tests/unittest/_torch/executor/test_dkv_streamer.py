@@ -25,6 +25,7 @@ mutations at the end remove one of the events of the streamer and the test has t
 """
 
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -42,7 +43,12 @@ from dkv_fake_dataplane import (
 )
 
 from tensorrt_llm._torch.pyexecutor.dkv import compute_ownership, owned_layers
-from tensorrt_llm._torch.pyexecutor.dkv_plan import Direction, PlanRequest
+from tensorrt_llm._torch.pyexecutor.dkv_plan import (
+    Direction,
+    PlanRequest,
+    build_dkv_plan,
+    layer_types_from_compress_ratios,
+)
 from tensorrt_llm._torch.pyexecutor.dkv_staging import (
     BAD_PAGE_INDEX,
     StagingGeometry,
@@ -168,6 +174,21 @@ class RankReport:
     plans: list = field(default_factory=list)
 
 
+class Stall:
+    """Holds the forward pass of one rank after the attention of one layer until it is released."""
+
+    def __init__(self, rank: int, layer: int) -> None:
+        self.rank = rank
+        self.layer = layer
+        self.reached = threading.Event()
+        self.release = threading.Event()
+
+    def hold(self) -> None:
+        self.reached.set()
+        if not self.release.wait(_TIMEOUT):
+            raise TimeoutError("the stalled forward pass was never released")
+
+
 @dataclass(frozen=True)
 class Options:
     data_jitter: float = 0.0
@@ -180,6 +201,8 @@ class Options:
     # Checksum every message at both ends; ``fault`` damages a message after it was received.
     debug: bool = False
     fault: DataPlaneFault | None = None
+    # Stops the forward pass of one rank in the middle of an iteration.
+    stall: Stall | None = None
 
 
 def _corrupting(transport: FakeTransport, rank: int, options: Options) -> FakeTransport:
@@ -260,6 +283,11 @@ def _run_rank(
             for layer in range(len(_RATIOS)):
                 streamer.on_layer(layer)
                 exec_stream.enqueue(_attention(layer, local, spans, layout, pool))
+                if options.stall is not None and (rank, layer) == (
+                    options.stall.rank,
+                    options.stall.layer,
+                ):
+                    exec_stream.enqueue(options.stall.hold)
             _record_writes(written, batch, layout, manager)
             streamer.end_forward()
             records.append(streamer.drain(_TIMEOUT))
@@ -359,8 +387,10 @@ def _check_owner_pages(rank, layout, manager, written) -> list[str]:
     return problems
 
 
-def run_group(scenario: Scenario, options: Options = Options()) -> list[RankReport]:
-    network = FakeNetwork(scenario.group_size, timeout=_TIMEOUT)
+def run_group(
+    scenario: Scenario, options: Options = Options(), network: FakeNetwork | None = None
+) -> list[RankReport]:
+    network = network or FakeNetwork(scenario.group_size, timeout=_TIMEOUT)
     barrier = threading.Barrier(scenario.group_size)
     reports: list[RankReport | None] = [None] * scenario.group_size
     failures: list[BaseException] = []
@@ -423,6 +453,55 @@ def test_ranks_without_requests_still_serve_the_layers_they_own(group_size: int)
         assert report.errors == [], f"rank {rank}"
     assert reports[group_size - 1].stats.messages_sent > 0
     assert reports[group_size - 1].stats.messages_received > 0
+
+
+def test_a_rank_that_computes_nothing_receives_a_layer_only_after_its_forward_pass_got_there() -> (
+    None
+):
+    """The host of an idle rank runs far ahead of its GPU. A receive that does not wait for the
+    layers before it would start at once and spin on the GPU until the compute rank sends."""
+    group_size, stalled_layer = 2, 6
+    scenario = Scenario(group_size, 2, {1: 100}, {1: 0})
+    owners = compute_ownership(len(_RATIOS), group_size)
+    plan = build_dkv_plan(
+        scenario.batch(0),
+        owners,
+        layer_types_from_compress_ratios(_RATIOS),
+        LayoutCostModel(StagingLayout(_geometry(2))),
+        group_size=group_size,
+        ring_depth=2,
+    )
+
+    def messages(layers) -> int:
+        return sum(len(plan.transfers(Direction.WRITEBACK, layer)) for layer in layers)
+
+    served = [layer for layer in range(len(_RATIOS)) if owners[layer] == 1]
+    # The writeback of layer l is enqueued at the top of layer l + 1, behind the attention of l.
+    reachable = [layer for layer in served if layer < stalled_layer]
+    assert 0 < messages(reachable) < messages(served)
+
+    network = FakeNetwork(group_size, timeout=_TIMEOUT)
+    stall = Stall(rank=1, layer=stalled_layer)
+    outcome: list = []
+
+    def run() -> None:
+        try:
+            outcome.append(run_group(scenario, Options(stall=stall), network))
+        except BaseException as error:  # reported by the assertion below
+            outcome.append(error)
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    assert stall.reached.wait(_TIMEOUT)
+    time.sleep(0.5)  # a data stream that did not wait would have taken every message by now
+    received_while_stalled = len(network.received[0, 1])
+    stall.release.set()
+    runner.join(timeout=60.0)
+    assert not runner.is_alive(), "the group did not finish after the stall was released"
+    assert not isinstance(outcome[0], BaseException), outcome[0]
+    assert [report.errors for report in outcome[0]] == [[], []]
+    assert received_while_stalled == messages(reachable)
+    assert len(network.received[0, 1]) == messages(served)
 
 
 @pytest.mark.parametrize("seed", range(3))

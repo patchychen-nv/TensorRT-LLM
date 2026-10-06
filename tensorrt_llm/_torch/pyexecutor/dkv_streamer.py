@@ -419,7 +419,8 @@ class DkvStreamer:
 
     * the first operation of an iteration waits for the pages of the cache manager to be ready;
     * the operations at the top of layer ``l`` wait for the kernels of the layers before ``l``, so
-      the writeback sends what they produced and the prefetch may overwrite their slots;
+      the writeback sends what they produced and the prefetch may overwrite their slots; a rank
+      that computes nothing waits as well, which keeps it in step with the others;
     * the attention of layer ``l`` waits for the fetch of layer ``l``.
 
     ``drain`` waits on the host for the data stream. After it returns the cache manager may free or
@@ -597,7 +598,12 @@ class DkvStreamer:
         if not self._begun:
             self._begin()
         stream = self._current_stream()
-        if layer >= 1 and self._computes:
+        if layer >= 1:
+            # Also on a rank that computes nothing: the host of an idle rank runs far ahead of its
+            # GPU, and a receive that is enqueued without this wait starts at once and spins for a
+            # message that is not sent before the compute rank reaches the layer. The spinning
+            # kernel holds multiprocessors that the layers of this rank need to get through the MoE
+            # exchange, which the sender of the message waits for.
             self._data_stream.wait_event(stream.record_event())
         for step in plan.layer_steps(layer):
             self._issue(step)
@@ -612,8 +618,7 @@ class DkvStreamer:
             return
         if not self._begun:
             self._begin()
-        if self._computes:
-            self._data_stream.wait_event(self._current_stream().record_event())
+        self._data_stream.wait_event(self._current_stream().record_event())
         for step in plan.end_steps():
             self._issue(step)
         self._data_done = self._data_stream.record_event()

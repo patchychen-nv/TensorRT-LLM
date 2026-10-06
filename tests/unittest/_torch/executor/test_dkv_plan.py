@@ -1185,7 +1185,9 @@ def test_a_sender_that_serves_its_peers_one_after_the_other_deadlocks_in_the_moe
 def test_a_fetch_ahead_of_the_fetch_of_the_layer_whose_slot_it_reuses_deadlocks() -> None:
     """With one slot, the fetch of layer 1 overwrites the slot of layer 0 and so waits for the end
     of layer 0, whose attention waits for the fetch of layer 0 behind it on the data stream. The
-    request has no chunk, so nothing is written back and only the reuse of the slot is at stake."""
+    request has no chunk, so nothing is written back and only the fetches are at stake. Both ends
+    of the message wait for the end of layer 0: the receiver for the slot, and the sender because
+    the fetch is enqueued at the top of layer 1."""
     batch = [PlanRequest(1, 1, 300, 0), PlanRequest(2, 0, 0, 1, is_dummy=True)]
     plan = _plan(batch, (0, 0, 0), (CSA,) * 3, group_size=2, ring_depth=1)
     programs = expand_plan(plan)
@@ -1195,7 +1197,10 @@ def test_a_fetch_ahead_of_the_fetch_of_the_layer_whose_slot_it_reuses_deadlocks(
     assert {ProblemKind.CYCLE, ProblemKind.STEP_ORDER} <= _kinds(report)
     assert not {ProblemKind.UNPAIRED, ProblemKind.SIZE_MISMATCH} & _kinds(report)
     cycle = _text(report, ProblemKind.CYCLE)
-    assert "overwrites the staging slot of an earlier layer" in cycle
+    assert (
+        "overwrites the staging slot of an earlier layer" in cycle
+        or "behind the MoE of the layer before" in cycle
+    )
     assert "F(0)" in cycle and "F(1)" in cycle
 
 
@@ -1301,6 +1306,11 @@ def _completes(plan, programs: Sequence[Sequence]) -> bool:
     finished = [0] * group_size  # the operations of a data stream finish in order
     attention: list[set[int]] = [set() for _ in range(group_size)]
     moe: list[set[int]] = [set() for _ in range(group_size)]
+    # The hook that enqueues the steps; the data stream waits for the layers before the hook.
+    issue_point = {
+        (step.direction, step.layer): step.issue_point
+        for step in global_step_order(num_layers, ring_depth)
+    }
 
     def done(rank: int, index: int) -> bool:
         return index < finished[rank]
@@ -1309,6 +1319,9 @@ def _completes(plan, programs: Sequence[Sequence]) -> bool:
         op = programs[rank][index]
         transfer = op.transfer
         if index != finished[rank]:
+            return False
+        issued = issue_point[(transfer.direction, transfer.layer)]
+        if issued >= 1 and issued - 1 not in moe[rank]:
             return False
         if _writes_slot(op):
             earlier = transfer.layer - ring_depth

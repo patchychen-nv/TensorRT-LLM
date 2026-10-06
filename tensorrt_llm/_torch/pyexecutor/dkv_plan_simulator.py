@@ -43,10 +43,15 @@ The model has two in-order queues per rank.
 * An operation that writes the staging slot of layer ``m`` (a receive or the local gather of
   ``F(m)``) overwrites what layer ``m - ring_depth`` left there. It waits for ``M(m - ring_depth)``
   on its rank and for the operations of ``W(m - ring_depth)`` on its rank, which read the slot.
+* An operation that the hook at the top of layer ``l`` enqueues waits for ``M(l - 1)`` on its rank,
+  because the data stream waits for the kernels enqueued before the hook. Every rank does so, one
+  that computes nothing as well: a receive that started earlier would spin on its GPU for a message
+  that is not sent yet.
 
 Not modeled: the host side of the hooks, which enqueue an operation only after the events it waits
 for are recorded and never block while doing it; communicators other than the one of the data plane;
-and the sharing of the GPU's multiprocessors between kernels.
+and the sharing of the GPU's multiprocessors between kernels (the wait above only keeps a receive
+from spinning for long before its layer).
 
 Usage::
 
@@ -210,10 +215,9 @@ class _Simulation:
         self.plan = plan
         self.programs = [tuple(program) for program in programs]
         self.problems: list[Problem] = []
-        self.step_index = {
-            (step.direction, step.layer): index
-            for index, step in enumerate(global_step_order(plan.num_layers, plan.ring_depth))
-        }
+        order = global_step_order(plan.num_layers, plan.ring_depth)
+        self.step_index = {(step.direction, step.layer): index for index, step in enumerate(order)}
+        self.issue_point = {(step.direction, step.layer): step.issue_point for step in order}
         # (sender, send op index, receiver, receive op index) of every message.
         self.messages: list[tuple[int, int, int, int]] = []
         self.unpaired = False
@@ -431,20 +435,24 @@ class _Simulation:
                 if index:
                     graph.wait(node, node_of[(rank, index - 1)], ("stream", rank, index, 0))
                 if transfer.direction is Direction.FETCH:
-                    if op.action is OpAction.SEND:
-                        continue
-                    graph.wait(
-                        attention[rank][transfer.layer], node, ("needs fetch", rank, index, 0)
-                    )
-                    earlier = transfer.layer - ring_depth
-                    if earlier >= 0:
-                        graph.wait(node, moe[rank][earlier], ("slot free", rank, index, 0))
-                        for reader in readers.get(earlier, ()):
-                            graph.wait(
-                                node, node_of[(rank, reader)], ("slot read", rank, index, reader)
-                            )
+                    if op.action is not OpAction.SEND:
+                        graph.wait(
+                            attention[rank][transfer.layer], node, ("needs fetch", rank, index, 0)
+                        )
+                        earlier = transfer.layer - ring_depth
+                        if earlier >= 0:
+                            graph.wait(node, moe[rank][earlier], ("slot free", rank, index, 0))
+                            for reader in readers.get(earlier, ()):
+                                graph.wait(
+                                    node,
+                                    node_of[(rank, reader)],
+                                    ("slot read", rank, index, reader),
+                                )
                 elif op.action is not OpAction.RECV:
                     graph.wait(node, attention[rank][transfer.layer], ("produced", rank, index, 0))
+                issued = self.issue_point[(transfer.direction, transfer.layer)]
+                if issued >= 1:
+                    graph.wait(node, moe[rank][issued - 1], ("issued after", rank, index, issued))
         return graph
 
     @staticmethod
@@ -557,5 +565,10 @@ class _Simulation:
             return (
                 f"op #{second} on rank {first} overwrites a staging slot that its writeback "
                 f"op #{third} still has to read"
+            )
+        if code == "issued after":
+            return (
+                f"op #{second} on rank {first} is enqueued at the top of layer {third}, behind the "
+                f"MoE of the layer before"
             )
         return f"op #{second} on rank {first} sends what the attention produced"

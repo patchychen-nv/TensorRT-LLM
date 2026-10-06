@@ -122,6 +122,8 @@ class FakeNetwork:
             if source != destination
         }
         self.sent: dict[tuple[int, int], list[int]] = {key: [] for key in self._channels}
+        # The sizes of the messages that the receiver has taken, in the order it took them.
+        self.received: dict[tuple[int, int], list[int]] = {key: [] for key in self._channels}
 
     def channel(
         self, source: int, destination: int
@@ -168,6 +170,7 @@ class FakeTransport:
                         f"which sent {len(payload)}"
                     )
                 buffer.copy_(torch.frombuffer(bytearray(payload), dtype=torch.uint8))
+                network.received[peer, rank].append(len(payload))
             finally:
                 taken.set()
 
