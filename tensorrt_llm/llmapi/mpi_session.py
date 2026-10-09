@@ -405,7 +405,10 @@ class MpiPoolSession(MpiSession):
                 current latency.
             env_overrides: extra environment variables to set in the WORKERS at
                 spawn, on top of the TRTLLM*/TLLM* variables forwarded from the
-                parent. The parent process environment is never touched — this
+                parent; both go into the environment the workers are launched
+                with (Open MPI's spawn info key ``PMIX_ENVAR``), so a variable the CUDA
+                driver reads at initialization takes effect as well. The parent
+                process environment is never touched — this
                 replaces the racy "set os.environ around the spawn, then
                 restore" pattern for callers that spawn pools from background
                 threads.
@@ -570,10 +573,23 @@ class MpiPoolSession(MpiSession):
         python_args = ([
             "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
         ] if isolate_workspace else None)
+        # mpi4py applies ``env`` inside a worker after MPI_Init, which has
+        # initialized CUDA by then: too late for the variables the CUDA driver
+        # reads once, such as CUDA_DEVICE_MAX_CONNECTIONS. The spawn info key
+        # PMIX_ENVAR of Open MPI puts them in the environment the workers are
+        # launched with, one KEY=VALUE per line.
+        launch_env = "\n".join(f"{key}={value}" for key, value in env.items()
+                               if "\n" not in value)
+        spawn_info = {
+            "mpi_info": {
+                "PMIX_ENVAR": launch_env
+            }
+        } if launch_env else {}
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,
-                                        python_args=python_args)
+                                        python_args=python_args,
+                                        **spawn_info)
 
     def __del__(self):
         self.shutdown_abort()

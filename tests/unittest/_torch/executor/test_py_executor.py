@@ -3380,6 +3380,32 @@ class TestDkvRuntimeValidation:
             executor._validate_dkv_runtime()
         assert any("reuse is disabled" in call.args[0] for call in warning.call_args_list)
 
+    @pytest.mark.parametrize(
+        "launch_env, warns",
+        [
+            ({}, True),
+            ({"CUDA_DEVICE_MAX_CONNECTIONS": "8"}, True),
+            ({"CUDA_DEVICE_MAX_CONNECTIONS": "32"}, False),
+        ],
+    )
+    def test_layer_split_warns_when_the_workers_were_launched_with_few_hardware_queues(
+        self, launch_env, warns
+    ):
+        executor = self._make_layer_split_executor()
+        with (
+            patch(self._SM, return_value=103),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.py_executor.launch_environment",
+                return_value=launch_env,
+            ),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as warning,
+        ):
+            executor._validate_dkv_runtime()
+        warned = any(
+            "CUDA_DEVICE_MAX_CONNECTIONS" in call.args[0] for call in warning.call_args_list
+        )
+        assert warned == warns
+
     def test_layer_split_rejects_a_cache_manager_that_is_not_deepseek_v4s(self):
         from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 

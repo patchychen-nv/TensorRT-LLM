@@ -681,3 +681,40 @@ def test_server_close_is_a_noop_without_a_global_executor(
     MPINodeState._global_comm_executor = None
     # Must not touch MPI at all (no abort callable is even constructed).
     RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)
+
+
+@pytest.mark.cpu_only
+def test_mpi_pool_session_launches_workers_with_the_overrides(monkeypatch):
+    """The overrides reach the launch environment of the workers.
+
+    They and the forwarded TRTLLM variables go through the spawn info key
+    ``PMIX_ENVAR``, not only through mpi4py, which applies its env option after
+    MPI_Init has initialized CUDA.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    monkeypatch.setenv("TRTLLM_PROBE_FORWARDED", "yes")
+    captured = {}
+
+    class FakeMpiPoolExecutor:
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor)
+    session = SimpleNamespace(n_workers=2,
+                              _env_overrides={
+                                  "CUDA_DEVICE_MAX_CONNECTIONS": "32",
+                                  "TWO_LINES": "a\nb"
+                              },
+                              mpi_pool=None)
+
+    mpi_session.MpiPoolSession._start_mpi_pool(session)
+
+    lines = captured["mpi_info"]["PMIX_ENVAR"].split("\n")
+    assert "CUDA_DEVICE_MAX_CONNECTIONS=32" in lines
+    assert "TRTLLM_PROBE_FORWARDED=yes" in lines
+    assert not any(line.startswith("TWO_LINES") for line in lines)
+    assert captured["env"]["TWO_LINES"] == "a\nb"

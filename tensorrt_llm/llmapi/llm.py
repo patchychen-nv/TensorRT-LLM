@@ -443,6 +443,16 @@ class BaseLLM:
         self.args.mpi_session = None
         self._owns_mpi_session = self.mpi_session is None
 
+        # Validation may add overrides of its own (DKV layer split sets
+        # CUDA_DEVICE_MAX_CONNECTIONS); the caller's were processed above,
+        # before the arguments existed.
+        added_overrides = {
+            key: value
+            for key, value in (self.args.env_overrides or {}).items()
+            if key not in (env_overrides or {})
+        }
+        self._process_env_overrides(added_overrides or None)
+
         # Build this LLM's post-processing hook for the in-proxy detok path (each
         # postproc worker builds its own). Resolving here fails fast on a bad
         # import path at startup rather than per-request.
@@ -471,8 +481,15 @@ class BaseLLM:
                 mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
                 if not mpi_process_pre_spawned:
                     logger_debug("LLM create MpiPoolSession\n", "yellow")
+                    # Only name the overrides when there are some: the pool
+                    # factory of the test suites hands out a prefetched pool
+                    # for a plain call and spawns anew for any other.
+                    pool_kwargs = {}
+                    if self.args.env_overrides:
+                        pool_kwargs["env_overrides"] = self.args.env_overrides
                     self.mpi_session = MpiPoolSession(
-                        n_workers=self.args.parallel_config.world_size)
+                        n_workers=self.args.parallel_config.world_size,
+                        **pool_kwargs)
                 else:
                     logger_debug("LLM create MpiCommSession\n", "yellow")
                     self.mpi_session = create_mpi_comm_session(

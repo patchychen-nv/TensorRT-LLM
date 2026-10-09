@@ -313,13 +313,21 @@ class SessionReuseCache:
         cache = self
 
         def factory(n_workers, *args, **kwargs):
-            if args or kwargs:  # unknown calling convention: stay out of the way
+            # Unknown calling convention: stay out of the way.
+            if args or set(kwargs) - {"env_overrides"}:
                 print(
                     "[session-reuse] bypassing reuse: MpiPoolSession called with "
                     "unexpected arguments (library signature changed?)",
                     flush=True,
                 )
                 return real_cls(n_workers, *args, **kwargs)
+            if kwargs.get("env_overrides"):
+                # The LLM launches these workers with variables of its own; a cached
+                # pool cannot change the environment its workers started with, so
+                # this pool stays private. wait_shutdown: see rpc_factory.
+                return real_cls(
+                    n_workers=n_workers, wait_shutdown=True, env_overrides=kwargs["env_overrides"]
+                )
             return cache.acquire(real_cls, n_workers)
 
         def rpc_factory(n_workers, *args, **kwargs):

@@ -970,3 +970,20 @@ class ApiStatusRegistry:
 
 set_api_status = ApiStatusRegistry().set_api_status
 get_api_status = ApiStatusRegistry().get_api_status
+
+
+def launch_environment() -> dict[str, str]:
+    """The environment this process was started with, which is what the CUDA driver read.
+
+    Linux keeps it in ``/proc/self/environ``; elsewhere the current environment stands in.
+    """
+    try:
+        with open("/proc/self/environ", "rb") as initial:
+            raw = initial.read()
+    except OSError:
+        return dict(os.environ)
+    pairs = (item.split(b"=", 1) for item in raw.split(b"\0") if b"=" in item)
+    return {
+        key.decode(errors="replace"): value.decode(errors="replace")
+        for key, value in pairs
+    }

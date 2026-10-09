@@ -723,7 +723,15 @@ rank cancels the sends of all.
 for the loopback. `TRTLLM_DKV_TRANSPORT_TIMEOUT_S` (default 60) is how long the host waits for
 the data plane at the end of an iteration before it fails; set it below the hang detector
 timeout. The plan of an iteration is resolved to device addresses once, when the staged batch is
-known, so the hooks of the forward pass only enqueue work. `TRTLLM_DKV_P2P_GROUPS=1` issues the
+known, so the hooks of the forward pass only enqueue work. The LLM launches its workers with
+`CUDA_DEVICE_MAX_CONNECTIONS=32` in their environment (an `env_overrides` entry it adds unless the
+caller set one): the data stream and the stream of the forward pass must not share a hardware queue
+of the GPU, since a forward kernel queued behind a receive that still waits for its peer would wait
+with it. The driver reads the variable once, when a process starts, and hands streams to the queues
+as they are created, so a run can still draw a sharing pair; 32 queues make that much less likely
+than the default 8. Workers launched ahead of time, with `mpirun` or `trtllm-llmapi-launch`, need
+the variable in their launch environment; the executor warns when a worker was launched with fewer
+queues. `TRTLLM_DKV_P2P_GROUPS=1` issues the
 messages a rank sends or receives in one step as one NCCL group, one kernel for all of them; it is
 off by default because a group finishes only when every peer has posted its side, which under a
 concurrent load makes the data stream of an owner, and the forward pass queued behind it, wait for

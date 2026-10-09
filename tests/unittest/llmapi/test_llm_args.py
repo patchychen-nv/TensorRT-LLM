@@ -5313,6 +5313,22 @@ class TestDkvConfig:
             cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"))
         assert args.cache_transceiver_config.backend == "NIXL"
 
+    def test_layer_split_starts_its_workers_with_every_hardware_queue(
+            self) -> None:
+        # A forward kernel queued behind a receive that waits for its peer, on a
+        # hardware queue the two streams share, stalls the forward pass.
+        args = self._layer_split_args()
+        assert args.env_overrides == {"CUDA_DEVICE_MAX_CONNECTIONS": "32"}
+        chosen = self._layer_split_args(env_overrides={
+            "CUDA_DEVICE_MAX_CONNECTIONS": "16",
+            "OTHER": "1"
+        })
+        assert chosen.env_overrides == {
+            "CUDA_DEVICE_MAX_CONNECTIONS": "16",
+            "OTHER": "1"
+        }
+        assert self._dkv_args().env_overrides is None
+
     def test_layer_split_needs_the_dual_ledger(self, monkeypatch) -> None:
         monkeypatch.setenv("TRTLLM_DKV_DUAL_LEDGER", "0")
         with pytest.raises(

@@ -6820,6 +6820,16 @@ class TorchLlmArgs(BaseLlmArgs):
             transceiver_config.transceiver_runtime = "PYTHON"
         if self.dkv_config.kv_layout == "layer_split":
             self._reject_dkv_layer_split_features()
+            # The data stream of the layer-split data plane and the stream of the forward pass
+            # must not share a hardware queue of the GPU: a queue serves its commands in order,
+            # so a forward kernel behind a receive that still waits for its peer would wait with
+            # it. The workers of the LLM are started with the most queues CUDA offers unless the
+            # caller chose a number.
+            overrides = self.env_overrides or {}
+            if "CUDA_DEVICE_MAX_CONNECTIONS" not in overrides:
+                self.env_overrides = {
+                    **overrides, "CUDA_DEVICE_MAX_CONNECTIONS": "32"
+                }
         return self
 
     def _reject_dkv_layer_split_features(self) -> None:

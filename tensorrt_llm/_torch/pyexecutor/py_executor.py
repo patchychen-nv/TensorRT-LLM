@@ -48,8 +48,8 @@ from tensorrt_llm.llmapi._dkv import _validate_dkv_request
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
-from tensorrt_llm.llmapi.utils import \
-    _reapply_current_thread_affinity_to_all_threads
+from tensorrt_llm.llmapi.utils import (
+    _reapply_current_thread_affinity_to_all_threads, launch_environment)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
@@ -6496,6 +6496,19 @@ class PyExecutor:
         if sm_version not in (100, 103):
             raise ValueError(
                 f"SM{sm_version} {suffix}; only SM100 and SM103 are supported")
+        # CUDA gives a process 8 hardware queues unless CUDA_DEVICE_MAX_CONNECTIONS, read
+        # once when the driver initializes, says otherwise; the data stream and the stream of
+        # the forward pass sharing a queue stalls the forward pass behind a receive that waits
+        # for its peer. The LLM launches its workers with 32; workers launched otherwise need
+        # it in their launch environment.
+        connections = launch_environment().get("CUDA_DEVICE_MAX_CONNECTIONS",
+                                               "8")
+        if not connections.isdigit() or int(connections) < 32:
+            logger.warning(
+                f"DKV layer split runs with CUDA_DEVICE_MAX_CONNECTIONS={connections} in "
+                "the launch environment of this worker; the forward pass may stall behind "
+                "the data plane when its stream shares a hardware queue with it. Launch the "
+                "workers with CUDA_DEVICE_MAX_CONNECTIONS=32.")
         owners = compute_ownership(manager.num_layers, mapping.tp_size)
         validate_ownership(owners, manager.get_layer_life_cycle_keys(),
                            mapping.tp_size)
