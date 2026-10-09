@@ -645,7 +645,10 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
             messages_sent=4,
             bytes_sent=4096,
             bytes_local=512,
+            bytes_local_fetch=384,
+            bytes_local_writeback=128,
             hook_seconds=0.25,
+            fetch_wait_seconds=0.0625,
             drain_seconds=0.125,
         )
     )
@@ -659,6 +662,9 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
         "bytes_received": 0,
         "local_copies": 0,
         "bytes_local": 512,
+        "bytes_local_fetch": 384,
+        "bytes_local_writeback": 128,
         "hook_seconds": 0.25,
+        "fetch_wait_seconds": 0.0625,
         "drain_seconds": 0.125,
     }

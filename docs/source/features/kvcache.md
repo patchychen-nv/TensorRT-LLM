@@ -730,7 +730,14 @@ damages the received messages of one step (`*`: of every iteration). With `TRTLL
 iteration-stats row also carries `data_plane`, the messages and bytes the rank has sent,
 received and copied locally, the host seconds of the hooks of the forward pass (`hook_seconds`:
 what the data plane adds to a pass that is bound by the host) and the host seconds that the end
-of an iteration waited for the data stream (`drain_seconds`).
+of an iteration waited for the data stream (`drain_seconds`). Local bytes are also separated into
+`bytes_local_fetch` and `bytes_local_writeback`; their sum is `bytes_local`. Set
+`TRTLLM_DKV_WAIT_TIMING=1` to measure the compute stream's GPU wait for layer fetches with CUDA
+events. The cumulative `fetch_wait_seconds` is collected at the end of each iteration; it is zero
+when the switch is off (the default), which creates no timing events.
+With `TRTLLM_DKV_MEASUREMENT=1`, `control_plane` also reports cumulative host time and call counts
+for S-control (`control_seconds`, `control_calls`) and S-sample (`sample_seconds`, `sample_calls`),
+including time waiting for other ranks. These host timers are disabled otherwise.
 
 The tests are `tests/integration/defs/dkv/test_dkv_layer_split.py` (DeepSeek-V4 on two to eight
 ranks, judged against the replicated group by the rules above: precision with and without chunked

@@ -28,6 +28,7 @@ forward pass by events.
 """
 
 import functools
+import os
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -224,7 +225,8 @@ class DataPlaneStats:
     ``hook_seconds`` is the host time of the hooks of the forward pass, which run between the
     launches of its layers and so add to a pass that is bound by the host, and ``drain_seconds`` the
     host time that ``drain`` waited for the data stream, the part of the data plane that the
-    forward pass did not hide.
+    forward pass did not hide. ``fetch_wait_seconds`` is the GPU time the compute stream spent
+    waiting for layer fetches, measured only with ``TRTLLM_DKV_WAIT_TIMING=1``.
     """
 
     iterations: int = 0
@@ -234,8 +236,11 @@ class DataPlaneStats:
     bytes_received: int = 0
     local_copies: int = 0
     bytes_local: int = 0
+    bytes_local_fetch: int = 0
+    bytes_local_writeback: int = 0
     hook_seconds: float = 0.0
     drain_seconds: float = 0.0
+    fetch_wait_seconds: float = 0.0
 
 
 def _timed_hook(method):
@@ -481,6 +486,7 @@ class DkvStreamer:
         fill: str = "",
         debug: DataPlaneDebug | None = None,
         fault: DataPlaneFault | None = None,
+        timing_event_factory: Callable[[], torch.cuda.Event] | None = None,
     ) -> None:
         """Build the streamer of ``rank``.
 
@@ -498,6 +504,8 @@ class DkvStreamer:
             debug: Checksums every message at both ends and the pages it came from or went to;
                 ``drain`` returns the records for the executor to compare across the ranks.
             fault: A message to damage after it was received; it needs ``debug``.
+            timing_event_factory: Creates a timing-enabled event for fetch waits. Used only with
+                ``TRTLLM_DKV_WAIT_TIMING=1``; CUDA events by default.
         """
         layout = view.layout
         owners = tuple(owner_of_layer)
@@ -520,6 +528,11 @@ class DkvStreamer:
         self._copier = copier or DkvPageCopier()
         self._data_stream = data_stream if data_stream is not None else torch.cuda.Stream()
         self._current_stream = current_stream or torch.cuda.current_stream
+        self._wait_timing = os.environ.get("TRTLLM_DKV_WAIT_TIMING") == "1"
+        self._timing_event_factory = timing_event_factory or functools.partial(
+            torch.cuda.Event, enable_timing=True
+        )
+        self._fetch_wait_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._fill = fill
         self._costs = LayoutCostModel(layout)
         self._layer_types = layer_types_from_compress_ratios(layout.geometry.compress_ratios)
@@ -643,7 +656,14 @@ class DkvStreamer:
             self._issue(step)
         fetched = self._fetch_done.pop(layer, None)
         if fetched is not None:
-            stream.wait_event(fetched)
+            if self._wait_timing:
+                start, end = self._timing_event_factory(), self._timing_event_factory()
+                stream.record_event(start)
+                stream.wait_event(fetched)
+                stream.record_event(end)
+                self._fetch_wait_events.append((start, end))
+            else:
+                stream.wait_event(fetched)
 
     @_timed_hook
     def end_forward(self) -> None:
@@ -697,6 +717,10 @@ class DkvStreamer:
                 )
             time.sleep(self._POLL_SECONDS)
         self.stats.drain_seconds += time.monotonic() - started
+        for start, end in self._fetch_wait_events:
+            end.synchronize()
+            self.stats.fetch_wait_seconds += start.elapsed_time(end) / 1000.0
+        self._fetch_wait_events.clear()
         return self._debug.collect() if self._debug is not None else []
 
     # ---- issuing the steps ----------------------------------------------------------------
@@ -737,6 +761,10 @@ class DkvStreamer:
                 self._checksum_pages(key, "stored", transfer.nbytes, runs, destination)
             self.stats.local_copies += 1
             self.stats.bytes_local += transfer.nbytes
+            if fetch:
+                self.stats.bytes_local_fetch += transfer.nbytes
+            else:
+                self.stats.bytes_local_writeback += transfer.nbytes
             return
         sending = op.action is OpAction.SEND
         addresses_of = (

@@ -27,6 +27,7 @@ mutations at the end remove one of the events of the streamer and the test has t
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -254,6 +255,7 @@ def _run_rank(
         current_stream=lambda: exec_stream,
         debug=HostDataPlaneDebug(data_stream) if options.debug else None,
         fault=options.fault,
+        timing_event_factory=lambda: FakeEvent(enable_timing=True),
     )
     written: dict[tuple[int, int, object], set[int]] = {}
     errors: list[str] = []
@@ -444,6 +446,16 @@ def test_the_pages_of_every_layer_reach_the_compute_rank_and_come_back(
     if group_size > 1:
         assert sum(s.bytes_sent for s in stats) > 0
     assert sum(s.bytes_local for s in stats) > 0
+    for rank, report in enumerate(reports):
+        local_bytes = Counter()
+        for plan in report.plans:
+            for step in plan.steps:
+                for transfer in step.transfers:
+                    if transfer.owner == transfer.compute == rank:
+                        local_bytes[transfer.direction] += transfer.nbytes
+        assert report.stats.bytes_local_fetch == local_bytes[Direction.FETCH]
+        assert report.stats.bytes_local_writeback == local_bytes[Direction.WRITEBACK]
+        assert report.stats.bytes_local == sum(local_bytes.values())
 
 
 @pytest.mark.parametrize("group_size", [2, 3, 4])
@@ -562,7 +574,12 @@ def test_a_byte_flipped_in_a_message_is_noticed(number: int) -> None:
 
 
 class _Single:
-    def __init__(self, ring_depth: int = 2) -> None:
+    def __init__(
+        self,
+        ring_depth: int = 2,
+        *,
+        timing_event_factory: Callable[[], FakeEvent] | None = None,
+    ) -> None:
         self.layout = StagingLayout(_geometry(ring_depth))
         self.pool = StagingPool(self.layout, device="cpu")
         self.owners = compute_ownership(len(_RATIOS), 1)
@@ -579,6 +596,7 @@ class _Single:
             copier=FakeCopier(),
             data_stream=self.data,
             current_stream=lambda: self.exec,
+            timing_event_factory=timing_event_factory,
         )
 
     def spans(self, placement):
@@ -669,6 +687,106 @@ def test_drain_gives_up_when_the_data_stream_never_finishes(single) -> None:
     streamer._data_done = single.data.record_event()
     with pytest.raises(RuntimeError, match="did not finish"):
         streamer.drain(0.05)
+
+
+def test_fetch_wait_timing_brackets_compute_waits_and_accumulates_once_per_iteration(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_DKV_WAIT_TIMING", "1")
+    # Each layer contributes a distinct duration, independent of thread scheduling.
+    durations = [(layer + 1) / 1000.0 for layer in range(len(_RATIOS))]
+    timestamps = iter(
+        timestamp
+        for iteration in range(2)
+        for layer, duration in enumerate(durations)
+        for timestamp in (iteration * 100 + layer, iteration * 100 + layer + duration)
+    )
+    events: list[FakeEvent] = []
+
+    def event_factory() -> FakeEvent:
+        event = FakeEvent(enable_timing=True, clock=lambda: next(timestamps))
+        events.append(event)
+        return event
+
+    rank = _Single(timing_event_factory=event_factory)
+    calls: list[tuple[str, FakeEvent | None]] = []
+    record_event, wait_event = rank.exec.record_event, rank.exec.wait_event
+
+    def record(event: FakeEvent | None = None) -> FakeEvent:
+        calls.append(("record", event))
+        return record_event(event)
+
+    def wait(event: FakeEvent) -> None:
+        calls.append(("wait", event))
+        wait_event(event)
+
+    monkeypatch.setattr(rank.exec, "record_event", record)
+    monkeypatch.setattr(rank.exec, "wait_event", wait)
+    try:
+        streamer = rank.streamer
+        for iteration in range(2):
+            history = iteration * 128
+            rank.manager.prepare(1, history, 128)
+            streamer.set_plan(streamer.plan_for([PlanRequest(1, 0, history, 128)]))
+            streamer.begin_iteration([1], [history], [128], rank.spans([(history, 128)]))
+            for layer in range(len(_RATIOS)):
+                streamer.on_layer(layer)
+                assert calls[-3:] == [
+                    ("record", events[-2]),
+                    ("wait", calls[-2][1]),
+                    ("record", events[-1]),
+                ]
+                assert calls[-2][1] not in events
+            streamer.end_forward()
+            assert streamer.stats.fetch_wait_seconds == pytest.approx(iteration * sum(durations))
+            streamer.drain(5.0)
+            assert streamer.stats.fetch_wait_seconds == pytest.approx(
+                (iteration + 1) * sum(durations)
+            )
+            assert streamer._fetch_wait_events == []
+            streamer.drain(5.0)
+            assert streamer.stats.fetch_wait_seconds == pytest.approx(
+                (iteration + 1) * sum(durations)
+            )
+        assert len(events) == 4 * len(_RATIOS)
+        assert rank.data.errors == rank.exec.errors == []
+    finally:
+        rank.close()
+
+
+@pytest.mark.parametrize("setting", [None, "0"])
+def test_disabled_fetch_wait_timing_creates_no_events(monkeypatch, setting: str | None) -> None:
+    if setting is None:
+        monkeypatch.delenv("TRTLLM_DKV_WAIT_TIMING", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DKV_WAIT_TIMING", setting)
+
+    def forbidden_event() -> FakeEvent:
+        pytest.fail("disabled fetch wait timing must not create timing events")
+
+    rank = _Single(timing_event_factory=forbidden_event)
+    try:
+        streamer = rank.streamer
+        rank.manager.prepare(1, 128, 128)
+        streamer.set_plan(streamer.plan_for([PlanRequest(1, 0, 128, 128)]))
+        streamer.begin_iteration([1], [128], [128], rank.spans([(128, 128)]))
+        for layer in range(len(_RATIOS)):
+            streamer.on_layer(layer)
+        streamer.end_forward()
+        streamer.drain(5.0)
+        assert streamer.stats.fetch_wait_seconds == 0.0
+        assert rank.data.errors == rank.exec.errors == []
+    finally:
+        rank.close()
+
+
+def test_fetch_wait_timing_measures_only_ranks_that_compute(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_DKV_WAIT_TIMING", "1")
+    scenario = Scenario(2, 2, {1: 300}, {1: 0})
+    reports = run_group(scenario, Options(data_jitter=0.001))
+    assert [report.errors for report in reports] == [[], []]
+    assert reports[0].stats.fetch_wait_seconds > 0.0
+    assert reports[1].stats.fetch_wait_seconds == 0.0
 
 
 # The debug checksums: every message at both ends and on the pages it came from or went to

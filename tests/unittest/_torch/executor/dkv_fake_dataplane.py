@@ -40,10 +40,17 @@ from tensorrt_llm._torch.pyexecutor.dkv_staging import BAD_PAGE_INDEX, StagingLa
 class FakeEvent:
     """An event that the stream records when it reaches it."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, enable_timing: bool = False, clock: Callable[[], float] = time.perf_counter
+    ) -> None:
         self._recorded = threading.Event()
+        self._enable_timing = enable_timing
+        self._clock = clock
+        self._timestamp: float | None = None
 
     def record(self) -> None:
+        if self._enable_timing:
+            self._timestamp = self._clock()
         self._recorded.set()
 
     def query(self) -> bool:
@@ -52,6 +59,14 @@ class FakeEvent:
     def wait(self, timeout: float) -> None:
         if not self._recorded.wait(timeout):
             raise TimeoutError("an event was waited for but never recorded")
+
+    def synchronize(self) -> None:
+        self.wait(10.0)
+
+    def elapsed_time(self, end_event: "FakeEvent") -> float:
+        if self._timestamp is None or end_event._timestamp is None:
+            raise RuntimeError("elapsed time requires two recorded timing events")
+        return (end_event._timestamp - self._timestamp) * 1000.0
 
 
 class FakeStream:
@@ -93,8 +108,8 @@ class FakeStream:
     def enqueue(self, work: Callable[[], None]) -> None:
         self._queue.put(work)
 
-    def record_event(self) -> FakeEvent:
-        event = FakeEvent()
+    def record_event(self, event: FakeEvent | None = None) -> FakeEvent:
+        event = event if event is not None else FakeEvent()
         self.enqueue(event.record)
         return event
 
