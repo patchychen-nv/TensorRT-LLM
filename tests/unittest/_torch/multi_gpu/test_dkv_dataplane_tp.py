@@ -97,6 +97,8 @@ class Scenario:
     debug: bool = False
     # The compress ratio of every layer of the model.
     ratios: tuple[int, ...] = tuple(_RATIOS)
+    # Issue the messages of a step as one NCCL group instead of one by one.
+    grouped: bool = False
 
     @classmethod
     def soak(cls, group_size: int, ring_depth: int, iterations: int) -> "Scenario":
@@ -314,6 +316,7 @@ def _probe_rank(scenario: Scenario) -> dict:
         data_stream=data_stream,
         debug=DeviceDataPlaneDebug(data_stream) if scenario.debug else None,
         fault=DataPlaneFault.parse(scenario.fault) if scenario.fault else None,
+        group_messages=scenario.grouped,
     )
     view.dkv_streamer = streamer
     requests: dict[int, LlmRequest] = {}
@@ -415,16 +418,25 @@ _PROMPTS = {1: 300, 2: 700, 3: 150, 4: 1000, 5: 90}
 
 
 @pytest.mark.parametrize("ring_depth", [1, 2, 3])
+@pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("placement", ["spread", "one_rank"])
 @pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
 def test_the_pages_of_every_layer_reach_the_compute_rank_and_come_back(
-    mpi_pool_executor: MPIPoolExecutor, placement: str, ring_depth: int
+    mpi_pool_executor: MPIPoolExecutor, placement: str, ring_depth: int, grouped: bool
 ) -> None:
     group_size = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < group_size:
         pytest.skip(f"Requires {group_size} GPUs")
     ranks = _spread(group_size, _PROMPTS) if placement == "spread" else {rid: 0 for rid in _PROMPTS}
-    scenario = Scenario(group_size, ring_depth, _PROMPTS, ranks, arrival={4: 1, 5: 2}, debug=True)
+    scenario = Scenario(
+        group_size,
+        ring_depth,
+        _PROMPTS,
+        ranks,
+        arrival={4: 1, 5: 2},
+        debug=True,
+        grouped=grouped,
+    )
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * group_size, timeout=900))
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"

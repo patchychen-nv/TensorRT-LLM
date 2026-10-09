@@ -649,6 +649,8 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
             bytes_local_writeback=128,
             hook_seconds=0.25,
             compile_seconds=0.05,
+            copy_seconds=0.03,
+            transport_seconds=0.02,
             fetch_wait_seconds=0.0625,
             drain_seconds=0.125,
         )
@@ -667,6 +669,8 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
         "bytes_local_writeback": 128,
         "hook_seconds": 0.25,
         "compile_seconds": 0.05,
+        "copy_seconds": 0.03,
+        "transport_seconds": 0.02,
         "fetch_wait_seconds": 0.0625,
         "drain_seconds": 0.125,
     }

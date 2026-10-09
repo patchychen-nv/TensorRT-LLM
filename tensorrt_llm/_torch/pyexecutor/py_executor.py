@@ -6382,9 +6382,11 @@ class PyExecutor:
             float(os.environ.get("TRTLLM_DKV_TRANSPORT_TIMEOUT_S", "60")),
             "fault":
             os.environ.get("TRTLLM_DKV_FAULT", ""),
-            # All the messages of a step in one NCCL group; 0 sends them one by one.
+            # 1 issues all the messages of a step in one NCCL group. Off by default: a group
+            # finishes when every peer has posted its side, so under a concurrent load the data
+            # stream of an owner, and the forward pass queued behind it, waits for the slowest peer.
             "p2p_groups":
-            os.environ.get("TRTLLM_DKV_P2P_GROUPS", "1") == "1",
+            os.environ.get("TRTLLM_DKV_P2P_GROUPS", "0") == "1",
         }
         fault = (DataPlaneFault.parse(settings["fault"])
                  if settings["fault"] else None)

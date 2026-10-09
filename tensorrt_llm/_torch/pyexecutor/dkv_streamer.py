@@ -257,10 +257,11 @@ class DataPlaneStats:
     ``hook_seconds`` is the host time of the hooks of the forward pass, which run between the
     launches of its layers and so add to a pass that is bound by the host, and ``drain_seconds`` the
     host time that ``drain`` waited for the data stream, the part of the data plane that the
-    forward pass did not hide. ``compile_seconds``, part of ``hook_seconds``, is the host time that
-    resolved the plan of an iteration to device addresses. ``fetch_wait_seconds`` is the GPU time
-    the compute stream spent waiting for layer fetches, measured only with
-    ``TRTLLM_DKV_WAIT_TIMING=1``.
+    forward pass did not hide. Three parts of ``hook_seconds`` are told apart: ``compile_seconds``
+    resolved the plan of an iteration to device addresses, ``copy_seconds`` was spent inside the
+    page copies and ``transport_seconds`` inside the transport calls; the last two enqueue work
+    on the GPU and wait only when its queue is full. ``fetch_wait_seconds`` is the GPU time the
+    compute stream spent waiting for layer fetches, measured only with ``TRTLLM_DKV_WAIT_TIMING=1``.
     """
 
     iterations: int = 0
@@ -274,6 +275,8 @@ class DataPlaneStats:
     bytes_local_writeback: int = 0
     hook_seconds: float = 0.0
     compile_seconds: float = 0.0
+    copy_seconds: float = 0.0
+    transport_seconds: float = 0.0
     drain_seconds: float = 0.0
     fetch_wait_seconds: float = 0.0
 
@@ -986,17 +989,19 @@ class DkvStreamer:
 
     def _transfer(self, sends: Sequence[_CompiledOp], recvs: Sequence[_CompiledOp]) -> None:
         """Hand the messages of a step to the transport: in one group when it offers one."""
+        started = time.perf_counter()
         if self._group_send_recv is not None:
             self._group_send_recv(
                 [(op.message, op.op.peer) for op in sends],
                 [(op.message, op.op.peer) for op in recvs],
                 self._data_stream,
             )
-            return
-        for op in sends:
-            self._transport.send(op.message, op.op.peer, self._data_stream)
-        for op in recvs:
-            self._transport.recv(op.message, op.op.peer, self._data_stream)
+        else:
+            for op in sends:
+                self._transport.send(op.message, op.op.peer, self._data_stream)
+            for op in recvs:
+                self._transport.recv(op.message, op.op.peer, self._data_stream)
+        self.stats.transport_seconds += time.perf_counter() - started
 
     def _is_faulty(self, transfer: Transfer) -> bool:
         fault = self._fault
@@ -1021,10 +1026,13 @@ class DkvStreamer:
         self._debug.checksum(key, role, self._scratch[:nbytes])
 
     def _copy(self, copies: Sequence[int], stream: int, what: str) -> None:
+        started = time.perf_counter()
         try:
             self._copier.copy_runs(copies, stream)
         except RuntimeError as error:
             raise RuntimeError(f"rank {self._rank}: {what}: {error}") from error
+        finally:
+            self.stats.copy_seconds += time.perf_counter() - started
 
     # ---- where the pages are --------------------------------------------------------------
 
