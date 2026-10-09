@@ -40,6 +40,26 @@ class WorkloadResult:
     prompt_tokens: int
     cached_tokens: int
     latency_s: float
+    ttft_server_s: float | None = None
+    queue_s: float | None = None
+    submitted_at: float | None = None
+    completed_at: float | None = None
+    ttft_server_raw_s: float | None = None
+    queue_raw_s: float | None = None
+    server_timing_error: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkloadCompletion:
+    """One completed response, with an optional timestamp from its response consumer."""
+
+    cached_tokens: int
+    ttft_server_s: float | None = None
+    queue_s: float | None = None
+    completed_at: float | None = None
+    ttft_server_raw_s: float | None = None
+    queue_raw_s: float | None = None
+    server_timing_error: str | None = None
 
 
 _WARMUP_SEED_OFFSET = 1_000_003
@@ -187,10 +207,16 @@ def warmup_prompts(*, count: int, tokens: int, vocab: int, seed: int = 0) -> lis
     return [_tokens(rng, tokens, vocab) for _ in range(count)]
 
 
-def summarize_results(results: Sequence[WorkloadResult]) -> dict:
-    """Totals, hits per turn and latency percentiles of the results of one or more runs.
+def summarize_results(
+    results: Sequence[WorkloadResult],
+    *,
+    elapsed_seconds: float | None = None,
+    computed_context_tokens: int | None = None,
+) -> dict:
+    """Hits, latency percentiles and throughput over the measured request intervals.
 
-    The latencies include the wait behind earlier requests, so they only indicate an order of size.
+    ``computed_context_tokens`` comes from executor scheduling counters. The elapsed time excludes
+    warm-up, priming and waits for the measurement streams to settle between intervals.
     """
     by_turn: dict[int, dict[str, int]] = {}
     for result in results:
@@ -202,15 +228,20 @@ def summarize_results(results: Sequence[WorkloadResult]) -> dict:
         row["cached_tokens"] += result.cached_tokens
     eligible = sum(row["eligible_tokens"] for row in by_turn.values())
     cached = sum(row["cached_tokens"] for row in by_turn.values())
-    latencies = sorted(result.latency_s for result in results)
 
-    def percentile(fraction: float) -> float | None:
-        return (
-            latencies[min(len(latencies) - 1, int(fraction * len(latencies)))]
-            if latencies
-            else None
-        )
+    def percentile(values: Sequence[float], fraction: float) -> float | None:
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))] if ordered else None
 
+    latencies = [result.latency_s for result in results]
+    server = [result.ttft_server_s for result in results if result.ttft_server_s is not None]
+    queues = [result.queue_s for result in results if result.queue_s is not None]
+    timing_errors: dict[str, int] = {}
+    for result in results:
+        if result.server_timing_error is not None:
+            reason = result.server_timing_error
+            timing_errors[reason] = timing_errors.get(reason, 0) + 1
+    duration = elapsed_seconds if elapsed_seconds and elapsed_seconds > 0 else None
     return {
         "requests": len(results),
         "prompt_tokens": sum(result.prompt_tokens for result in results),
@@ -219,8 +250,22 @@ def summarize_results(results: Sequence[WorkloadResult]) -> dict:
         "cached_over_eligible": cached / eligible if eligible else None,
         "by_turn": by_turn,
         "requests_with_cached_tokens": sum(1 for result in results if result.cached_tokens > 0),
-        "latency_p50_s": percentile(0.5),
-        "latency_p99_s": percentile(0.99),
+        **{f"latency_p{p}_s": percentile(latencies, p / 100) for p in (50, 90, 99)},
+        **{f"ttft_client_p{p}_s": percentile(latencies, p / 100) for p in (50, 90, 99)},
+        **{f"ttft_server_p{p}_s": percentile(server, p / 100) for p in (50, 90, 99)},
+        "queue_p99_s": percentile(queues, 0.99),
+        "server_timing_requests": len(server),
+        "server_timing_complete": bool(results) and len(server) == len(results),
+        "server_timing_errors": timing_errors,
+        "ttft_source": "server" if results and len(server) == len(results) else "client",
+        "measured_seconds": elapsed_seconds,
+        "computed_context_tokens": computed_context_tokens,
+        "requests_per_second": len(results) / duration if duration else None,
+        "computed_context_tokens_per_second": (
+            computed_context_tokens / duration
+            if duration and computed_context_tokens is not None
+            else None
+        ),
     }
 
 
@@ -240,18 +285,21 @@ def trace_workload(rows: Sequence[dict]) -> list[WorkloadRequest]:
 
 
 def run_workload(
-    submit: Callable[[WorkloadRequest], Callable[[], int]],
+    submit: Callable[[WorkloadRequest], Callable[[], int | WorkloadCompletion | None]],
     requests: Sequence[WorkloadRequest],
     *,
     concurrency: int,
     completed_turns: Mapping[int, int] | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    idle: Callable[[], None] | None = None,
 ) -> list[WorkloadResult]:
     """Run a workload with at most ``concurrency`` requests in flight.
 
-    ``submit(request)`` starts a request and returns a callable that waits for it and returns the
-    number of prompt tokens served from cache. A request waits for the previous turn of its session
+    ``submit(request)`` starts a request and returns a poll callable: ``None`` means still pending,
+    a ``WorkloadCompletion`` gives the response metrics. A legacy blocking callable returning only
+    cached tokens is also accepted, but cannot measure out-of-order completion. A request waits for
+    the previous turn of its session
     to finish and, when it has an arrival offset, for that offset to pass; offsets count from the
     start of each call. ``completed_turns`` maps a session to the number of its turns an earlier call
     already served, so a closed-loop workload can be run in several consecutive parts.
@@ -260,22 +308,37 @@ def run_workload(
         raise ValueError("concurrency must be positive")
     started = clock()
     pending = sorted(requests, key=lambda request: (request.arrival_s, request.index))
-    in_flight: list[tuple[WorkloadRequest, float, Callable[[], int]]] = []
+    in_flight: list[
+        tuple[WorkloadRequest, float, Callable[[], int | WorkloadCompletion | None]]
+    ] = []
     done_turns: dict[int, int] = dict(completed_turns or {})
     results: dict[int, WorkloadResult] = {}
 
-    def finish(entry) -> None:
-        request, submitted, wait = entry
-        cached = wait()
+    def finish(entry, completion: WorkloadCompletion) -> None:
+        request, submitted, _ = entry
+        finished = completion.completed_at if completion.completed_at is not None else clock()
+        latency = finished - submitted
+        ttft, queue = completion.ttft_server_s, completion.queue_s
+        timing_error = completion.server_timing_error
+        if ttft is not None and ttft > latency:
+            ttft, queue = None, None
+            timing_error = "server_ttft_exceeds_client"
         results[request.index] = WorkloadResult(
             request.index,
             request.session,
             request.turn,
             len(request.prompt),
-            cached,
-            clock() - submitted,
+            completion.cached_tokens,
+            latency,
+            ttft,
+            queue,
+            submitted,
+            finished,
+            completion.ttft_server_raw_s,
+            completion.queue_raw_s,
+            timing_error,
         )
-        done_turns[request.session] = request.turn + 1
+        done_turns[request.session] = max(done_turns.get(request.session, 0), request.turn + 1)
 
     while pending or in_flight:
         ready = next(
@@ -291,7 +354,20 @@ def run_workload(
             pending.remove(ready)
             in_flight.append((ready, clock(), submit(ready)))
         elif in_flight:
-            finish(in_flight.pop(0))
+            completed = []
+            for entry in in_flight:
+                response = entry[2]()
+                if response is not None:
+                    if isinstance(response, int):
+                        response = WorkloadCompletion(response)
+                    finish(entry, response)
+                    completed.append(entry)
+            for entry in completed:
+                in_flight.remove(entry)
+            if idle is not None:
+                idle()
+            if not completed:
+                sleep(0.001)
         else:
             wait = min(request.arrival_s for request in pending) - (clock() - started)
             if wait <= 0:

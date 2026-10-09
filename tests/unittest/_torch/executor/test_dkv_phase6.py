@@ -6,7 +6,9 @@ import dataclasses
 import importlib.util
 import json
 import sys
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -66,6 +68,21 @@ def test_options_survive_a_round_trip_through_json() -> None:
     options = _options(workload="chat", interleave="random", kv_quota_gib=2.0, prime=True)
     again = _RUNNER.Phase6Options(**json.loads(json.dumps(dataclasses.asdict(options))))
     assert again == options
+
+
+def test_worker_timing_and_page_fill_are_opt_in(monkeypatch) -> None:
+    monkeypatch.setattr(
+        _RUNNER,
+        "_dkv_models",
+        lambda: SimpleNamespace(dkv_worker_env=lambda **kwargs: {"TRTLLM_DKV_MEASUREMENT": "1"}),
+    )
+    default = _RUNNER.worker_env("1")
+    assert default["TRTLLM_KV_FRESH_PAGE_FILL"] == "zero"
+    assert "TRTLLM_DKV_WAIT_TIMING" not in default
+    timed = _RUNNER.worker_env("0", "none", timing=True)
+    assert timed["TRTLLM_KV_FRESH_PAGE_FILL"] == ""
+    assert timed["TRTLLM_DKV_WAIT_TIMING"] == "1"
+    assert timed["TRTLLM_DKV_DEBUG"] == "0"
 
 
 def test_requests_and_priming_prompts_follow_the_workload_options() -> None:
@@ -304,6 +321,71 @@ def test_waiting_for_a_request_keeps_draining_the_streams(tmp_path: Path) -> Non
         _RUNNER._await_cached_tokens(_Future(10**9), observer, 0.0)
 
 
+def test_response_poll_consumes_the_queue_and_extracts_server_metrics() -> None:
+    timing = SimpleNamespace(
+        arrival_time=timedelta(seconds=10),
+        first_scheduled_time=timedelta(seconds=10.25),
+        first_token_time=timedelta(seconds=11.5),
+    )
+    answer = SimpleNamespace(
+        cached_tokens=7,
+        outputs=[SimpleNamespace(request_perf_metrics=SimpleNamespace(timing_metrics=timing))],
+    )
+    timeouts = []
+
+    def result(timeout):
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            raise TimeoutError
+        return answer
+
+    future = SimpleNamespace(result=result)
+    assert _RUNNER._poll_response(future, deadline=10, timing=True, clock=lambda: 3) is None
+    completion = _RUNNER._poll_response(future, deadline=10, timing=True, clock=lambda: 4)
+    assert timeouts == [0, 0]
+    assert completion.cached_tokens == 7 and completion.completed_at == 4
+    assert completion.ttft_server_s == 1.5 and completion.queue_s == 0.25
+    assert completion.ttft_server_raw_s == 1.5 and completion.queue_raw_s == 0.25
+    assert completion.server_timing_error is None
+    with pytest.raises(TimeoutError, match="deadline"):
+        _RUNNER._poll_response(_Future(1), deadline=1, timing=False, clock=lambda: 2)
+    answer.outputs[0].request_perf_metrics = None
+    missing = _RUNNER._poll_response(future, deadline=10, timing=True, clock=lambda: 4)
+    assert missing.cached_tokens == 7 and missing.completed_at == 4
+    assert missing.ttft_server_s is None and missing.queue_s is None
+    assert missing.server_timing_error == "missing_server_timing"
+
+
+@pytest.mark.parametrize(
+    ("arrival", "scheduled", "first_token", "reason"),
+    [
+        (10, 10.5, 9, "negative_server_timing"),
+        (10, 9, 11, "negative_server_timing"),
+        (10, 12, 11, "server_queue_exceeds_ttft"),
+        (0, 0, 0, "uninitialized_server_timing"),
+    ],
+)
+def test_invalid_server_timing_retains_raw_evidence_and_client_completion(
+    arrival, scheduled, first_token, reason
+) -> None:
+    timing = SimpleNamespace(
+        arrival_time=timedelta(seconds=arrival),
+        first_scheduled_time=timedelta(seconds=scheduled),
+        first_token_time=timedelta(seconds=first_token),
+    )
+    answer = SimpleNamespace(
+        cached_tokens=5,
+        outputs=[SimpleNamespace(request_perf_metrics=SimpleNamespace(timing_metrics=timing))],
+    )
+    future = SimpleNamespace(result=lambda timeout: answer)
+    completion = _RUNNER._poll_response(future, deadline=10, timing=True, clock=lambda: 4)
+    assert completion.cached_tokens == 5 and completion.completed_at == 4
+    assert completion.ttft_server_s is None and completion.queue_s is None
+    assert completion.ttft_server_raw_s == first_token - arrival
+    assert completion.queue_raw_s == scheduled - arrival
+    assert completion.server_timing_error == reason
+
+
 def _report(
     *,
     hit: float = 0.5,
@@ -442,6 +524,100 @@ def test_the_seed_summary_has_a_column_per_label() -> None:
     assert "| mode | seed0 | seed1 |" in text
     assert "| adp | 0.200 | 0.300 |" in text and "| dkv | 0.900 | 0.800 |" in text
     assert "requests per rank, max / min" in text
+
+
+def test_cost_uses_snapshot_deltas_and_rank_iteration_denominators() -> None:
+    before, after = [], []
+    for rank, iterations in enumerate((2, 4)):
+        data = {
+            "iterations": 10,
+            "hook_seconds": 1.0,
+            "fetch_wait_seconds": 0.1,
+            "drain_seconds": 0.2,
+            "bytes_sent": 1_000_000,
+            "bytes_received": 2_000_000,
+        }
+        control = {
+            "control_seconds": 1.0,
+            "control_calls": 10,
+            "sample_seconds": 2.0,
+            "sample_calls": 10,
+        }
+        before.append({"rank": rank, "data_plane": data, "control_plane": control})
+        after.append(
+            {
+                "rank": rank,
+                "data_plane": {
+                    key: value
+                    + iterations
+                    * {
+                        "iterations": 1,
+                        "hook_seconds": 0.02,
+                        "fetch_wait_seconds": 0.003,
+                        "drain_seconds": 0.001,
+                        "bytes_sent": 3_000_000,
+                        "bytes_received": 4_000_000,
+                    }[key]
+                    for key, value in data.items()
+                },
+                "control_plane": {
+                    "control_seconds": 1.0 + iterations * 0.004,
+                    "control_calls": 10 + iterations,
+                    "sample_seconds": 2.0 + iterations * 0.005,
+                    "sample_calls": 10 + iterations,
+                },
+            }
+        )
+    cost = _TABLES.interval_cost(after, before)
+    assert cost["data_plane"]["iterations"] == 6
+    assert cost["data_plane"]["hook_seconds_per_iteration"] == pytest.approx(0.02)
+    assert cost["data_plane"]["fetch_wait_seconds_per_iteration"] == pytest.approx(0.003)
+    assert cost["data_plane"]["drain_seconds_per_iteration"] == pytest.approx(0.001)
+    assert cost["data_plane"]["mb_sent_per_iteration"] == 3.0
+    assert cost["data_plane"]["mb_received_per_iteration"] == 4.0
+    assert cost["control_plane"]["control_seconds_per_iteration"] == pytest.approx(0.004)
+    assert cost["control_plane"]["sample_seconds_per_iteration"] == pytest.approx(0.005)
+    del before[0]["data_plane"]["fetch_wait_seconds"]
+    assert (
+        _TABLES.interval_cost(after, before)["data_plane"]["fetch_wait_seconds_per_iteration"]
+        is None
+    )
+    after[0]["control_plane"]["control_calls"] = 0
+    with pytest.raises(ValueError, match="reset"):
+        _TABLES.interval_cost(after, before)
+
+
+def test_report_and_summary_include_latency_throughput_and_cost() -> None:
+    result = _result("dkv")
+    result["client"].update(
+        ttft_server_p50_s=0.02,
+        ttft_client_p90_s=0.04,
+        requests_per_second=8.0,
+        computed_context_tokens_per_second=400.0,
+        ttft_source="client",
+        server_timing_requests=3,
+        server_timing_errors={"missing_server_timing": 1},
+    )
+    result["report"]["cost"] = {
+        "data_plane": {"fetch_wait_seconds_per_iteration": 0.0004},
+        "control_plane": {"control_seconds_per_iteration": 0.0012},
+    }
+    for text in (_TABLES.comparison_tables([result]), _TABLES.seed_summary({"one": [result]})):
+        for title in (
+            "TTFT server p50 s",
+            "TTFT client p90 s",
+            "queue p99 s",
+            "requests/s",
+            "computed context tokens/s",
+            "fetch_wait_seconds / rank-iteration",
+            "S-control host seconds / call",
+            "S-sample host seconds / call",
+        ):
+            assert title in text
+        for value in ("0.020000", "0.040000", "8.000000", "400.000000", "0.000400", "0.001200"):
+            assert value in text
+        assert "n/a" in text
+        assert "client; server 3/4; missing_server_timing: 1" in text
 
 
 def test_phases_are_ordered_by_number_and_a_missing_phase_is_a_gap() -> None:
@@ -631,12 +807,19 @@ def test_a_worker_needs_its_options_or_a_model_and_a_mode(tmp_path: Path) -> Non
 def test_a_worker_takes_its_options_from_a_file_or_from_flags(tmp_path: Path, monkeypatch) -> None:
     served = []
     monkeypatch.setattr(_RUNNER, "run_mode", lambda options, out: served.append((options, out)))
-    options = _options(workload="chat", group=8, kv_quota_gib=3.0, mode="adp_kv:1")
+    options = _options(
+        workload="chat",
+        group=8,
+        kv_quota_gib=3.0,
+        mode="adp_kv:1",
+        fresh_page_fill="none",
+        timing=True,
+    )
     path = tmp_path / "options.json"
     path.write_text(json.dumps(dataclasses.asdict(options)))
     assert _RUNNER.main(["worker", "--options", str(path), "--out", str(tmp_path / "a")]) == 0
     flags = ["--model", "model", "--mode", "adp_kv:1", "--group", "8", "--workload", "chat"]
-    flags += ["--kv-quota-gib", "3.0"]
+    flags += ["--kv-quota-gib", "3.0", "--fresh-page-fill", "none", "--timing"]
     assert _RUNNER.main(["worker", *flags, "--out", str(tmp_path / "b")]) == 0
     assert [out for _, out in served] == [tmp_path / "a", tmp_path / "b"]
     assert served[0][0] == served[1][0] == options

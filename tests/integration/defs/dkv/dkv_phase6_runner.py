@@ -15,9 +15,9 @@ process; a group that spans nodes is driven by starting it on every task of the 
 
 The results are hit rates, the context tokens that still had to be computed, the load of every rank
 and the logical duplicate storage, each with the validity controls of
-``build_dkv_measurement_report``. Timing is perturbed by the DKV debug checks and the fresh-page
-fill, so no latency or throughput conclusion can be drawn from a run, and a replicated page that a
-rank did not compute holds no valid KV, so no output is checked either.
+``build_dkv_measurement_report``. Use ``--timing --debug 0 --fresh-page-fill none`` for timing
+experiments. Debug checks and fresh-page filling perturb latency. Output correctness requires a
+separate preflight run for the selected KV layout.
 
 DeepSeek-V4 reuses a prefix only where a stored sequence ended: a shared prefix followed by a
 different suffix never hits, while a conversation's history and a prefix that was sent once on its
@@ -42,6 +42,7 @@ if __package__:
     from . import dkv_phase6_report as tables
     from .dkv_stats import latest_snapshots
     from .dkv_workloads import (
+        WorkloadCompletion,
         WorkloadRequest,
         chat_workload,
         history_hit_ceiling,
@@ -55,6 +56,7 @@ else:
     import dkv_phase6_report as tables
     from dkv_stats import latest_snapshots
     from dkv_workloads import (
+        WorkloadCompletion,
         WorkloadRequest,
         chat_workload,
         history_hit_ceiling,
@@ -128,6 +130,8 @@ class Phase6Options:
     capacity_tolerance_pages: int = 0
     request_timeout: int = 900
     debug: str = "1"
+    fresh_page_fill: Literal["zero", "none"] = "zero"
+    timing: bool = False
 
 
 _OPTION_NAMES = {field.name for field in dataclasses.fields(Phase6Options)}
@@ -211,11 +215,15 @@ def _dkv_models() -> ModuleType:
     return dkv_models
 
 
-def worker_env(debug: str) -> dict[str, str]:
+def worker_env(
+    debug: str, fresh_page_fill: str = "zero", *, timing: bool = False
+) -> dict[str, str]:
     """The DKV switches of the workers, which a group launched through MPI only gets this way."""
     env = _dkv_models().dkv_worker_env(measurement=True)
     env["TRTLLM_DKV_DEBUG"] = debug
-    env["TRTLLM_KV_FRESH_PAGE_FILL"] = "zero"
+    env["TRTLLM_KV_FRESH_PAGE_FILL"] = "" if fresh_page_fill == "none" else fresh_page_fill
+    if timing:
+        env["TRTLLM_DKV_WAIT_TIMING"] = "1"
     return env
 
 
@@ -247,10 +255,10 @@ class Observer:
         for name in ("events", "iteration-stats"):
             (directory / f"{name}.jsonl").unlink(missing_ok=True)
 
-    def pull(self) -> list[dict]:
+    def pull(self, *, timeout: float = _POLL_S) -> list[dict]:
         """Collect what the runtime produced since the last pull; returns the new events."""
-        fresh = [event for event in self._llm.get_kv_cache_events(_POLL_S) if event]
-        rows = self._llm.get_stats(timeout=_POLL_S)
+        fresh = [event for event in self._llm.get_kv_cache_events(timeout) if event]
+        rows = self._llm.get_stats(timeout=timeout)
         self.events.extend(fresh)
         self.stats.extend(rows)
         for name, values in (("events", fresh), ("iteration-stats", rows)):
@@ -294,6 +302,7 @@ class Observer:
 
 class _Answer(Protocol):
     cached_tokens: int
+    outputs: Sequence
 
 
 class _Pending(Protocol):
@@ -310,6 +319,45 @@ def _await_cached_tokens(future: _Pending, observer: Observer, timeout_s: float)
             observer.pull()
             if time.monotonic() > deadline:
                 raise
+
+
+def _poll_response(
+    future: _Pending,
+    *,
+    deadline: float,
+    timing: bool,
+    clock: Callable[[], float] = time.monotonic,
+) -> WorkloadCompletion | None:
+    """Consume ready responses; GenerationResult completion needs its queue to be consumed."""
+    try:
+        answer = future.result(timeout=0)
+    except TimeoutError:
+        if clock() >= deadline:
+            raise TimeoutError("The workload request exceeded its response deadline") from None
+        return None
+    completed_at = clock()
+    ttft, queue = None, None
+    raw_ttft, raw_queue = None, None
+    timing_error = None
+    if timing:
+        metrics = answer.outputs[0].request_perf_metrics
+        if metrics is None or metrics.timing_metrics is None:
+            timing_error = "missing_server_timing"
+        else:
+            timestamps = metrics.timing_metrics
+            raw_ttft = (timestamps.first_token_time - timestamps.arrival_time).total_seconds()
+            raw_queue = (timestamps.first_scheduled_time - timestamps.arrival_time).total_seconds()
+            if raw_ttft < 0 or raw_queue < 0:
+                timing_error = "negative_server_timing"
+            elif raw_queue > raw_ttft:
+                timing_error = "server_queue_exceeds_ttft"
+            elif timestamps.first_token_time.total_seconds() == 0:
+                timing_error = "uninitialized_server_timing"
+            else:
+                ttft, queue = raw_ttft, raw_queue
+    return WorkloadCompletion(
+        answer.cached_tokens, ttft, queue, completed_at, raw_ttft, raw_queue, timing_error
+    )
 
 
 def _load_reference(options: Phase6Options, mode: Mode) -> list[dict] | None:
@@ -393,14 +441,17 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
         "max_num_tokens": options.max_num_tokens,
         "max_seq_len": options.max_seq_len,
         "max_stats_len": -1,
-        "env_overrides": worker_env(options.debug),
+        "env_overrides": worker_env(options.debug, options.fresh_page_fill, timing=options.timing),
+        "return_perf_metrics": options.timing,
     }
     if mode.beta is not None:
         llm_kwargs["attention_dp_config"] = AttentionDpConfig(
             enable_kv_cache_aware_routing=True, kv_cache_routing_load_balance_weight=mode.beta
         )
     moe_config = MoeConfig(backend=options.moe_backend) if options.moe_backend else None
-    sampling = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
+    sampling = SamplingParams(
+        max_tokens=1, temperature=0, ignore_eos=True, return_perf_metrics=options.timing
+    )
     started = time.monotonic()
     print(
         f"WORKER_START mode={mode.name} group={options.group} requests={len(requests)}", flush=True
@@ -426,7 +477,7 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
 
         def report_of(after: list[dict], before: list[dict], events: int, stats: int) -> dict:
             try:
-                return build_dkv_measurement_report(
+                report = build_dkv_measurement_report(
                     after,
                     observer.events,
                     dkv_enabled=mode.dkv,
@@ -436,6 +487,11 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
                     capacity_tolerance_pages=options.capacity_tolerance_pages,
                     iteration_stats=observer.stats[stats:],
                 )
+                report["cost"] = tables.interval_cost(after, before)
+                if not options.timing:
+                    report["cost"]["data_plane"]["fetch_wait_seconds"] = None
+                    report["cost"]["data_plane"]["fetch_wait_seconds_per_iteration"] = None
+                return report
             except ValueError as error:
                 return {"report_error": str(error)}
 
@@ -448,9 +504,10 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
                 for future in futures:
                     _await_cached_tokens(future, observer, options.request_timeout)
 
-        def submit(request: WorkloadRequest) -> Callable[[], int]:
+        def submit(request: WorkloadRequest) -> Callable[[], WorkloadCompletion | None]:
+            deadline = time.monotonic() + options.request_timeout
             future = llm.generate_async(request.prompt, sampling_params=sampling)
-            return lambda: _await_cached_tokens(future, observer, options.request_timeout)
+            return lambda: _poll_response(future, deadline=deadline, timing=options.timing)
 
         # A shared prefix is primed by sending it alone, which is what DeepSeek-V4 can reuse.
         start_all(warm, _WARMUP_SALT)
@@ -465,28 +522,44 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
         completed = prelude
         served: dict[int, int] = {}
         all_results = []
+        measured_seconds = 0.0
         for number, begin in enumerate(range(0, len(requests), size), start=1):
             part = requests[begin : begin + size]
             before = latest_snapshots(observer.stats)
             event_start, stats_start = len(observer.events), len(observer.stats)
             began = time.monotonic()
             results = run_workload(
-                submit, part, concurrency=options.concurrency, completed_turns=served
+                submit,
+                part,
+                concurrency=options.concurrency,
+                completed_turns=served,
+                idle=lambda: observer.pull(timeout=0),
             )
-            seconds = time.monotonic() - began
+            finished = max(result.completed_at for result in results)
+            seconds = finished - began
+            measured_seconds += seconds
             for result in results:
                 served[result.session] = max(served.get(result.session, 0), result.turn + 1)
             completed += len(part)
             after = observer.settle(completed)
             all_results.extend(results)
             name = f"phase{number}"
+            phase_report = report_of(after, before, event_start, stats_start)
             phases[name] = {
                 "requests": len(part),
                 "seconds": seconds,
+                "started_monotonic_s": began,
+                "completed_monotonic_s": finished,
                 "event_start": event_start,
                 "event_end": len(observer.events),
-                "client": summarize_results(results),
-                "report": report_of(after, before, event_start, stats_start),
+                "client": summarize_results(
+                    results,
+                    elapsed_seconds=seconds,
+                    computed_context_tokens=phase_report.get("global", {}).get(
+                        "scheduled_context_tokens"
+                    ),
+                ),
+                "report": phase_report,
             }
             (directory / f"{name}-snapshots.json").write_text(
                 json.dumps({"before": before, "after": after}, indent=1)
@@ -501,12 +574,13 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
         total = report_of(latest_snapshots(observer.stats), initial, initial_events, initial_stats)
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "options": dataclasses.asdict(options),
         "mode": dataclasses.asdict(mode),
         "kv_cache_capacity": capacity,
         "build_seconds": build_seconds,
         "wall_seconds": time.monotonic() - started,
+        "measured_seconds": measured_seconds,
         "workload": {
             "kind": options.workload,
             "requests": len(requests),
@@ -519,21 +593,16 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
         },
         "phases": phases,
         "report": total,
-        "client": summarize_results(all_results),
-        "requests": [
-            {
-                "index": r.index,
-                "session": r.session,
-                "turn": r.turn,
-                "prompt_tokens": r.prompt_tokens,
-                "cached_tokens": r.cached_tokens,
-                "latency_s": r.latency_s,
-            }
-            for r in all_results
-        ],
+        "client": summarize_results(
+            all_results,
+            elapsed_seconds=measured_seconds,
+            computed_context_tokens=total.get("global", {}).get("scheduled_context_tokens"),
+        ),
+        "requests": [dataclasses.asdict(result) for result in all_results],
         "output_correctness_validated": False,
-        "interpretation": "Prefix metadata, load and logical storage only; cross-rank reuse "
-        "outputs are wrong by design",
+        "timing_enabled": options.timing,
+        "interpretation": "Output correctness requires a separate preflight. Timing excludes "
+        "warm-up, priming and inter-phase stream settling; client TTFT uses one output token.",
     }
     (directory / "result.json").write_text(json.dumps(result, indent=1))
     print("WORKER_DONE", flush=True)
@@ -567,7 +636,7 @@ def run_modes(
         PYTHONDONTWRITEBYTECODE="1",
         CUDA_VISIBLE_DEVICES=gpus or ",".join(str(index) for index in range(options.group)),
     )
-    env.update(worker_env(options.debug))
+    env.update(worker_env(options.debug, options.fresh_page_fill, timing=options.timing))
     env["PYTHONPATH"] = os.pathsep.join([str(Path(__file__).parent), env.get("PYTHONPATH", "")])
     env.pop("TLLM_WORKER_USE_SINGLE_PROCESS", None)
     codes: dict[str, int] = {}
@@ -665,6 +734,12 @@ def _add_options(parser: argparse.ArgumentParser, *, model_required: bool = True
     parser.add_argument("--capacity-tolerance-pages", type=int, default=0)
     parser.add_argument("--request-timeout", type=int, default=defaults.request_timeout)
     parser.add_argument("--debug", default=defaults.debug, help="TRTLLM_DKV_DEBUG of the workers")
+    parser.add_argument(
+        "--fresh-page-fill", choices=("zero", "none"), default=defaults.fresh_page_fill
+    )
+    parser.add_argument(
+        "--timing", action="store_true", help="return server timing and measure fetch waits"
+    )
 
 
 def _options_of(args: argparse.Namespace, mode: str) -> Phase6Options:

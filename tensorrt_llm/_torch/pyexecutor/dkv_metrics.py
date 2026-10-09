@@ -522,7 +522,7 @@ def build_dkv_measurement_report(
                 else None
             ),
             "timing_perturbed_by_fresh_page_fill": any(
-                row["fresh_page_fill"] != "none" for row in rows
+                row["fresh_page_fill"] not in ("", "none") for row in rows
             ),
             "output_correctness_validated": False,
         },

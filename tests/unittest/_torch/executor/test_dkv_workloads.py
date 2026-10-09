@@ -160,6 +160,22 @@ def test_summarize_results_counts_hits_per_turn() -> None:
     assert empty["cached_over_eligible"] is None and empty["latency_p50_s"] is None
 
 
+def test_timing_summary_uses_measured_duration_and_executor_context_tokens() -> None:
+    result = _WORKLOADS.WorkloadResult
+    results = [result(i, i, 0, 100, 50, i + 1.0, i + 0.5, i / 10) for i in range(10)]
+    summary = _WORKLOADS.summarize_results(
+        results, elapsed_seconds=2.0, computed_context_tokens=640
+    )
+    assert summary["ttft_client_p50_s"] == 6.0
+    assert summary["ttft_client_p90_s"] == summary["ttft_client_p99_s"] == 10.0
+    assert summary["ttft_server_p50_s"] == 5.5
+    assert summary["ttft_server_p90_s"] == summary["ttft_server_p99_s"] == 9.5
+    assert summary["queue_p99_s"] == 0.9
+    assert summary["requests_per_second"] == 5.0
+    assert summary["computed_context_tokens_per_second"] == 320.0
+    assert _WORKLOADS.summarize_results(results)["computed_context_tokens_per_second"] is None
+
+
 def test_trace_workload_orders_by_arrival_and_counts_turns_per_session() -> None:
     rows = [
         {"arrival_s": 2.0, "session": 7, "prompt": [1, 2]},
@@ -238,6 +254,71 @@ def test_run_workload_waits_for_arrival_offsets() -> None:
     )
     assert clock.sleeps == [5.0]
     assert len(results) == 2
+
+
+def test_out_of_order_completion_releases_the_next_session_turn() -> None:
+    request = _WORKLOADS.WorkloadRequest
+    requests = [request(0, 0, [2]), request(1, 1, [3]), request(2, 1, [3, 4], turn=1)]
+    clock = _Clock()
+    submitted = {}
+    finished = []
+
+    def submit(item):
+        submitted[item.index] = clock()
+        completed_at = clock() + (10 if item.index == 0 else 1)
+
+        def poll():
+            if clock() < completed_at:
+                return None
+            finished.append(item.index)
+            return _WORKLOADS.WorkloadCompletion(
+                item.turn, ttft_server_s=0.5, queue_s=0.1, completed_at=completed_at
+            )
+
+        return poll
+
+    results = _WORKLOADS.run_workload(
+        submit, requests, concurrency=2, clock=clock, sleep=clock.sleep
+    )
+    assert finished == [1, 2, 0]
+    assert submitted[2] < 2 < submitted[0] + 10
+    assert [result.index for result in results] == [0, 1, 2]
+    assert [result.latency_s for result in results] == pytest.approx([10, 1, 1])
+    assert results[2].cached_tokens == 1
+    assert results[1].ttft_server_s == 0.5 and results[1].queue_s == 0.1
+
+
+def test_server_timing_longer_than_client_uses_client_and_retains_raw_values() -> None:
+    request = _WORKLOADS.WorkloadRequest(0, 0, [2])
+    clock = _Clock()
+
+    def submit(item):
+        def poll():
+            clock.now = 1.0
+            return _WORKLOADS.WorkloadCompletion(
+                0,
+                ttft_server_s=2.0,
+                queue_s=0.1,
+                completed_at=1.0,
+                ttft_server_raw_s=2.0,
+                queue_raw_s=0.1,
+            )
+
+        return poll
+
+    (result,) = _WORKLOADS.run_workload(
+        submit, [request], concurrency=1, clock=clock, sleep=clock.sleep
+    )
+    assert result.latency_s == 1.0
+    assert result.ttft_server_s is None and result.queue_s is None
+    assert result.ttft_server_raw_s == 2.0 and result.queue_raw_s == 0.1
+    assert result.server_timing_error == "server_ttft_exceeds_client"
+    summary = _WORKLOADS.summarize_results([result])
+    assert summary["ttft_client_p50_s"] == 1.0
+    assert summary["ttft_server_p50_s"] is None
+    assert summary["server_timing_complete"] is False
+    assert summary["server_timing_errors"] == {"server_ttft_exceeds_client": 1}
+    assert summary["ttft_source"] == "client"
 
 
 def test_run_workload_rejects_a_workload_that_can_never_make_progress() -> None:

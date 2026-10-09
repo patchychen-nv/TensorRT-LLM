@@ -14,6 +14,98 @@ from pathlib import Path
 REMOVALS_ONLY = ["removals_without_verified_equal_capacity"]
 
 
+def interval_cost(after: Sequence[Mapping], before: Sequence[Mapping]) -> dict:
+    """Counter deltas and means over rank-iterations, excluding warm-up snapshots.
+
+    Missing counters stay unknown so older runs and disabled timing are not mistaken for zero
+    measured cost. Control and sample calls count the iterations that execute those collectives.
+    """
+    baseline = {row["rank"]: row for row in before}
+    cost = {}
+    for plane, names in (
+        (
+            "data_plane",
+            (
+                "iterations",
+                "hook_seconds",
+                "fetch_wait_seconds",
+                "drain_seconds",
+                "bytes_sent",
+                "bytes_received",
+            ),
+        ),
+        ("control_plane", ("control_seconds", "control_calls", "sample_seconds", "sample_calls")),
+    ):
+        totals = {}
+        for name in names:
+            deltas = []
+            for row in after:
+                last = row.get(plane, {})
+                first = baseline.get(row["rank"], {}).get(plane, {})
+                if name not in last or name not in first:
+                    break
+                delta = last[name] - first[name]
+                if delta < 0:
+                    raise ValueError(f"{plane}.{name} reset during the measurement interval")
+                deltas.append(delta)
+            totals[name] = sum(deltas) if after and len(deltas) == len(after) else None
+        if plane == "data_plane":
+            iterations = totals["iterations"]
+            for name in ("hook_seconds", "fetch_wait_seconds", "drain_seconds"):
+                value = totals[name]
+                totals[f"{name}_per_iteration"] = (
+                    value / iterations if value is not None and iterations else None
+                )
+            for direction in ("sent", "received"):
+                value = totals[f"bytes_{direction}"]
+                totals[f"mb_{direction}_per_iteration"] = (
+                    value / 1e6 / iterations if value is not None and iterations else None
+                )
+        else:
+            for kind in ("control", "sample"):
+                seconds, calls = totals[f"{kind}_seconds"], totals[f"{kind}_calls"]
+                totals[f"{kind}_seconds_per_iteration"] = (
+                    seconds / calls if seconds is not None and calls else None
+                )
+        cost[plane] = totals
+    return cost
+
+
+_TIMING_FIELDS = [
+    (f"TTFT {side} p{percentile} s", f"ttft_{side}_p{percentile}_s")
+    for side in ("server", "client")
+    for percentile in (50, 90, 99)
+] + [
+    ("queue p99 s", "queue_p99_s"),
+    ("measured seconds", "measured_seconds"),
+    ("requests/s", "requests_per_second"),
+    ("computed context tokens/s", "computed_context_tokens_per_second"),
+]
+_COST_FIELDS = [
+    ("data_plane", "hook_seconds_per_iteration", "hook_seconds / rank-iteration"),
+    ("data_plane", "fetch_wait_seconds_per_iteration", "fetch_wait_seconds / rank-iteration"),
+    ("data_plane", "drain_seconds_per_iteration", "drain_seconds / rank-iteration"),
+    ("data_plane", "mb_sent_per_iteration", "sent MB / rank-iteration"),
+    ("data_plane", "mb_received_per_iteration", "received MB / rank-iteration"),
+    ("control_plane", "control_seconds_per_iteration", "S-control host seconds / call"),
+    ("control_plane", "sample_seconds_per_iteration", "S-sample host seconds / call"),
+]
+
+
+def _cost_value(result: Mapping, plane: str, name: str) -> float | None:
+    return result["report"].get("cost", {}).get(plane, {}).get(name)
+
+
+def _timing_status(result: Mapping) -> str:
+    client = result["client"]
+    source = client.get("ttft_source", "unknown")
+    available = client.get("server_timing_requests", "?")
+    total = client.get("requests", result["workload"]["requests"])
+    errors = client.get("server_timing_errors", {})
+    reasons = ", ".join(f"{reason}: {count}" for reason, count in sorted(errors.items()))
+    return f"{source}; server {available}/{total}" + (f"; {reasons}" if reasons else "")
+
+
 def mode_order(result: Mapping) -> tuple[int, float]:
     """Sort key: ADP first, then the KV-aware routers by their weight, DKV last."""
     mode = result["mode"]
@@ -66,7 +158,7 @@ def _phase_number(name: str) -> int:
     return int(name.removeprefix("phase"))
 
 
-def _number(value: float | int | None, digits: int = 3) -> str:
+def _number(value: float | int | str | None, digits: int = 3) -> str:
     if value is None:
         return "n/a"
     if isinstance(value, float):
@@ -215,6 +307,27 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
         ],
         rows,
     )
+    lines += _table(
+        ["mode", "TTFT source and timing coverage", *[title for title, _ in _TIMING_FIELDS]],
+        [
+            [
+                result["mode"]["name"],
+                _timing_status(result),
+                *[_number(result["client"].get(key), 6) for _, key in _TIMING_FIELDS],
+            ]
+            for result in results
+        ],
+    )
+    lines += _table(
+        ["mode", *[title for _, _, title in _COST_FIELDS]],
+        [
+            [
+                result["mode"]["name"],
+                *[_number(_cost_value(result, plane, key), 6) for plane, key, _ in _COST_FIELDS],
+            ]
+            for result in results
+        ],
+    )
     turns = sorted({int(turn) for r in results for turn in r["client"].get("by_turn", {})})
     if len(turns) > 1:
         rows = []
@@ -238,7 +351,6 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
     for result in results:
         report = result["report"]
         reasons = report.get("validity", {}).get("invalid_reasons", [report.get("report_error")])
-        client = result["client"]
         comparison = report.get("capacity_comparison")
         rows.append(
             [
@@ -249,7 +361,6 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
                 else f"{comparison['equal_usable_capacity']} (tolerance {comparison['tolerance_pages']})",
                 _number(result["build_seconds"], 0),
                 _number(result["wall_seconds"] - result["build_seconds"], 0),
-                f"{_number(client['latency_p50_s'])} / {_number(client['latency_p99_s'])}",
             ]
         )
     lines += _table(
@@ -259,7 +370,6 @@ def comparison_tables(results: Sequence[Mapping]) -> str:
             "equal usable capacity",
             "LLM build s",
             "run wall s",
-            "client latency p50 / p99 s (informational)",
         ],
         rows,
     )
@@ -327,6 +437,31 @@ def seed_summary(groups: Mapping[str, Sequence[Mapping]]) -> str:
                     cells.append(_number(getter(result["report"]), digits))
             rows.append([mode, *cells])
         lines.append(f"**{title}**\n")
+        lines += _table(["mode", *by_label], rows)
+    extra_rows = (
+        [("TTFT source and timing coverage", _timing_status)]
+        + [
+            (title, lambda result, key=key: result["client"].get(key))
+            for title, key in _TIMING_FIELDS
+        ]
+        + [
+            (title, lambda result, plane=plane, key=key: _cost_value(result, plane, key))
+            for plane, key, title in _COST_FIELDS
+        ]
+    )
+    for title, getter in extra_rows:
+        lines.append(f"**{title}**\n")
+        rows = []
+        for mode in modes:
+            rows.append(
+                [
+                    mode,
+                    *[
+                        _number(getter(results[mode]), 6) if mode in results else "-"
+                        for results in by_label.values()
+                    ],
+                ]
+            )
         lines += _table(["mode", *by_label], rows)
     return "\n".join(lines)
 

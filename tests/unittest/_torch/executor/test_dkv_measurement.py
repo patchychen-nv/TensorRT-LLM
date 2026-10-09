@@ -551,11 +551,24 @@ def test_bad_snapshot_sets_fail_explicitly(fault: str) -> None:
         _report(rows, baseline_snapshots=before)
 
 
-def test_page_fill_marks_timing_and_never_asserts_output_correctness() -> None:
+@pytest.mark.parametrize(
+    ("fill_by_rank", "perturbed"),
+    [
+        (("none", "none"), False),
+        (("", ""), False),
+        (("", "none"), False),
+        (("zero", "none"), True),
+        (("", "nan"), True),
+    ],
+)
+def test_page_fill_marks_timing_and_never_asserts_output_correctness(
+    fill_by_rank: tuple[str, str], perturbed: bool
+) -> None:
     rows = [_snapshot(0), _snapshot(1)]
-    rows[0]["fresh_page_fill"] = "zero"
+    for row, fill in zip(rows, fill_by_rank, strict=True):
+        row["fresh_page_fill"] = fill
     validity = _report(rows)["validity"]
-    assert validity["timing_perturbed_by_fresh_page_fill"]
+    assert validity["timing_perturbed_by_fresh_page_fill"] is perturbed
     assert not validity["output_correctness_validated"]
 
 
