@@ -24,7 +24,8 @@ kernels and need no events.
 owns the layer and is computed on another. It carries out a ``DkvPlan`` on a data stream of its own:
 it packs the pages of a message, sends it, receives the messages of its peers and unpacks them, in
 the order the plan fixes for every rank, and it orders the data stream with the stream of the
-forward pass by events.
+forward pass by events. The plan is resolved to device addresses once per iteration, when the
+staged batch is known, so that the hooks of the forward pass only enqueue work.
 """
 
 import functools
@@ -34,10 +35,12 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple, Protocol
 
+import numpy as np
 import torch
 
 from .dkv_plan import (
     DEADLINE_OF_KIND,
+    ISSUE_AT_BEGIN,
     DeadlineClass,
     Direction,
     DkvPlan,
@@ -218,6 +221,19 @@ def max_message_bytes(layout: StagingLayout) -> int:
     return max(per_deadline.values(), default=0)
 
 
+def max_peer_step_bytes(layout: StagingLayout) -> int:
+    """An upper bound of the bytes one rank exchanges with one peer in one step.
+
+    The messages of a step to one peer are the deadline classes of one layer, each at most once,
+    and their pages fit the slots of the kinds, so all the slots together bound them.
+    """
+    return sum(layout.slot_pages(kind) * layout.kind_page_bytes(kind) for kind in layout.kinds)
+
+
+# Every message of a step starts at a multiple of this in the message arena.
+_MESSAGE_ALIGNMENT = 256
+
+
 @dataclass
 class DataPlaneStats:
     """What the data plane of one rank has moved since its streamer was built, and what it cost.
@@ -225,8 +241,10 @@ class DataPlaneStats:
     ``hook_seconds`` is the host time of the hooks of the forward pass, which run between the
     launches of its layers and so add to a pass that is bound by the host, and ``drain_seconds`` the
     host time that ``drain`` waited for the data stream, the part of the data plane that the
-    forward pass did not hide. ``fetch_wait_seconds`` is the GPU time the compute stream spent
-    waiting for layer fetches, measured only with ``TRTLLM_DKV_WAIT_TIMING=1``.
+    forward pass did not hide. ``compile_seconds``, part of ``hook_seconds``, is the host time that
+    resolved the plan of an iteration to device addresses. ``fetch_wait_seconds`` is the GPU time
+    the compute stream spent waiting for layer fetches, measured only with
+    ``TRTLLM_DKV_WAIT_TIMING=1``.
     """
 
     iterations: int = 0
@@ -239,6 +257,7 @@ class DataPlaneStats:
     bytes_local_fetch: int = 0
     bytes_local_writeback: int = 0
     hook_seconds: float = 0.0
+    compile_seconds: float = 0.0
     drain_seconds: float = 0.0
     fetch_wait_seconds: float = 0.0
 
@@ -274,6 +293,36 @@ class _Run(NamedTuple):
     first: int
     count: int
     offset: int
+
+
+class _CompiledOp(NamedTuple):
+    """One operation of the data plane with its copies resolved to device addresses."""
+
+    op: RankOp
+    key: tuple[int, int, int, int, int]
+    # The region of the message arena the message occupies; None for a local copy.
+    message: torch.Tensor | None
+    # The copies the operation issues: (page bytes, destination addresses, source addresses). A
+    # send packs pages into its message, a receive unpacks its message into pages and a local copy
+    # moves pages between the cache manager and the staging area.
+    copies: tuple[tuple[int, np.ndarray, np.ndarray], ...]
+    runs: tuple[_Run, ...]
+    # The addresses of the pages of every run on this rank, for the checksums of debug: the pages
+    # a message was packed from or unpacked into, or (source, destination) of a local copy.
+    pages: tuple[tuple[np.ndarray, ...], ...]
+
+
+class _CompiledStep(NamedTuple):
+    """What one rank does in one step, resolved to addresses and grouped by kind of operation."""
+
+    step: PlanStep
+    # The layer whose slots are overwritten before its fetch (the debug fill), else None.
+    fill_layer: int | None
+    local: tuple[_CompiledOp, ...]
+    sends: tuple[_CompiledOp, ...]
+    recvs: tuple[_CompiledOp, ...]
+    # Record the event the attention of the layer waits for, once the fetch is enqueued.
+    record_fetch: bool
 
 
 # The multiplier of the position of a word in the checksum: 2**64 divided by the golden ratio.
@@ -440,6 +489,10 @@ def find_data_plane_mismatches(
     return problems
 
 
+def _concatenated(arrays: Sequence[np.ndarray]) -> np.ndarray:
+    return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
+
+
 class DkvStreamer:
     """Carries out the data plane of the ``layer_split`` layout around the layers of a forward pass.
 
@@ -449,11 +502,14 @@ class DkvStreamer:
     ``begin_iteration`` (through the staged view), ``on_layer`` at the top of every layer and
     ``end_forward`` after the last one, and the executor calls ``drain`` when the iteration ends.
 
-    Everything the plan lists for this rank runs on ``data_stream``, one operation after the other
-    in the order of the plan: the owner packs the pages of a message from its cache manager and
-    sends them, the compute rank receives them and unpacks them into the slot of the layer, and the
-    other way round for the pages the new tokens wrote. The data stream waits for the forward pass
-    by events, and the forward pass waits for the fetch of a layer:
+    When the staged batch is known the plan is compiled: every operation of this rank is resolved
+    to the device addresses of its pages and to its region of the message arena, step by step. The
+    hooks then only enqueue the work of their steps on ``data_stream``: the owner packs the pages
+    of its messages from its cache manager and sends them, the compute rank receives them and
+    unpacks them into the slot of the layer, and the other way round for the pages the new tokens
+    wrote. All the messages a rank sends or receives in one step are issued together when the
+    transport can group them. The data stream waits for the forward pass by events, and the
+    forward pass waits for the fetch of a layer:
 
     * the first operation of an iteration waits for the pages of the cache manager to be ready;
     * the operations at the top of layer ``l`` wait for the kernels of the layers before ``l``, so
@@ -487,6 +543,7 @@ class DkvStreamer:
         debug: DataPlaneDebug | None = None,
         fault: DataPlaneFault | None = None,
         timing_event_factory: Callable[[], torch.cuda.Event] | None = None,
+        group_messages: bool = True,
     ) -> None:
         """Build the streamer of ``rank``.
 
@@ -506,6 +563,8 @@ class DkvStreamer:
             fault: A message to damage after it was received; it needs ``debug``.
             timing_event_factory: Creates a timing-enabled event for fetch waits. Used only with
                 ``TRTLLM_DKV_WAIT_TIMING=1``; CUDA events by default.
+            group_messages: Hand all the messages of a step to the transport in one call when it
+                has a ``group_send_recv`` method that is not None; else one message at a time.
         """
         layout = view.layout
         owners = tuple(owner_of_layer)
@@ -522,6 +581,9 @@ class DkvStreamer:
         self._layout = layout
         self._pool = view.pool
         self._transport = transport
+        self._group_send_recv = (
+            getattr(transport, "group_send_recv", None) if group_messages else None
+        )
         self._owners = owners
         self._rank = rank
         self._group_size = group_size
@@ -536,14 +598,22 @@ class DkvStreamer:
         self._fill = fill
         self._costs = LayoutCostModel(layout)
         self._layer_types = layer_types_from_compress_ratios(layout.geometry.compress_ratios)
-        size = max_message_bytes(layout)
+        # Every message of a step has its own region of the arena, so the messages of a step can
+        # be packed first and issued together: a rank exchanges at most max_peer_step_bytes with
+        # each of its peers in a step, in at most one message per deadline class.
+        peers = max(group_size - 1, 1)
+        arena = peers * (max_peer_step_bytes(layout) + len(DeadlineClass) * _MESSAGE_ALIGNMENT)
         device = view.pool.buffer.device
-        self._send_buffer = torch.empty(size, dtype=torch.uint8, device=device)
-        self._recv_buffer = torch.empty(size, dtype=torch.uint8, device=device)
+        self._send_arena = torch.empty(arena, dtype=torch.uint8, device=device)
+        self._recv_arena = torch.empty(arena, dtype=torch.uint8, device=device)
         self._debug = debug
         self._fault = fault
         # Where the pages of a message are read back to checksum them.
-        self._scratch = torch.empty(size, dtype=torch.uint8, device=device) if debug else None
+        self._scratch = (
+            torch.empty(max_message_bytes(layout), dtype=torch.uint8, device=device)
+            if debug
+            else None
+        )
         self._iteration = 0
         self.last_plan: DkvPlan | None = None
         self.stats = DataPlaneStats()
@@ -551,11 +621,21 @@ class DkvStreamer:
         self._requests: dict[int, PlanRequest] = {}
         self._computes = False
         self._begun = False
+        self._program: dict[int, list[_CompiledStep]] | None = None
         self._local_index: dict[int, int] = {}
         self._spans: dict[StagingKind, tuple[RequestSpan, ...]] = {}
         self._fetch_done: dict[int, object] = {}
         self._data_done = None
-        self._indices: dict[tuple[int, int, object], Sequence[int]] = {}
+        # The events of the iteration, one per use, recorded again every iteration.
+        self._events: dict[tuple, object] = {}
+        # A cache manager that maps blocks to pages by an affine function of their base page index
+        # gives the addresses of a run without a call per (request, layer, kind).
+        self._affine_pages = callable(
+            getattr(manager, "get_cache_index_affine", None)
+        ) and callable(getattr(manager, "get_base_page_indices", None))
+        self._affines: dict[tuple[int, object], tuple[int, int, int]] = {}
+        self._base_indices: dict[tuple[int, int], np.ndarray] = {}
+        self._indices: dict[tuple[int, int, object], np.ndarray] = {}
         self._page_tables: dict[tuple[int, object], tuple[int, int]] = {}
 
     # ---- the plan -------------------------------------------------------------------------
@@ -597,9 +677,11 @@ class DkvStreamer:
             request.compute_rank == self._rank and not request.is_dummy for request in plan.requests
         )
         self._begun = False
+        self._program = None
         self._local_index = {}
         self._spans = {}
         self._fetch_done = {}
+        self._base_indices = {}
         self._indices = {}
 
     # ---- hooks of the forward pass --------------------------------------------------------
@@ -651,9 +733,9 @@ class DkvStreamer:
             # message that is not sent before the compute rank reaches the layer. The spinning
             # kernel holds multiprocessors that the layers of this rank need to get through the MoE
             # exchange, which the sender of the message waits for.
-            self._data_stream.wait_event(stream.record_event())
-        for step in plan.layer_steps(layer):
-            self._issue(step)
+            self._data_stream.wait_event(self._record(stream, ("compute", layer)))
+        for compiled in self._program.get(layer, ()):
+            self._issue(compiled)
         fetched = self._fetch_done.pop(layer, None)
         if fetched is not None:
             if self._wait_timing:
@@ -673,12 +755,13 @@ class DkvStreamer:
             return
         if not self._begun:
             self._begin()
-        self._data_stream.wait_event(self._current_stream().record_event())
-        for step in plan.end_steps():
-            self._issue(step)
-        self._data_done = self._data_stream.record_event()
+        self._data_stream.wait_event(self._record(self._current_stream(), ("end",)))
+        for compiled in self._program.get(plan.num_layers, ()):
+            self._issue(compiled)
+        self._data_done = self._record(self._data_stream, ("done",))
         self.last_plan = plan
         self._plan = None
+        self._program = None
         self.stats.iterations += 1
 
     def assert_idle(self, what: str) -> None:
@@ -723,76 +806,184 @@ class DkvStreamer:
         self._fetch_wait_events.clear()
         return self._debug.collect() if self._debug is not None else []
 
-    # ---- issuing the steps ----------------------------------------------------------------
+    # ---- compiling the plan ---------------------------------------------------------------
 
-    def _begin(self) -> None:
-        self._begun = True
-        self._data_stream.wait_event(self._current_stream().record_event())
-        for step in self._plan.begin_steps():
-            self._issue(step)
+    def _compile(self) -> None:
+        """Resolve every operation of this rank to addresses, step by step."""
+        started = time.perf_counter()
+        program: dict[int, list[_CompiledStep]] = {}
+        for step in self._plan.steps:
+            fetch = step.direction is Direction.FETCH
+            fill_layer = step.layer if fetch and self._computes and self._fill else None
+            # A rank that computes waits for the fetch of a layer also when the layer has nothing
+            # to fetch: the step follows the writeback of the layer whose slot this layer computes
+            # in, so the layer must not start before the data stream has got past it.
+            record_fetch = fetch and self._computes
+            ops = step.ops_for(self._rank)
+            if not ops and fill_layer is None and not record_fetch:
+                continue
+            local: list[_CompiledOp] = []
+            sends: list[_CompiledOp] = []
+            recvs: list[_CompiledOp] = []
+            send_offset = recv_offset = 0
+            for op in ops:
+                if op.action is OpAction.LOCAL:
+                    local.append(self._compile_local(op))
+                elif op.action is OpAction.SEND:
+                    compiled, send_offset = self._compile_message(op, self._send_arena, send_offset)
+                    sends.append(compiled)
+                else:
+                    compiled, recv_offset = self._compile_message(op, self._recv_arena, recv_offset)
+                    recvs.append(compiled)
+            program.setdefault(step.issue_point, []).append(
+                _CompiledStep(
+                    step, fill_layer, tuple(local), tuple(sends), tuple(recvs), record_fetch
+                )
+            )
+        self._program = program
+        self.stats.compile_seconds += time.perf_counter() - started
 
-    def _issue(self, step: PlanStep) -> None:
-        fetch = step.direction is Direction.FETCH
-        if fetch and self._computes and self._fill:
-            with torch.cuda.stream(self._data_stream):
-                self._pool.fill_layer(step.layer, self._fill)
-        for op in step.ops_for(self._rank):
-            self._run(op)
-        # A rank that computes waits for the fetch of a layer also when the layer has nothing to
-        # fetch: the step follows the writeback of the layer whose slot this layer computes in, so
-        # the layer must not start before the data stream has got past it.
-        if fetch and self._computes:
-            self._fetch_done[step.layer] = self._data_stream.record_event()
-
-    def _run(self, op: RankOp) -> None:
+    def _compile_local(self, op: RankOp) -> _CompiledOp:
         transfer = op.transfer
         layer = transfer.layer
-        runs = self._message_runs(transfer)
-        key = message_key(transfer)
-        if op.action is OpAction.LOCAL:
-            fetch = transfer.direction is Direction.FETCH
-            pool = [self._pool_addresses(layer, run) for run in runs]
-            staging = [self._staging_addresses(layer, run) for run in runs]
-            source, destination = (pool, staging) if fetch else (staging, pool)
-            if self._debug is not None:
-                self._checksum_pages(key, "source", transfer.nbytes, runs, source)
-            self._copy(runs, destination, source)
-            if self._debug is not None:
-                self._checksum_pages(key, "stored", transfer.nbytes, runs, destination)
-            self.stats.local_copies += 1
-            self.stats.bytes_local += transfer.nbytes
-            if fetch:
-                self.stats.bytes_local_fetch += transfer.nbytes
-            else:
-                self.stats.bytes_local_writeback += transfer.nbytes
-            return
-        sending = op.action is OpAction.SEND
+        runs = tuple(self._message_runs(transfer))
+        pool = tuple(self._pool_addresses(layer, run) for run in runs)
+        staging = tuple(self._staging_addresses(layer, run) for run in runs)
+        if transfer.direction is Direction.FETCH:
+            sources, destinations = pool, staging
+        else:
+            sources, destinations = staging, pool
+        return _CompiledOp(
+            op,
+            message_key(transfer),
+            None,
+            self._group_copies(runs, destinations, sources),
+            runs,
+            (sources, destinations),
+        )
+
+    def _compile_message(
+        self, op: RankOp, arena: torch.Tensor, offset: int
+    ) -> tuple[_CompiledOp, int]:
+        """Resolve a send or receive whose message starts at ``offset`` of ``arena``.
+
+        Returns the operation and the offset of the next message of the step.
+        """
+        transfer = op.transfer
+        layer = transfer.layer
+        runs = tuple(self._message_runs(transfer))
+        end = offset + transfer.nbytes
+        if end > arena.numel():
+            raise RuntimeError(
+                f"rank {self._rank}: the messages of {step_label(transfer.direction, layer)} need "
+                f"{end} bytes, the message arena has {arena.numel()}"
+            )
+        message = arena[offset:end]
+        base = arena.data_ptr() + offset
         addresses_of = (
             self._pool_addresses if op.rank == transfer.owner else self._staging_addresses
         )
-        buffer = self._send_buffer if sending else self._recv_buffer
-        message = buffer[: transfer.nbytes]
-        base = buffer.data_ptr()
-        page_at = [addresses_of(layer, run) for run in runs]
-        in_message = [self._message_addresses(base, run) for run in runs]
-        if sending:
-            self._copy(runs, in_message, page_at)
-            if self._debug is not None:
-                self._debug.checksum(key, "sent", message)
-            self._transport.send(message, op.peer, self._data_stream)
-            self.stats.messages_sent += 1
-            self.stats.bytes_sent += transfer.nbytes
+        pages = tuple(addresses_of(layer, run) for run in runs)
+        in_message = tuple(self._message_addresses(base, run) for run in runs)
+        if op.action is OpAction.SEND:
+            copies = self._group_copies(runs, in_message, pages)
         else:
-            self._transport.recv(message, op.peer, self._data_stream)
-            if self._fault is not None and self._is_faulty(transfer):
-                self._debug.corrupt(message, self._fault.kind)
-            if self._debug is not None:
-                self._debug.checksum(key, "received", message)
-            self._copy(runs, page_at, in_message)
-            if self._debug is not None:
-                self._checksum_pages(key, "stored", transfer.nbytes, runs, page_at)
-            self.stats.messages_received += 1
-            self.stats.bytes_received += transfer.nbytes
+            copies = self._group_copies(runs, pages, in_message)
+        compiled = _CompiledOp(op, message_key(transfer), message, copies, runs, (pages,))
+        return compiled, -(-end // _MESSAGE_ALIGNMENT) * _MESSAGE_ALIGNMENT
+
+    def _group_copies(
+        self,
+        runs: Sequence[_Run],
+        destinations: Sequence[np.ndarray],
+        sources: Sequence[np.ndarray],
+    ) -> tuple[tuple[int, np.ndarray, np.ndarray], ...]:
+        """The copies of the runs, one entry per page size whatever the number of runs."""
+        by_size: dict[int, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+        for run, destination, source in zip(runs, destinations, sources):
+            group = by_size.setdefault(self._layout.page_bytes(run.component), ([], []))
+            group[0].append(destination)
+            group[1].append(source)
+        return tuple(
+            (page_bytes, _concatenated(group[0]), _concatenated(group[1]))
+            for page_bytes, group in by_size.items()
+        )
+
+    # ---- issuing the steps ----------------------------------------------------------------
+
+    def _record(self, stream, slot: tuple) -> object:
+        """Record the event of ``slot`` on ``stream``; one event per slot, reused every iteration."""
+        event = stream.record_event(self._events.get(slot))
+        self._events[slot] = event
+        return event
+
+    def _begin(self) -> None:
+        self._begun = True
+        if self._program is None:
+            self._compile()
+        self._data_stream.wait_event(self._record(self._current_stream(), ("begin",)))
+        for compiled in self._program.get(ISSUE_AT_BEGIN, ()):
+            self._issue(compiled)
+
+    def _issue(self, compiled: _CompiledStep) -> None:
+        """Enqueue the operations of one step on the data stream."""
+        if compiled.fill_layer is not None:
+            with torch.cuda.stream(self._data_stream):
+                self._pool.fill_layer(compiled.fill_layer, self._fill)
+        stream = self._data_stream.cuda_stream
+        debug = self._debug
+        stats = self.stats
+        for op in compiled.local:
+            nbytes = op.op.transfer.nbytes
+            if debug is not None:
+                self._checksum_pages(op.key, "source", nbytes, op.runs, op.pages[0])
+            self._copy(op.copies, stream)
+            if debug is not None:
+                self._checksum_pages(op.key, "stored", nbytes, op.runs, op.pages[1])
+            stats.local_copies += 1
+            stats.bytes_local += nbytes
+            if op.op.transfer.direction is Direction.FETCH:
+                stats.bytes_local_fetch += nbytes
+            else:
+                stats.bytes_local_writeback += nbytes
+        if compiled.sends:
+            for op in compiled.sends:
+                self._copy(op.copies, stream)
+                if debug is not None:
+                    debug.checksum(op.key, "sent", op.message)
+            self._transfer(compiled.sends, ())
+            stats.messages_sent += len(compiled.sends)
+            stats.bytes_sent += sum(op.op.transfer.nbytes for op in compiled.sends)
+        if compiled.recvs:
+            self._transfer((), compiled.recvs)
+            for op in compiled.recvs:
+                nbytes = op.op.transfer.nbytes
+                if self._fault is not None and self._is_faulty(op.op.transfer):
+                    debug.corrupt(op.message, self._fault.kind)
+                if debug is not None:
+                    debug.checksum(op.key, "received", op.message)
+                self._copy(op.copies, stream)
+                if debug is not None:
+                    self._checksum_pages(op.key, "stored", nbytes, op.runs, op.pages[0])
+            stats.messages_received += len(compiled.recvs)
+            stats.bytes_received += sum(op.op.transfer.nbytes for op in compiled.recvs)
+        if compiled.record_fetch:
+            layer = compiled.step.layer
+            self._fetch_done[layer] = self._record(self._data_stream, ("fetch", layer))
+
+    def _transfer(self, sends: Sequence[_CompiledOp], recvs: Sequence[_CompiledOp]) -> None:
+        """Hand the messages of a step to the transport: in one group when it offers one."""
+        if self._group_send_recv is not None:
+            self._group_send_recv(
+                [(op.message, op.op.peer) for op in sends],
+                [(op.message, op.op.peer) for op in recvs],
+                self._data_stream,
+            )
+            return
+        for op in sends:
+            self._transport.send(op.message, op.op.peer, self._data_stream)
+        for op in recvs:
+            self._transport.recv(op.message, op.op.peer, self._data_stream)
 
     def _is_faulty(self, transfer: Transfer) -> bool:
         fault = self._fault
@@ -804,26 +995,22 @@ class DkvStreamer:
         )
 
     def _checksum_pages(
-        self, key: tuple, role: str, nbytes: int, runs: Sequence[_Run], addresses
+        self,
+        key: tuple,
+        role: str,
+        nbytes: int,
+        runs: Sequence[_Run],
+        addresses: Sequence[np.ndarray],
     ) -> None:
         """Read the pages at ``addresses`` back into the order of a message and checksum them."""
         base = self._scratch.data_ptr()
-        self._copy(runs, [self._message_addresses(base, run) for run in runs], addresses)
+        in_scratch = tuple(self._message_addresses(base, run) for run in runs)
+        self._copy(self._group_copies(runs, in_scratch, addresses), self._data_stream.cuda_stream)
         self._debug.checksum(key, role, self._scratch[:nbytes])
 
-    def _copy(self, runs: Sequence[_Run], destinations, sources) -> None:
-        """Copy the pages of each run from its ``sources`` to its ``destinations`` addresses.
-
-        There is one launch per page size, whatever the number of runs.
-        """
-        by_size: dict[int, list[tuple[int, int]]] = {}
-        for run, destination, source in zip(runs, destinations, sources):
-            by_size.setdefault(self._layout.page_bytes(run.component), []).extend(
-                zip(destination, source)
-            )
-        stream = self._data_stream.cuda_stream
-        for page_bytes, group in by_size.items():
-            self._copier.copy(group, page_bytes, stream)
+    def _copy(self, copies: Sequence[tuple[int, np.ndarray, np.ndarray]], stream: int) -> None:
+        for page_bytes, destinations, sources in copies:
+            self._copier.copy_addresses(destinations, sources, page_bytes, stream)
 
     # ---- where the pages are --------------------------------------------------------------
 
@@ -853,22 +1040,32 @@ class DkvStreamer:
             )
         return runs
 
-    def _message_addresses(self, base: int, run: _Run) -> range:
+    def _message_addresses(self, base: int, run: _Run) -> np.ndarray:
         """The addresses of the pages of a run in a message buffer that starts at ``base``."""
         page_bytes = self._layout.page_bytes(run.component)
-        begin = base + run.offset
-        return range(begin, begin + run.count * page_bytes, page_bytes)
+        return (base + run.offset) + np.arange(run.count, dtype=np.int64) * page_bytes
 
-    def _pool_addresses(self, layer: int, run: _Run) -> list[int]:
+    def _pool_addresses(self, layer: int, run: _Run) -> np.ndarray:
         """The addresses of the pages of a run in the cache manager of this rank."""
         attention_type = run.component.attention_type
-        key = (run.request_id, layer, attention_type)
-        indices = self._indices.get(key)
-        if indices is None:
-            indices = self._manager.get_cache_indices(run.request_id, layer, attention_type)
-            self._indices[key] = indices
+        if self._affine_pages:
+            group, step, origin = self._affine(layer, attention_type)
+            indices = self._base_indices.get((run.request_id, group))
+            if indices is None:
+                indices = np.asarray(self._manager.get_base_page_indices(run.request_id, group))
+                self._base_indices[run.request_id, group] = indices
+        else:
+            origin, step = self._page_table(layer, attention_type)
+            key = (run.request_id, layer, attention_type)
+            indices = self._indices.get(key)
+            if indices is None:
+                indices = np.asarray(
+                    self._manager.get_cache_indices(run.request_id, layer, attention_type),
+                    dtype=np.int64,
+                )
+                self._indices[key] = indices
         chosen = indices[run.first : run.first + run.count]
-        if len(chosen) != run.count or BAD_PAGE_INDEX in chosen:
+        if len(chosen) != run.count or (chosen == BAD_PAGE_INDEX).any():
             block = next(
                 block
                 for block in range(run.first, run.first + run.count)
@@ -879,8 +1076,22 @@ class DkvStreamer:
                 f"request {run.request_id} in layer {layer} ({attention_type.name}), which the "
                 "plan moves"
             )
-        base, stride = self._page_table(layer, attention_type)
-        return [base + index * stride for index in chosen]
+        return origin + chosen.astype(np.int64) * step
+
+    def _affine(self, layer: int, attention_type) -> tuple[int, int, int]:
+        """``(layer group, address step, address origin)`` of the pages of a buffer.
+
+        Block ``b`` of a request is at ``origin + base[b] * step`` where ``base`` is its base
+        page indices in the layer group. Looked up once per buffer.
+        """
+        key = (layer, attention_type)
+        affine = self._affines.get(key)
+        if affine is None:
+            group, scale, offset = self._manager.get_cache_index_affine(layer, attention_type)
+            base, stride = self._page_table(layer, attention_type)
+            affine = (group, scale * stride, base + offset * stride)
+            self._affines[key] = affine
+        return affine
 
     def _page_table(self, layer: int, attention_type) -> tuple[int, int]:
         """Where the pages of a buffer of the cache manager start and how far apart they are.
@@ -894,7 +1105,7 @@ class DkvStreamer:
             self._page_tables[layer, attention_type] = table
         return table
 
-    def _staging_addresses(self, layer: int, run: _Run) -> range:
+    def _staging_addresses(self, layer: int, run: _Run) -> np.ndarray:
         """The addresses of the pages of a run in the slot of ``layer`` of this rank."""
         layout = self._layout
         component = run.component
@@ -921,4 +1132,4 @@ class DkvStreamer:
             - span.first_block
         )
         begin = self._pool.layer_pointer(layer, component) + entry * page_bytes
-        return range(begin, begin + run.count * page_bytes, page_bytes)
+        return begin + np.arange(run.count, dtype=np.int64) * page_bytes

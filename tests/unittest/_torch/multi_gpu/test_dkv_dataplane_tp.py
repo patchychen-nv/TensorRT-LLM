@@ -266,12 +266,22 @@ class _FlippingTransport:
         self._transport = transport
         self._number = number
         self._received = 0
+        if getattr(transport, "group_send_recv", None) is None:
+            self.group_send_recv = None
 
     def send(self, buffer, peer, stream) -> None:
         self._transport.send(buffer, peer, stream)
 
     def recv(self, buffer, peer, stream) -> None:
         self._transport.recv(buffer, peer, stream)
+        self._flip(buffer, stream)
+
+    def group_send_recv(self, sends, recvs, stream) -> None:
+        self._transport.group_send_recv(sends, recvs, stream)
+        for buffer, _ in recvs:
+            self._flip(buffer, stream)
+
+    def _flip(self, buffer, stream) -> None:
         if self._received == self._number:
             with torch.cuda.stream(stream):
                 buffer[buffer.numel() // 2].bitwise_xor_(0xFF)

@@ -18,6 +18,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+import numpy as np
 import pytest
 import torch
 from utils.util import skip_pre_blackwell
@@ -509,3 +510,51 @@ def test_a_fill_covers_the_slots_of_one_layer(case: _Case) -> None:
             assert (rows == (0xFF if layer == 2 else 0)).all(), (component, layer)
     with pytest.raises(ValueError, match="unknown staging fill"):
         pool.fill_layer(2, "one")
+
+
+def test_copying_by_address_arrays_moves_the_same_pages_as_the_task_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copier = DkvPageCopier()
+    pages, page_bytes = 2 * DkvPageCopier.MAX_TASKS_PER_CALL + 5, 4096
+    source = torch.randint(0, 255, (pages, page_bytes), dtype=torch.uint8, device="cuda")
+    order = torch.randperm(pages).tolist()
+    sources = source.data_ptr() + np.arange(pages, dtype=np.int64) * page_bytes
+    stream = torch.cuda.Stream()
+
+    def copied() -> torch.Tensor:
+        target = torch.zeros_like(source)
+        destinations = target.data_ptr() + np.asarray(order, dtype=np.int64) * page_bytes
+        copier.copy_addresses(destinations, sources, page_bytes, stream.cuda_stream)
+        stream.synchronize()
+        return target
+
+    assert torch.equal(copied()[order], source)
+    # The same through the per-page task list of an older native build.
+    monkeypatch.setattr(copier, "_copy_addresses", None)
+    assert torch.equal(copied()[order], source)
+    with pytest.raises(ValueError, match="multiple of 16"):
+        copier.copy_addresses(sources[:1], sources[:1], 100, stream.cuda_stream)
+    with pytest.raises(ValueError, match="destination addresses"):
+        copier.copy_addresses(sources[:2], sources[:1], page_bytes, stream.cuda_stream)
+
+
+def test_the_affine_page_map_of_the_cache_manager_agrees_with_its_page_indices(
+    case: _Case,
+) -> None:
+    layout, manager = case.layout, case.manager
+    seen = 0
+    for component in layout.components:
+        for layer in layout.layers_of(component.kind):
+            attention_type = component.attention_type
+            indices = manager.get_cache_indices(_REQUEST, layer, attention_type)
+            group, scale, offset = manager.get_cache_index_affine(layer, attention_type)
+            base = manager.get_base_page_indices(_REQUEST, group)
+            assert len(base) >= len(indices)
+            expected = [
+                BAD_PAGE_INDEX if index == BAD_PAGE_INDEX else int(index) * scale + offset
+                for index in base[: len(indices)]
+            ]
+            assert expected == list(indices), (layer, attention_type)
+            seen += sum(1 for index in indices if index != BAD_PAGE_INDEX)
+    assert seen > 0

@@ -18,6 +18,7 @@ from dataclasses import replace
 from math import gcd
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
@@ -965,6 +966,41 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             base_indices,
             page_index_mode,
             kv_cache.get_scratch_desc(pool_id),
+        )
+
+    def get_cache_index_affine(
+        self, layer_idx: int, attn_type: DeepseekV4AttentionType
+    ) -> Tuple[int, int, int]:
+        """How the blocks of a request map to the pages of ``get_buffers(layer_idx, attn_type)``.
+
+        Returns ``(layer_group_id, scale, offset)``: block ``b`` of a request is page
+        ``base[b] * scale + offset`` of the buffer, where ``base`` is
+        ``get_base_page_indices(request_id, layer_group_id)``. This holds while SWA scratch reuse
+        is off; a scratch block takes its page from a scratch descriptor instead.
+        """
+        if self.enable_swa_scratch_reuse:
+            raise RuntimeError(
+                "the pages of a block are not affine in its base page index with SWA scratch reuse"
+            )
+        layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
+        converter = self.impl.get_page_index_converter(layer_id, attn_type.role)
+        if converter.expansion != 1:
+            raise RuntimeError(
+                f"layer {layer_idx} {attn_type.name} expands a block to {converter.expansion} pages"
+            )
+        offset = (
+            converter.layer_offset if _get_index_mode(attn_type) == PageIndexMode.PER_LAYER else 0
+        )
+        return self.layer_to_pool_mapping_dict[layer_id], converter.scale, offset
+
+    def get_base_page_indices(self, request_id: int, layer_group_id: int) -> np.ndarray:
+        """The base page index of every block of ``request_id`` in ``layer_group_id``.
+
+        A read-only int32 view of the table the cache keeps, padded with ``BAD_PAGE_INDEX`` to the
+        capacity of the request. It is valid until the next lifecycle operation of the request.
+        """
+        return np.frombuffer(
+            self.kv_cache_map[request_id].get_base_page_indices(layer_group_id), dtype=np.int32
         )
 
     def _get_extra_quota_padding(self) -> int:

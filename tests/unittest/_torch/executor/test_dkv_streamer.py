@@ -204,6 +204,10 @@ class Options:
     fault: DataPlaneFault | None = None
     # Stops the forward pass of one rank in the middle of an iteration.
     stall: Stall | None = None
+    # The transport takes all the messages of a step in one call, as the NCCL one does.
+    grouped: bool = True
+    # The cache manager maps blocks to pages by an affine function of their base page index.
+    affine: bool = True
 
 
 def _corrupting(transport: FakeTransport, rank: int, options: Options) -> FakeTransport:
@@ -235,7 +239,9 @@ def _run_rank(
     blocks = sum(
         -(-prompt // _geometry(1).tokens_per_block) for prompt in scenario.prompts.values()
     )
-    manager = FakeKvManager(layout, owned_layers(owners, rank), pages=blocks + 2, seed=rank)
+    manager = FakeKvManager(
+        layout, owned_layers(owners, rank), pages=blocks + 2, seed=rank, affine=options.affine
+    )
     seed = options.seed * 100 + rank
     data_class = _NoWait if options.deaf == "data" else FakeStream
     exec_class = _NoWait if options.deaf == "exec" else FakeStream
@@ -246,7 +252,7 @@ def _run_rank(
     streamer = DkvStreamer(
         manager,
         SimpleNamespace(layout=layout, pool=pool),
-        _corrupting(FakeTransport(network, rank), rank, options),
+        _corrupting(FakeTransport(network, rank, grouped=options.grouped), rank, options),
         owners,
         rank,
         group_size=group_size,
@@ -301,7 +307,7 @@ def _run_rank(
         errors.extend(_check_owner_pages(rank, layout, manager, written))
         largest = max((size for sizes in network.sent.values() for size in sizes), default=0)
         return RankReport(
-            streamer.stats, errors, largest, streamer._send_buffer.numel(), records, plans
+            streamer.stats, errors, largest, streamer._send_arena.numel(), records, plans
         )
     finally:
         exec_stream.close()
@@ -446,6 +452,23 @@ def test_the_pages_of_every_layer_reach_the_compute_rank_and_come_back(
     if group_size > 1:
         assert sum(s.bytes_sent for s in stats) > 0
     assert sum(s.bytes_local for s in stats) > 0
+
+
+@pytest.mark.parametrize("grouped,affine", [(False, True), (True, False), (False, False)])
+def test_the_pages_arrive_without_grouped_messages_and_without_the_affine_page_map(
+    grouped: bool, affine: bool
+) -> None:
+    # A transport that takes one message at a time pairs the messages up like the grouped one,
+    # and a cache manager that only lists page indices per (request, layer, buffer) is served too.
+    scenario = Scenario(3, 2, _PROMPTS, _spread(3, _PROMPTS), arrival={4: 1, 5: 2})
+    options = Options(data_jitter=0.001, exec_jitter=0.001, seed=7, grouped=grouped, affine=affine)
+    reports = run_group(scenario, options)
+    for rank, report in enumerate(reports):
+        assert report.errors == [], f"rank {rank}"
+    stats = [report.stats for report in reports]
+    assert sum(s.bytes_sent for s in stats) == sum(s.bytes_received for s in stats) > 0
+    assert sum(s.messages_sent for s in stats) == sum(s.messages_received for s in stats)
+    assert all(s.compile_seconds > 0 for s in stats)
     for rank, report in enumerate(reports):
         local_bytes = Counter()
         for plan in report.plans:

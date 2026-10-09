@@ -47,6 +47,10 @@ The model has two in-order queues per rank.
   because the data stream waits for the kernels enqueued before the hook. Every rank does so, one
   that computes nothing as well: a receive that started earlier would spin on its GPU for a message
   that is not sent yet.
+* Within a step a rank issues its local copies first and its messages after them. With
+  ``grouped`` the messages of a step go out as one group: they run side by side and the data stream
+  continues only when all of them are done, as a transport that puts them in one kernel behaves.
+  Without it they run one after the other.
 
 Not modeled: the host side of the hooks, which enqueue an operation only after the events it waits
 for are recorded and never block while doing it; communicators other than the one of the data plane;
@@ -159,25 +163,33 @@ def expand_plan(plan: DkvPlan) -> list[list[RankOp]]:
     return [list(plan.rank_program(rank)) for rank in range(plan.group_size)]
 
 
-def simulate(plan: DkvPlan, programs: Sequence[Sequence[RankOp]] | None = None) -> SimulationReport:
+def simulate(
+    plan: DkvPlan,
+    programs: Sequence[Sequence[RankOp]] | None = None,
+    *,
+    grouped: bool = False,
+) -> SimulationReport:
     """Check that the data plane of a plan pairs up and cannot deadlock.
 
     Args:
         plan: The plan, which gives the number of ranks and layers and the ring depth.
         programs: The operation sequence of every rank. Defaults to ``expand_plan(plan)``. Pass
             edited programs to see how the checks react to a bad plan.
+        grouped: Whether a rank issues the messages of a step as one group that finishes as a
+            whole, instead of one message after the other.
 
     Returns:
         The report; ``report.ok`` is true if no defect was found.
     """
     if programs is None:
         programs = expand_plan(plan)
-    return _Simulation(plan, programs).run()
+    return _Simulation(plan, programs, grouped=grouped).run()
 
 
 # A node of the wait-for graph: its kind and up to four integers that say which one it is. The
 # kinds are "attention" (rank, layer), "moe" (rank, layer), "exchange" (layer), "message" (sender,
-# send op, receiver, receive op) and "local" (rank, op). Unused integers are zero.
+# send op, receiver, receive op), "local" (rank, op) and "group" (rank, step position). Unused
+# integers are zero.
 _Key = tuple[str, int, int, int, int]
 # Why a node waits for another: a code and up to three integers, as in the table of
 # ``_describe_reason``.
@@ -211,9 +223,12 @@ class _Graph:
 
 
 class _Simulation:
-    def __init__(self, plan: DkvPlan, programs: Sequence[Sequence[RankOp]]) -> None:
+    def __init__(
+        self, plan: DkvPlan, programs: Sequence[Sequence[RankOp]], *, grouped: bool = False
+    ) -> None:
         self.plan = plan
         self.programs = [tuple(program) for program in programs]
+        self.grouped = grouped
         self.problems: list[Problem] = []
         order = global_step_order(plan.num_layers, plan.ring_depth)
         self.step_index = {(step.direction, step.layer): index for index, step in enumerate(order)}
@@ -429,11 +444,10 @@ class _Simulation:
                 transfer = op.transfer
                 if transfer.direction is Direction.WRITEBACK and op.action is not OpAction.RECV:
                     readers.setdefault(transfer.layer, []).append(index)
+            self._chain_stream(graph, rank, program, node_of)
             for index, op in enumerate(program):
                 transfer = op.transfer
                 node = node_of[(rank, index)]
-                if index:
-                    graph.wait(node, node_of[(rank, index - 1)], ("stream", rank, index, 0))
                 if transfer.direction is Direction.FETCH:
                     if op.action is not OpAction.SEND:
                         graph.wait(
@@ -454,6 +468,45 @@ class _Simulation:
                 if issued >= 1:
                     graph.wait(node, moe[rank][issued - 1], ("issued after", rank, index, issued))
         return graph
+
+    def _chain_stream(
+        self,
+        graph: _Graph,
+        rank: int,
+        program: Sequence[RankOp],
+        node_of: dict[tuple[int, int], int],
+    ) -> None:
+        """The order of the data stream of ``rank``: step by step, the local copies of a step and
+        then its messages, one after the other or as one group that finishes as a whole."""
+        previous: int | None = None
+        index = 0
+        while index < len(program):
+            step = (program[index].transfer.direction, program[index].transfer.layer)
+            end = index
+            while (
+                end < len(program)
+                and (program[end].transfer.direction, program[end].transfer.layer) == step
+            ):
+                end += 1
+            ops = range(index, end)
+            for i in (i for i in ops if program[i].action is OpAction.LOCAL):
+                if previous is not None:
+                    graph.wait(node_of[(rank, i)], previous, ("stream", rank, i, 0))
+                previous = node_of[(rank, i)]
+            members = [i for i in ops if program[i].action is not OpAction.LOCAL]
+            if self.grouped and len(members) > 1:
+                group = graph.node(("group", rank, self.step_index[step], 0, 0))
+                for i in members:
+                    if previous is not None:
+                        graph.wait(node_of[(rank, i)], previous, ("stream", rank, i, 0))
+                    graph.wait(group, node_of[(rank, i)], ("group member", rank, i, 0))
+                previous = group
+            else:
+                for i in members:
+                    if previous is not None:
+                        graph.wait(node_of[(rank, i)], previous, ("stream", rank, i, 0))
+                    previous = node_of[(rank, i)]
+            index = end
 
     @staticmethod
     def _stuck_nodes(graph: _Graph) -> list[int]:
@@ -541,6 +594,9 @@ class _Simulation:
                 f"message {transfer.label} {transfer.nbytes} B from rank {first} to rank "
                 f"{third} (op #{second} on rank {first}, op #{fourth} on rank {third})"
             )
+        if kind == "group":
+            order = global_step_order(self.plan.num_layers, self.plan.ring_depth)[second]
+            return f"the group of messages of {step_label(order.direction, order.layer)} on rank {first}"
         return f"rank {first} op #{second} ({self.programs[first][second].describe()})"
 
     @staticmethod
@@ -548,6 +604,8 @@ class _Simulation:
         code, first, second, third = reason
         if code == "stream":
             return f"rank {first} issues its op #{second} after its previous op"
+        if code == "group member":
+            return f"the group on rank {first} finishes when its member op #{second} is done"
         if code == "next layer":
             return f"rank {first} computes layer {second} after the layer before"
         if code == "exchange needs":

@@ -32,6 +32,7 @@ import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import get_token_bytes
@@ -810,6 +811,39 @@ class DkvPageCopier:
         from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2_utils
 
         self._utils = kv_cache_manager_v2_utils
+        # A native build before the address-tensor entry point takes one task object per page.
+        self._copy_addresses = getattr(
+            kv_cache_manager_v2_utils, "copy_device_to_device_addresses", None
+        )
+
+    def copy_addresses(
+        self, destinations: np.ndarray, sources: np.ndarray, num_bytes: int, stream: int
+    ) -> None:
+        """Copy ``num_bytes`` from every source address to the destination address at its position.
+
+        Args:
+            destinations: The int64 device addresses the copies write to, one per page.
+            sources: The int64 device addresses the copies read from, as many as ``destinations``.
+            num_bytes: The size of every copy, a positive multiple of 16.
+            stream: The CUDA stream handle the copies are enqueued on.
+        """
+        if num_bytes <= 0 or num_bytes % 16:
+            raise ValueError(f"num_bytes must be a positive multiple of 16, got {num_bytes}")
+        if len(destinations) != len(sources):
+            raise ValueError(
+                f"{len(destinations)} destination addresses but {len(sources)} source addresses"
+            )
+        if self._copy_addresses is None:
+            self.copy(list(zip(destinations.tolist(), sources.tolist())), num_bytes, stream)
+            return
+        result = self._copy_addresses(
+            torch.from_numpy(np.ascontiguousarray(destinations, dtype=np.int64)),
+            torch.from_numpy(np.ascontiguousarray(sources, dtype=np.int64)),
+            num_bytes,
+            stream,
+        )
+        if result != 0:
+            raise RuntimeError(f"copy_device_to_device_addresses failed with CUDA error {result}")
 
     def copy(self, pairs: Sequence[tuple[int, int]], num_bytes: int, stream: int) -> None:
         """Copy ``num_bytes`` from the source to the destination address of every pair.

@@ -134,6 +134,35 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         "Copy data from device to device using CUDA kernels");
 
     module.def(
+        "copy_device_to_device_addresses",
+        [](at::Tensor const& destinations, at::Tensor const& sources, ssize_t numBytes, uintptr_t stream) -> int
+        {
+            TLLM_CHECK_WITH_INFO(destinations.device().is_cpu() && sources.device().is_cpu(),
+                "The address tensors must live in host memory.");
+            TLLM_CHECK_WITH_INFO(destinations.scalar_type() == at::kLong && sources.scalar_type() == at::kLong,
+                "The address tensors must hold int64 device addresses.");
+            TLLM_CHECK_WITH_INFO(
+                destinations.is_contiguous() && sources.is_contiguous(), "The address tensors must be contiguous.");
+            TLLM_CHECK_WITH_INFO(destinations.numel() == sources.numel(),
+                "The address tensors must have the same length: %ld destinations, %ld sources.",
+                static_cast<long>(destinations.numel()), static_cast<long>(sources.numel()));
+            auto const count = static_cast<size_t>(destinations.numel());
+            auto const* dst = destinations.data_ptr<int64_t>();
+            auto const* src = sources.data_ptr<int64_t>();
+            std::vector<Task<MemAddress, MemAddress>> tasks(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                tasks[i]
+                    = Task<MemAddress, MemAddress>{static_cast<MemAddress>(dst[i]), static_cast<MemAddress>(src[i])};
+            }
+            return copyDeviceToDevice(tasks, numBytes, reinterpret_cast<CUstream>(stream));
+        },
+        nb::arg("destinations"), nb::arg("sources"), nb::arg("num_bytes"), nb::arg("stream"),
+        nb::call_guard<nb::gil_scoped_release>(),
+        "Copy num_bytes of device memory from every source address to the destination address at the same "
+        "position; the addresses are int64 host tensors");
+
+    module.def(
         "copy_batch_block_offsets_to_device",
         [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor indexScales, at::Tensor kvOffset,
             uintptr_t stream)

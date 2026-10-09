@@ -897,6 +897,10 @@ def test_plans_of_the_ownership_tables_of_compute_ownership_are_deadlock_free(
     assert report.num_messages == sum(not t.is_local for s in plan.steps for t in s.transfers)
     assert report.num_ops == sum(len(plan.rank_program(rank)) for rank in range(group_size))
     assert (report.num_ops == 0) == (placement == "dummy_only")
+    # The messages of a step issued as one group that finishes as a whole cannot deadlock either.
+    grouped = simulate(plan, grouped=True)
+    assert grouped.ok, str(grouped)
+    assert grouped.num_nodes >= report.num_nodes
 
 
 @pytest.mark.parametrize("ring_depth", [1, 2, 3])
@@ -913,8 +917,9 @@ def test_every_ownership_table_of_a_small_model_is_deadlock_free(
     for owners in itertools.product(range(group_size), repeat=num_layers):
         for batch in batches:
             plan = _plan(batch, owners, layer_types, group_size=group_size, ring_depth=ring_depth)
-            report = simulate(plan)
-            assert report.ok, f"owners {owners}: {report}"
+            for grouped in (False, True):
+                report = simulate(plan, grouped=grouped)
+                assert report.ok, f"owners {owners}, grouped {grouped}: {report}"
 
 
 @pytest.mark.parametrize("ring_depth", [1, 2, 3])
@@ -937,21 +942,24 @@ def test_random_ownership_tables_and_batches_of_a_larger_model_are_deadlock_free
                 for index in range(2 * group_size)
             ]
             plan = _plan(batch, owners, layer_types, group_size=group_size, ring_depth=ring_depth)
-            report = simulate(plan)
-            assert report.ok, f"owners {owners}: {report}"
+            for grouped in (False, True):
+                report = simulate(plan, grouped=grouped)
+                assert report.ok, f"owners {owners}, grouped {grouped}: {report}"
 
 
+@pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("ring_depth", [1, 2, 3])
 @pytest.mark.parametrize("group_size", [2, 4, 8])
 @pytest.mark.parametrize("placement", ["every_rank", "mixed_with_dummy_only_ranks"])
 def test_every_wait_of_a_plan_raises_the_potential_of_the_deadlock_argument(
-    group_size: int, ring_depth: int, placement: str
+    group_size: int, ring_depth: int, placement: str, grouped: bool
 ) -> None:
     """The graph has no cycle because a potential grows along every wait. Attention of layer l is
     4l, the MoE exchange of layer l 4l + 1, the MoE 4l + 2, the writeback of layer l 4l + 3 and the
     fetch of layer m, which is enqueued at the top of layer m - D + 1, is 4(m - D + 1) - 1/2. A
     wait between two operations of the same step is the order of one data stream, in which the
-    messages of a step are sorted by compute rank and deadline class."""
+    messages of a step are sorted by compute rank and deadline class; a group of messages has the
+    potential of its step and waits only for its members."""
     layer_types = _MODELS["v4_43_layers"]
     plan = _plan(
         _batch(placement, group_size),
@@ -960,9 +968,15 @@ def test_every_wait_of_a_plan_raises_the_potential_of_the_deadlock_argument(
         group_size=group_size,
         ring_depth=ring_depth,
     )
-    simulation = simulator_lib._Simulation(plan, expand_plan(plan))
+    simulation = simulator_lib._Simulation(plan, expand_plan(plan), grouped=grouped)
     assert not simulation.run().problems
     graph = simulation.graph
+    order = global_step_order(plan.num_layers, plan.ring_depth)
+
+    def step_potential(direction, layer: int) -> float:
+        if direction is FETCH:
+            return 4 * (layer - ring_depth + 1) - 0.5
+        return 4 * layer + 3
 
     def potential(node: int) -> float:
         kind, first, second, _, _ = graph.keys[node]
@@ -972,17 +986,21 @@ def test_every_wait_of_a_plan_raises_the_potential_of_the_deadlock_argument(
             return 4 * second + 2
         if kind == "exchange":
             return 4 * first + 1
+        if kind == "group":
+            return step_potential(order[second].direction, order[second].layer)
         transfer = simulation.programs[first][second].transfer  # a message or a local copy
-        if transfer.direction is FETCH:
-            return 4 * (transfer.layer - ring_depth + 1) - 0.5
-        return 4 * transfer.layer + 3
+        return step_potential(transfer.direction, transfer.layer)
 
+    groups = 0
     for node, prerequisites in enumerate(graph.prerequisites):
+        groups += graph.keys[node][0] == "group"
         for prerequisite, reason in prerequisites.items():
             before, after = potential(prerequisite), potential(node)
-            assert before < after or (before == after and reason[0] == "stream"), (
-                f"{graph.keys[prerequisite]} -> {graph.keys[node]} ({reason[0]})"
-            )
+            assert before < after or (
+                before == after and reason[0] in ("stream", "group member")
+            ), f"{graph.keys[prerequisite]} -> {graph.keys[node]} ({reason[0]})"
+    # A step sends an owner's messages of several deadline classes and peers together.
+    assert (groups > 0) == grouped
 
 
 def test_a_report_counts_what_it_checked() -> None:

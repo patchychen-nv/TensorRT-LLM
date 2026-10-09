@@ -23,6 +23,7 @@ to the implementation, so a caller must not rely on it (see ``dkv_plan``, which 
 so that no rank waits on a message that its peer has not yet reached).
 """
 
+from collections.abc import Sequence
 from typing import Protocol
 
 import torch
@@ -43,6 +44,10 @@ class DkvTransport(Protocol):
         ...
 
 
+Message = tuple[torch.Tensor, int]
+"""A buffer and the peer it goes to or comes from."""
+
+
 class NcclP2PTransport:
     """Point-to-point messages over a communicator of its own.
 
@@ -50,6 +55,10 @@ class NcclP2PTransport:
     construct the transport at the same time, from the thread that runs the collective setup of the
     process and before any other communicator is active on the device. Creating it blocks until all
     ranks have arrived. The ranks of the DKV group are the ranks of the world.
+
+    ``group_send_recv`` issues all the messages of a step in one NCCL group, which NCCL runs as one
+    kernel. It is ``None`` on a native build whose communicator op has no group call; the streamer
+    then sends and receives one message at a time.
     """
 
     def __init__(self, world_size: int, rank: int) -> None:
@@ -58,6 +67,8 @@ class NcclP2PTransport:
         self.world_size = world_size
         self.rank = rank
         self._comm = torch.classes.trtllm.NcclCommunicatorOp(world_size, rank)
+        if not hasattr(self._comm, "group_send_recv"):
+            self.group_send_recv = None
 
     def send(self, buffer: torch.Tensor, peer: int, stream: torch.cuda.Stream) -> None:
         with torch.cuda.stream(stream):
@@ -66,6 +77,22 @@ class NcclP2PTransport:
     def recv(self, buffer: torch.Tensor, peer: int, stream: torch.cuda.Stream) -> None:
         with torch.cuda.stream(stream):
             self._comm.recv(buffer, peer)
+
+    def group_send_recv(
+        self, sends: Sequence[Message], recvs: Sequence[Message], stream: torch.cuda.Stream
+    ) -> None:
+        """Enqueue every send and receive of ``sends`` and ``recvs`` on ``stream`` as one group.
+
+        The messages to one peer keep their order, so a peer that issues its side of them one at a
+        time pairs them up the same way.
+        """
+        self._comm.group_send_recv(
+            [buffer for buffer, _ in sends],
+            [peer for _, peer in sends],
+            [buffer for buffer, _ in recvs],
+            [peer for _, peer in recvs],
+            stream.cuda_stream,
+        )
 
     def warmup(self, stream: torch.cuda.Stream) -> None:
         """Exchange one message between every two ranks so that no connection is made lazily.

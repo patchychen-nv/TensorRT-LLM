@@ -32,33 +32,62 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.pyexecutor.dkv_staging import BAD_PAGE_INDEX, StagingLayout
 
 
 class FakeEvent:
-    """An event that the stream records when it reaches it."""
+    """An event that the stream records when it reaches it.
+
+    Like a CUDA event it can be recorded again and again: a wait enqueued after a record waits for
+    that record and not for a later one, and ``query`` asks about the latest record. An event that
+    was never recorded is never reached, so a wait on it times out instead of passing.
+    """
 
     def __init__(
         self, *, enable_timing: bool = False, clock: Callable[[], float] = time.perf_counter
     ) -> None:
-        self._recorded = threading.Event()
+        self._condition = threading.Condition()
+        self._armed = 0  # records enqueued so far
+        self._reached = 0  # records the stream has carried out
         self._enable_timing = enable_timing
         self._clock = clock
         self._timestamp: float | None = None
 
-    def record(self) -> None:
-        if self._enable_timing:
-            self._timestamp = self._clock()
-        self._recorded.set()
+    def arm(self) -> int:
+        """Count a record that is about to be enqueued; returns its generation."""
+        with self._condition:
+            self._armed += 1
+            return self._armed
+
+    @property
+    def armed(self) -> int:
+        with self._condition:
+            return self._armed
+
+    def record(self, generation: int | None = None) -> None:
+        with self._condition:
+            if self._enable_timing:
+                self._timestamp = self._clock()
+            if generation is None:
+                generation = self._armed = self._armed + 1
+            self._reached = max(self._reached, generation)
+            self._condition.notify_all()
 
     def query(self) -> bool:
-        return self._recorded.is_set()
+        with self._condition:
+            return self._armed > 0 and self._reached >= self._armed
 
-    def wait(self, timeout: float) -> None:
-        if not self._recorded.wait(timeout):
-            raise TimeoutError("an event was waited for but never recorded")
+    def wait(self, timeout: float, generation: int | None = None) -> None:
+        with self._condition:
+            target = self._armed if generation is None else generation
+            reached = self._condition.wait_for(
+                lambda: target > 0 and self._reached >= target, timeout
+            )
+            if not reached:
+                raise TimeoutError("an event was waited for but never recorded")
 
     def synchronize(self) -> None:
         self.wait(10.0)
@@ -110,11 +139,14 @@ class FakeStream:
 
     def record_event(self, event: FakeEvent | None = None) -> FakeEvent:
         event = event if event is not None else FakeEvent()
-        self.enqueue(event.record)
+        generation = event.arm()
+        self.enqueue(lambda: event.record(generation))
         return event
 
     def wait_event(self, event: FakeEvent) -> None:
-        self.enqueue(lambda: event.wait(self.timeout))
+        # As a CUDA stream does: wait for the record that exists now, not for a later one.
+        generation = event.armed
+        self.enqueue(lambda: event.wait(self.timeout, generation))
 
     def synchronize(self) -> None:
         self.record_event().wait(self.timeout)
@@ -147,13 +179,31 @@ class FakeNetwork:
 
 
 class FakeTransport:
-    """``DkvTransport`` of one rank on a ``FakeNetwork``, with the semantics of the real one."""
+    """``DkvTransport`` of one rank on a ``FakeNetwork``, with the semantics of the real one.
 
-    def __init__(self, network: FakeNetwork, rank: int) -> None:
+    ``grouped`` offers ``group_send_recv`` as the NCCL transport does; without it the streamer
+    sends and receives one message at a time.
+    """
+
+    def __init__(self, network: FakeNetwork, rank: int, *, grouped: bool = True) -> None:
         self._network = network
         self._rank = rank
         # Hook for fault injection: called with the bytes of a message before it is delivered.
         self.corrupt: Callable[[int, int, bytearray], None] | None = None
+        if not grouped:
+            self.group_send_recv = None
+
+    def group_send_recv(
+        self,
+        sends: Sequence[tuple[torch.Tensor, int]],
+        recvs: Sequence[tuple[torch.Tensor, int]],
+        stream: FakeStream,
+    ) -> None:
+        """All the messages of a step: the sends first, then the receives, in list order."""
+        for buffer, peer in sends:
+            self.send(buffer, peer, stream)
+        for buffer, peer in recvs:
+            self.recv(buffer, peer, stream)
 
     def send(self, buffer: torch.Tensor, peer: int, stream: FakeStream) -> None:
         network, rank = self._network, self._rank
@@ -206,6 +256,15 @@ class FakeCopier:
 
         FakeStream.of_handle(stream).enqueue(work)
 
+    def copy_addresses(
+        self, destinations: np.ndarray, sources: np.ndarray, num_bytes: int, stream: int
+    ) -> None:
+        if len(destinations) != len(sources):
+            raise ValueError(
+                f"{len(destinations)} destination addresses but {len(sources)} source addresses"
+            )
+        self.copy(list(zip(destinations.tolist(), sources.tolist())), num_bytes, stream)
+
 
 class HostDataPlaneDebug:
     """``DataPlaneDebug`` on host memory: the checks run on the fake stream, in its order."""
@@ -247,8 +306,17 @@ class FakeKvManager:
     """
 
     def __init__(
-        self, layout: StagingLayout, owned_layers: Sequence[int], pages: int, seed: int = 0
+        self,
+        layout: StagingLayout,
+        owned_layers: Sequence[int],
+        pages: int,
+        seed: int = 0,
+        *,
+        affine: bool = True,
     ) -> None:
+        """``affine`` offers the page tables the way the DeepSeek-V4 manager does, as base page
+        indices per layer group with an affine map per buffer; without it the streamer asks for
+        the page indices of every (request, layer, buffer)."""
         self.layout = layout
         self.kv_cache_map: dict[int, object] = {}
         self._random = random.Random(seed)
@@ -265,12 +333,27 @@ class FakeKvManager:
                     free = list(range(pages))
                     self._random.shuffle(free)
                     self._free[key] = free
+        # Every buffer is a layer group of its own: the fake has no pool shared between layers.
+        self._group_keys = list(self._buffers)
+        self._groups = {key: group for group, key in enumerate(self._group_keys)}
+        if not affine:
+            self.get_cache_index_affine = None
+            self.get_base_page_indices = None
 
     def get_buffers(self, layer: int, attention_type) -> torch.Tensor:
         return self._buffers[layer, attention_type]
 
     def get_cache_indices(self, request_id: int, layer: int, attention_type) -> list[int]:
         return list(self._indices[request_id, layer, attention_type])
+
+    def get_cache_index_affine(self, layer: int, attention_type) -> tuple[int, int, int]:
+        return self._groups[layer, attention_type], 1, 0
+
+    def get_base_page_indices(self, request_id: int, group: int) -> np.ndarray:
+        layer, attention_type = self._group_keys[group]
+        return np.asarray(
+            self._indices.get((request_id, layer, attention_type), []), dtype=np.int32
+        )
 
     def prepare(self, request_id: int, history: int, chunk: int) -> None:
         self.kv_cache_map[request_id] = object()

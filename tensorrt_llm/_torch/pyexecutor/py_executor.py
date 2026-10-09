@@ -6382,6 +6382,9 @@ class PyExecutor:
             float(os.environ.get("TRTLLM_DKV_TRANSPORT_TIMEOUT_S", "60")),
             "fault":
             os.environ.get("TRTLLM_DKV_FAULT", ""),
+            # All the messages of a step in one NCCL group; 0 sends them one by one.
+            "p2p_groups":
+            os.environ.get("TRTLLM_DKV_P2P_GROUPS", "1") == "1",
         }
         fault = (DataPlaneFault.parse(settings["fault"])
                  if settings["fault"] else None)
@@ -6405,7 +6408,8 @@ class PyExecutor:
             fill=settings["staging_fill"],
             debug=(DeviceDataPlaneDebug(data_stream)
                    if dkv_debug_enabled() else None),
-            fault=fault)
+            fault=fault,
+            group_messages=settings["p2p_groups"])
         self._install_dkv_staged_view(view, settings)
         logger.info(
             f"DKV layer split: staging {pool.bytes_reserved / (1 << 20):.0f} MiB, "
