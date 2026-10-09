@@ -45,6 +45,12 @@ public:
     void groupSendRecv(std::vector<th::Tensor> sendTensors, std::vector<int64_t> sendPeers,
         std::vector<th::Tensor> recvTensors, std::vector<int64_t> recvPeers, int64_t stream) const;
 
+    //! groupSendRecv on raw device addresses and byte counts. The caller keeps the memory alive until the work
+    //! queued on the stream is done.
+    void groupSendRecvRaw(std::vector<int64_t> sendAddresses, std::vector<int64_t> sendBytes,
+        std::vector<int64_t> sendPeers, std::vector<int64_t> recvAddresses, std::vector<int64_t> recvBytes,
+        std::vector<int64_t> recvPeers, int64_t stream) const;
+
 private:
     int32_t mRank;
     std::shared_ptr<tensorrt_llm::runtime::NcclCommunicator> mPipelineComm;

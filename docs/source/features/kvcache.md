@@ -722,14 +722,18 @@ rank cancels the sends of all.
 `TRTLLM_DKV_STAGING_TOKENS`, `TRTLLM_DKV_STAGING_DEPTH` and `TRTLLM_DKV_STAGING_FILL` work as
 for the loopback. `TRTLLM_DKV_TRANSPORT_TIMEOUT_S` (default 60) is how long the host waits for
 the data plane at the end of an iteration before it fails; set it below the hang detector
-timeout. With `TRTLLM_DKV_DEBUG=1` every message is checksummed where it was packed, where it
+timeout. The messages a rank sends or receives in one step go out as one NCCL group, one kernel
+for all of them; `TRTLLM_DKV_P2P_GROUPS=0` sends them one by one instead. The plan of an
+iteration is resolved to device addresses once, when the staged batch is known, so the hooks of
+the forward pass only enqueue work. With `TRTLLM_DKV_DEBUG=1` every message is checksummed where it was packed, where it
 arrived and on the pages it was unpacked into, the ranks compare the checksums after every
 iteration, and a damaged message is named with its layer, direction and requests. To see that
 the check works, `TRTLLM_DKV_FAULT=<iteration or *>:<layer>:<fetch|writeback>[:<flip|zero>[:<rank>]]`
 damages the received messages of one step (`*`: of every iteration). With `TRTLLM_DKV_MEASUREMENT=1` the `dkvMeasurement` of an
 iteration-stats row also carries `data_plane`, the messages and bytes the rank has sent,
 received and copied locally, the host seconds of the hooks of the forward pass (`hook_seconds`:
-what the data plane adds to a pass that is bound by the host) and the host seconds that the end
+what the data plane adds to a pass that is bound by the host; `compile_seconds` is the part of
+it that resolved the plan of the iteration to addresses) and the host seconds that the end
 of an iteration waited for the data stream (`drain_seconds`). Local bytes are also separated into
 `bytes_local_fetch` and `bytes_local_writeback`; their sum is `bytes_local`. Set
 `TRTLLM_DKV_WAIT_TIMING=1` to measure the compute stream's GPU wait for layer fetches with CUDA

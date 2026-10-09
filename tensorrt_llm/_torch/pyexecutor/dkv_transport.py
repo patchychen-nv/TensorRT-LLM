@@ -69,6 +69,8 @@ class NcclP2PTransport:
         self._comm = torch.classes.trtllm.NcclCommunicatorOp(world_size, rank)
         if not hasattr(self._comm, "group_send_recv"):
             self.group_send_recv = None
+        # The raw entry point takes addresses and sizes, which spares the op the tensor arguments.
+        self._raw_groups = hasattr(self._comm, "group_send_recv_raw")
 
     def send(self, buffer: torch.Tensor, peer: int, stream: torch.cuda.Stream) -> None:
         with torch.cuda.stream(stream):
@@ -84,8 +86,20 @@ class NcclP2PTransport:
         """Enqueue every send and receive of ``sends`` and ``recvs`` on ``stream`` as one group.
 
         The messages to one peer keep their order, so a peer that issues its side of them one at a
-        time pairs them up the same way.
+        time pairs them up the same way. The buffers must stay alive until the work of ``stream``
+        that follows has run; the streamer's message arenas do.
         """
+        if self._raw_groups:
+            self._comm.group_send_recv_raw(
+                [buffer.data_ptr() for buffer, _ in sends],
+                [buffer.numel() * buffer.element_size() for buffer, _ in sends],
+                [peer for _, peer in sends],
+                [buffer.data_ptr() for buffer, _ in recvs],
+                [buffer.numel() * buffer.element_size() for buffer, _ in recvs],
+                [peer for _, peer in recvs],
+                stream.cuda_stream,
+            )
+            return
         self._comm.group_send_recv(
             [buffer for buffer, _ in sends],
             [peer for _, peer in sends],

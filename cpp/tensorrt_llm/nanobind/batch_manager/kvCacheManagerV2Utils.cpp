@@ -26,6 +26,9 @@
 #include <nanobind/stl/vector.h>
 #include <torch/extension.h>
 
+#include <algorithm>
+#include <utility>
+
 namespace tr = tensorrt_llm::runtime;
 namespace nb = nanobind;
 
@@ -161,6 +164,64 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         nb::call_guard<nb::gil_scoped_release>(),
         "Copy num_bytes of device memory from every source address to the destination address at the same "
         "position; the addresses are int64 host tensors");
+
+    // A run is eight integers: the page bytes, the page count, then for the destination and for the source a
+    // base address, an address step and the host address of `count` int32 page indices (0: the pages follow
+    // each other). Page i of a side is at base + (indices ? indices[i] : i) * step. A negative index is a block
+    // without a page.
+    module.def(
+        "copy_device_to_device_runs",
+        [](std::vector<int64_t> const& runs, uintptr_t stream) -> int
+        {
+            constexpr size_t kFields = 8;
+            TLLM_CHECK_WITH_INFO(
+                runs.size() % kFields == 0, "A run is %zu integers, %zu were given.", kFields, runs.size());
+            std::vector<std::pair<int64_t, std::vector<Task<MemAddress, MemAddress>>>> bySize;
+            for (size_t r = 0; r < runs.size(); r += kFields)
+            {
+                int64_t const pageBytes = runs[r];
+                int64_t const count = runs[r + 1];
+                int64_t const dstBase = runs[r + 2];
+                int64_t const dstStep = runs[r + 3];
+                auto const* dstIndices = reinterpret_cast<int32_t const*>(static_cast<uintptr_t>(runs[r + 4]));
+                int64_t const srcBase = runs[r + 5];
+                int64_t const srcStep = runs[r + 6];
+                auto const* srcIndices = reinterpret_cast<int32_t const*>(static_cast<uintptr_t>(runs[r + 7]));
+                auto group = std::find_if(
+                    bySize.begin(), bySize.end(), [pageBytes](auto const& entry) { return entry.first == pageBytes; });
+                if (group == bySize.end())
+                {
+                    bySize.emplace_back(pageBytes, std::vector<Task<MemAddress, MemAddress>>{});
+                    group = std::prev(bySize.end());
+                }
+                auto& tasks = group->second;
+                tasks.reserve(tasks.size() + static_cast<size_t>(std::max<int64_t>(count, 0)));
+                for (int64_t i = 0; i < count; ++i)
+                {
+                    int64_t const d = dstIndices != nullptr ? dstIndices[i] : i;
+                    int64_t const s = srcIndices != nullptr ? srcIndices[i] : i;
+                    if (d < 0 || s < 0)
+                    {
+                        return -1;
+                    }
+                    tasks.push_back(Task<MemAddress, MemAddress>{static_cast<MemAddress>(dstBase + d * dstStep),
+                        static_cast<MemAddress>(srcBase + s * srcStep)});
+                }
+            }
+            for (auto const& [pageBytes, tasks] : bySize)
+            {
+                auto const result = copyDeviceToDevice(tasks, pageBytes, reinterpret_cast<CUstream>(stream));
+                if (result != CUDA_SUCCESS)
+                {
+                    return static_cast<int>(result);
+                }
+            }
+            return 0;
+        },
+        nb::arg("runs"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Copy the pages of runs of device memory, eight integers per run (page bytes, count, destination base, "
+        "step and index address, source base, step and index address); returns -1 for a block without a page, "
+        "else the CUDA result");
 
     module.def(
         "copy_batch_block_offsets_to_device",

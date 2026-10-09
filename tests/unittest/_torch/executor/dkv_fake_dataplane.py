@@ -35,7 +35,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import torch
 
-from tensorrt_llm._torch.pyexecutor.dkv_staging import BAD_PAGE_INDEX, StagingLayout
+from tensorrt_llm._torch.pyexecutor.dkv_staging import BAD_PAGE_INDEX, StagingLayout, expand_runs
 
 
 class FakeEvent:
@@ -264,6 +264,10 @@ class FakeCopier:
                 f"{len(destinations)} destination addresses but {len(sources)} source addresses"
             )
         self.copy(list(zip(destinations.tolist(), sources.tolist())), num_bytes, stream)
+
+    def copy_runs(self, runs: Sequence[int], stream: int) -> None:
+        for page_bytes, destinations, sources in expand_runs(runs):
+            self.copy_addresses(destinations, sources, page_bytes, stream)
 
 
 class HostDataPlaneDebug:

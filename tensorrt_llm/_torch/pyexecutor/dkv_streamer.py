@@ -189,21 +189,37 @@ class LoopbackStreamer:
 
 
 class LayoutCostModel:
-    """The sizes of the staging layout in the form the plan asks for them."""
+    """The sizes of the staging layout in the form the plan asks for them.
+
+    The cost of a kind depends on the history and the chunk of the request only, so the costs of
+    the requests of an iteration are computed once and looked up for every layer.
+    """
+
+    # Costs remembered before the table is emptied; a few per request and kind are in use.
+    _MAX_REMEMBERED = 4096
 
     def __init__(self, layout: StagingLayout) -> None:
         self._layout = layout
+        self._costs: dict[tuple[StagingKind, int, int], PageCost] = {}
 
     def page_cost(self, layer: int, kind: StagingKind, history: int, chunk: int) -> PageCost:
-        layout = self._layout
-        page_bytes = layout.kind_page_bytes(kind)
-        if chunk < 1:
-            return PageCost(page_bytes, 0, 0)
-        return PageCost(
-            page_bytes,
-            layout.fetch_range(kind, history, chunk)[1],
-            layout.writeback_range(kind, history, chunk)[1],
-        )
+        key = (kind, history, chunk)
+        cost = self._costs.get(key)
+        if cost is None:
+            layout = self._layout
+            page_bytes = layout.kind_page_bytes(kind)
+            if chunk < 1:
+                cost = PageCost(page_bytes, 0, 0)
+            else:
+                cost = PageCost(
+                    page_bytes,
+                    layout.fetch_range(kind, history, chunk)[1],
+                    layout.writeback_range(kind, history, chunk)[1],
+                )
+            if len(self._costs) >= self._MAX_REMEMBERED:
+                self._costs.clear()
+            self._costs[key] = cost
+        return cost
 
 
 def max_message_bytes(layout: StagingLayout) -> int:
@@ -295,6 +311,12 @@ class _Run(NamedTuple):
     offset: int
 
 
+# One side of a copy of the pages of a run, as ``DkvPageCopier.copy_runs`` reads it: a base
+# address, an address step and the host address of the int32 page indices of the blocks, or 0 when
+# the pages follow each other.
+_Side = tuple[int, int, int]
+
+
 class _CompiledOp(NamedTuple):
     """One operation of the data plane with its copies resolved to device addresses."""
 
@@ -302,14 +324,15 @@ class _CompiledOp(NamedTuple):
     key: tuple[int, int, int, int, int]
     # The region of the message arena the message occupies; None for a local copy.
     message: torch.Tensor | None
-    # The copies the operation issues: (page bytes, destination addresses, source addresses). A
-    # send packs pages into its message, a receive unpacks its message into pages and a local copy
-    # moves pages between the cache manager and the staging area.
-    copies: tuple[tuple[int, np.ndarray, np.ndarray], ...]
+    # The copies the operation issues, as the runs of ``DkvPageCopier.copy_runs``. A send packs
+    # pages into its message, a receive unpacks its message into pages and a local copy moves
+    # pages between the cache manager and the staging area.
+    copies: list[int]
     runs: tuple[_Run, ...]
-    # The addresses of the pages of every run on this rank, for the checksums of debug: the pages
-    # a message was packed from or unpacked into, or (source, destination) of a local copy.
-    pages: tuple[tuple[np.ndarray, ...], ...]
+    # Where the pages of every run are on this rank, as copy sides, for the checksums of debug:
+    # the pages a message was packed from or unpacked into, or (source, destination) of a local
+    # copy.
+    pages: tuple[tuple[_Side, ...], ...]
 
 
 class _CompiledStep(NamedTuple):
@@ -487,10 +510,6 @@ def find_data_plane_mismatches(
                     f"{where}: rank {rank} has {role} {values[role]:#x}, not {reference:#x}"
                 )
     return problems
-
-
-def _concatenated(arrays: Sequence[np.ndarray]) -> np.ndarray:
-    return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
 
 
 class DkvStreamer:
@@ -847,8 +866,8 @@ class DkvStreamer:
         transfer = op.transfer
         layer = transfer.layer
         runs = tuple(self._message_runs(transfer))
-        pool = tuple(self._pool_addresses(layer, run) for run in runs)
-        staging = tuple(self._staging_addresses(layer, run) for run in runs)
+        pool = tuple(self._pool_side(layer, run) for run in runs)
+        staging = tuple(self._staging_side(layer, run) for run in runs)
         if transfer.direction is Direction.FETCH:
             sources, destinations = pool, staging
         else:
@@ -857,7 +876,7 @@ class DkvStreamer:
             op,
             message_key(transfer),
             None,
-            self._group_copies(runs, destinations, sources),
+            self._copy_runs(runs, destinations, sources),
             runs,
             (sources, destinations),
         )
@@ -880,34 +899,28 @@ class DkvStreamer:
             )
         message = arena[offset:end]
         base = arena.data_ptr() + offset
-        addresses_of = (
-            self._pool_addresses if op.rank == transfer.owner else self._staging_addresses
-        )
-        pages = tuple(addresses_of(layer, run) for run in runs)
-        in_message = tuple(self._message_addresses(base, run) for run in runs)
+        side_of = self._pool_side if op.rank == transfer.owner else self._staging_side
+        pages = tuple(side_of(layer, run) for run in runs)
+        in_message = tuple(self._message_side(base, run) for run in runs)
         if op.action is OpAction.SEND:
-            copies = self._group_copies(runs, in_message, pages)
+            copies = self._copy_runs(runs, in_message, pages)
         else:
-            copies = self._group_copies(runs, pages, in_message)
+            copies = self._copy_runs(runs, pages, in_message)
         compiled = _CompiledOp(op, message_key(transfer), message, copies, runs, (pages,))
         return compiled, -(-end // _MESSAGE_ALIGNMENT) * _MESSAGE_ALIGNMENT
 
-    def _group_copies(
-        self,
-        runs: Sequence[_Run],
-        destinations: Sequence[np.ndarray],
-        sources: Sequence[np.ndarray],
-    ) -> tuple[tuple[int, np.ndarray, np.ndarray], ...]:
-        """The copies of the runs, one entry per page size whatever the number of runs."""
-        by_size: dict[int, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+    def _copy_runs(
+        self, runs: Sequence[_Run], destinations: Sequence[_Side], sources: Sequence[_Side]
+    ) -> list[int]:
+        """The runs of a copy from ``sources`` to ``destinations`` as ``copy_runs`` reads them."""
+        page_bytes = self._layout.page_bytes
+        flat: list[int] = []
         for run, destination, source in zip(runs, destinations, sources):
-            group = by_size.setdefault(self._layout.page_bytes(run.component), ([], []))
-            group[0].append(destination)
-            group[1].append(source)
-        return tuple(
-            (page_bytes, _concatenated(group[0]), _concatenated(group[1]))
-            for page_bytes, group in by_size.items()
-        )
+            flat.append(page_bytes(run.component))
+            flat.append(run.count)
+            flat.extend(destination)
+            flat.extend(source)
+        return flat
 
     # ---- issuing the steps ----------------------------------------------------------------
 
@@ -937,7 +950,7 @@ class DkvStreamer:
             nbytes = op.op.transfer.nbytes
             if debug is not None:
                 self._checksum_pages(op.key, "source", nbytes, op.runs, op.pages[0])
-            self._copy(op.copies, stream)
+            self._copy(op.copies, stream, op.op.transfer.label)
             if debug is not None:
                 self._checksum_pages(op.key, "stored", nbytes, op.runs, op.pages[1])
             stats.local_copies += 1
@@ -948,7 +961,7 @@ class DkvStreamer:
                 stats.bytes_local_writeback += nbytes
         if compiled.sends:
             for op in compiled.sends:
-                self._copy(op.copies, stream)
+                self._copy(op.copies, stream, op.op.transfer.label)
                 if debug is not None:
                     debug.checksum(op.key, "sent", op.message)
             self._transfer(compiled.sends, ())
@@ -962,7 +975,7 @@ class DkvStreamer:
                     debug.corrupt(op.message, self._fault.kind)
                 if debug is not None:
                     debug.checksum(op.key, "received", op.message)
-                self._copy(op.copies, stream)
+                self._copy(op.copies, stream, op.op.transfer.label)
                 if debug is not None:
                     self._checksum_pages(op.key, "stored", nbytes, op.runs, op.pages[0])
             stats.messages_received += len(compiled.recvs)
@@ -995,22 +1008,23 @@ class DkvStreamer:
         )
 
     def _checksum_pages(
-        self,
-        key: tuple,
-        role: str,
-        nbytes: int,
-        runs: Sequence[_Run],
-        addresses: Sequence[np.ndarray],
+        self, key: tuple, role: str, nbytes: int, runs: Sequence[_Run], pages: Sequence[_Side]
     ) -> None:
-        """Read the pages at ``addresses`` back into the order of a message and checksum them."""
+        """Read the pages at ``pages`` back into the order of a message and checksum them."""
         base = self._scratch.data_ptr()
-        in_scratch = tuple(self._message_addresses(base, run) for run in runs)
-        self._copy(self._group_copies(runs, in_scratch, addresses), self._data_stream.cuda_stream)
+        in_scratch = tuple(self._message_side(base, run) for run in runs)
+        self._copy(
+            self._copy_runs(runs, in_scratch, pages),
+            self._data_stream.cuda_stream,
+            f"the {role} checksum of {step_label(Direction(key[0]), key[1])}",
+        )
         self._debug.checksum(key, role, self._scratch[:nbytes])
 
-    def _copy(self, copies: Sequence[tuple[int, np.ndarray, np.ndarray]], stream: int) -> None:
-        for page_bytes, destinations, sources in copies:
-            self._copier.copy_addresses(destinations, sources, page_bytes, stream)
+    def _copy(self, copies: Sequence[int], stream: int, what: str) -> None:
+        try:
+            self._copier.copy_runs(copies, stream)
+        except RuntimeError as error:
+            raise RuntimeError(f"rank {self._rank}: {what}: {error}") from error
 
     # ---- where the pages are --------------------------------------------------------------
 
@@ -1040,19 +1054,24 @@ class DkvStreamer:
             )
         return runs
 
-    def _message_addresses(self, base: int, run: _Run) -> np.ndarray:
-        """The addresses of the pages of a run in a message buffer that starts at ``base``."""
-        page_bytes = self._layout.page_bytes(run.component)
-        return (base + run.offset) + np.arange(run.count, dtype=np.int64) * page_bytes
+    def _message_side(self, base: int, run: _Run) -> _Side:
+        """The pages of a run in a message buffer that starts at ``base``: back to back."""
+        return (base + run.offset, self._layout.page_bytes(run.component), 0)
 
-    def _pool_addresses(self, layer: int, run: _Run) -> np.ndarray:
-        """The addresses of the pages of a run in the cache manager of this rank."""
+    def _pool_side(self, layer: int, run: _Run) -> _Side:
+        """The pages of a run in the cache manager of this rank: through their page indices.
+
+        The copier reads the indices from the table of the cache manager itself (or from a copy of
+        the list an older manager gives) and reports a block without a page.
+        """
         attention_type = run.component.attention_type
         if self._affine_pages:
             group, step, origin = self._affine(layer, attention_type)
             indices = self._base_indices.get((run.request_id, group))
             if indices is None:
-                indices = np.asarray(self._manager.get_base_page_indices(run.request_id, group))
+                indices = np.ascontiguousarray(
+                    self._manager.get_base_page_indices(run.request_id, group), dtype=np.int32
+                )
                 self._base_indices[run.request_id, group] = indices
         else:
             origin, step = self._page_table(layer, attention_type)
@@ -1061,22 +1080,16 @@ class DkvStreamer:
             if indices is None:
                 indices = np.asarray(
                     self._manager.get_cache_indices(run.request_id, layer, attention_type),
-                    dtype=np.int64,
+                    dtype=np.int32,
                 )
                 self._indices[key] = indices
-        chosen = indices[run.first : run.first + run.count]
-        if len(chosen) != run.count or (chosen == BAD_PAGE_INDEX).any():
-            block = next(
-                block
-                for block in range(run.first, run.first + run.count)
-                if block >= len(indices) or indices[block] == BAD_PAGE_INDEX
-            )
+        if len(indices) < run.first + run.count:
             raise RuntimeError(
-                f"rank {self._rank}: the cache manager has no page for block {block} of "
+                f"rank {self._rank}: the cache manager has no page for block {len(indices)} of "
                 f"request {run.request_id} in layer {layer} ({attention_type.name}), which the "
                 "plan moves"
             )
-        return origin + chosen.astype(np.int64) * step
+        return (origin, step, indices.ctypes.data + 4 * run.first)
 
     def _affine(self, layer: int, attention_type) -> tuple[int, int, int]:
         """``(layer group, address step, address origin)`` of the pages of a buffer.
@@ -1105,8 +1118,8 @@ class DkvStreamer:
             self._page_tables[layer, attention_type] = table
         return table
 
-    def _staging_addresses(self, layer: int, run: _Run) -> np.ndarray:
-        """The addresses of the pages of a run in the slot of ``layer`` of this rank."""
+    def _staging_side(self, layer: int, run: _Run) -> _Side:
+        """The pages of a run in the slot of ``layer`` of this rank: back to back."""
         layout = self._layout
         component = run.component
         index = self._local_index.get(run.request_id)
@@ -1132,4 +1145,4 @@ class DkvStreamer:
             - span.first_block
         )
         begin = self._pool.layer_pointer(layer, component) + entry * page_bytes
-        return begin + np.arange(run.count, dtype=np.int64) * page_bytes
+        return (begin, page_bytes, 0)

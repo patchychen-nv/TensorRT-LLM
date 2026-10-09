@@ -539,6 +539,86 @@ def test_copying_by_address_arrays_moves_the_same_pages_as_the_task_list(
         copier.copy_addresses(sources[:2], sources[:1], page_bytes, stream.cuda_stream)
 
 
+def test_copying_runs_follows_the_page_indices_of_a_side_and_names_a_missing_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copier = DkvPageCopier()
+    pages, page_bytes = 300, 2048
+    source = torch.randint(0, 255, (pages, page_bytes), dtype=torch.uint8, device="cuda")
+    order = np.random.default_rng(3).permutation(pages).astype(np.int32)
+    stream = torch.cuda.Stream()
+
+    def copied(indexed_side: str) -> torch.Tensor:
+        target = torch.zeros_like(source)
+        if indexed_side == "destination":
+            # Page i of the source goes to page order[i] of the target.
+            runs = [
+                page_bytes,
+                pages,
+                target.data_ptr(),
+                page_bytes,
+                order.ctypes.data,
+                source.data_ptr(),
+                page_bytes,
+                0,
+            ]
+        else:
+            # Page i of the target comes from page order[i] of the source.
+            runs = [
+                page_bytes,
+                pages,
+                target.data_ptr(),
+                page_bytes,
+                0,
+                source.data_ptr(),
+                page_bytes,
+                order.ctypes.data,
+            ]
+        copier.copy_runs(runs, stream.cuda_stream)
+        stream.synchronize()
+        return target
+
+    permutation = torch.from_numpy(order.astype(np.int64)).cuda()
+    assert torch.equal(copied("destination")[permutation], source)
+    assert torch.equal(copied("source"), source[permutation])
+    # Two runs of different page sizes in one call, and a block without a page is reported.
+    bad = order.copy()
+    bad[7] = -1
+    with pytest.raises(RuntimeError, match="without a page"):
+        copier.copy_runs(
+            [
+                page_bytes,
+                pages,
+                source.data_ptr(),
+                page_bytes,
+                bad.ctypes.data,
+                source.data_ptr(),
+                page_bytes,
+                0,
+            ],
+            stream.cuda_stream,
+        )
+    with pytest.raises(ValueError, match="integers"):
+        copier.copy_runs([page_bytes, pages, 0], stream.cuda_stream)
+    # The same through the per-page task list of an older native build.
+    monkeypatch.setattr(copier, "_copy_runs", None)
+    assert torch.equal(copied("destination")[permutation], source)
+    with pytest.raises(RuntimeError, match="without a page"):
+        copier.copy_runs(
+            [
+                page_bytes,
+                pages,
+                source.data_ptr(),
+                page_bytes,
+                bad.ctypes.data,
+                source.data_ptr(),
+                page_bytes,
+                0,
+            ],
+            stream.cuda_stream,
+        )
+
+
 def test_the_affine_page_map_of_the_cache_manager_agrees_with_its_page_indices(
     case: _Case,
 ) -> None:

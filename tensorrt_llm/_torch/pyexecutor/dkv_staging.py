@@ -28,6 +28,7 @@ buffers (``StagingPool``), the cache manager the attention backend sees when the
 (``DkvPageCopier``). It does not decide when anything is copied.
 """
 
+import ctypes
 import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -801,6 +802,46 @@ def pool_page_addresses(
     ]
 
 
+# A run of pages of ``DkvPageCopier.copy_runs`` is this many integers: the page bytes, the page
+# count, then for the destination and for the source a base address, an address step and the host
+# address of ``count`` int32 page indices, or 0 when the pages follow each other.
+RUN_FIELDS = 8
+
+
+def run_addresses(base: int, step: int, indices: int, count: int) -> np.ndarray:
+    """The addresses of the pages of one side of a run of ``copy_runs``.
+
+    Raises:
+        RuntimeError: A page index is negative, which marks a block without a page.
+    """
+    if not indices:
+        return base + np.arange(count, dtype=np.int64) * step
+    table = np.ctypeslib.as_array(
+        ctypes.cast(indices, ctypes.POINTER(ctypes.c_int32)), shape=(count,)
+    ).astype(np.int64)
+    if (table < 0).any():
+        raise RuntimeError("a run names a block without a page")
+    return base + table * step
+
+
+def expand_runs(runs: Sequence[int]) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """The ``(page bytes, destination addresses, source addresses)`` of runs, one per page size."""
+    if len(runs) % RUN_FIELDS:
+        raise ValueError(f"a run is {RUN_FIELDS} integers, {len(runs)} were given")
+    by_size: dict[int, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+    for start in range(0, len(runs), RUN_FIELDS):
+        page_bytes, count, dst_base, dst_step, dst_indices, src_base, src_step, src_indices = runs[
+            start : start + RUN_FIELDS
+        ]
+        group = by_size.setdefault(page_bytes, ([], []))
+        group[0].append(run_addresses(dst_base, dst_step, dst_indices, count))
+        group[1].append(run_addresses(src_base, src_step, src_indices, count))
+    return [
+        (page_bytes, np.concatenate(destinations), np.concatenate(sources))
+        for page_bytes, (destinations, sources) in by_size.items()
+    ]
+
+
 class DkvPageCopier:
     """Copies pages between the staging area and the pages of the cache manager, on a stream."""
 
@@ -811,10 +852,34 @@ class DkvPageCopier:
         from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2_utils
 
         self._utils = kv_cache_manager_v2_utils
-        # A native build before the address-tensor entry point takes one task object per page.
+        # A native build before the address-tensor entry point takes one task object per page, and
+        # one before the run entry point expands the runs here.
         self._copy_addresses = getattr(
             kv_cache_manager_v2_utils, "copy_device_to_device_addresses", None
         )
+        self._copy_runs = getattr(kv_cache_manager_v2_utils, "copy_device_to_device_runs", None)
+
+    def copy_runs(self, runs: Sequence[int], stream: int) -> None:
+        """Copy the pages of runs, ``RUN_FIELDS`` integers each (see ``RUN_FIELDS``).
+
+        Page ``i`` of a side is at ``base + indices[i] * step``, or at ``base + i * step`` when the
+        side has no index address. The index tables are read now, on the host, so they only have
+        to live until the call returns.
+
+        Raises:
+            RuntimeError: A block has no page, or the copy could not be enqueued.
+        """
+        if len(runs) % RUN_FIELDS:
+            raise ValueError(f"a run is {RUN_FIELDS} integers, {len(runs)} were given")
+        if self._copy_runs is None:
+            for page_bytes, destinations, sources in expand_runs(runs):
+                self.copy_addresses(destinations, sources, page_bytes, stream)
+            return
+        result = self._copy_runs(runs if isinstance(runs, list) else list(runs), stream)
+        if result == -1:
+            raise RuntimeError("a run names a block without a page")
+        if result != 0:
+            raise RuntimeError(f"copy_device_to_device_runs failed with CUDA error {result}")
 
     def copy_addresses(
         self, destinations: np.ndarray, sources: np.ndarray, num_bytes: int, stream: int

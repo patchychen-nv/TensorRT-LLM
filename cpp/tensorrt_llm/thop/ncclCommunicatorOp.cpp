@@ -103,6 +103,35 @@ void NcclCommunicatorOp::groupSendRecv(std::vector<th::Tensor> sendTensors, std:
 #endif // ENABLE_MULTI_DEVICE
 }
 
+void NcclCommunicatorOp::groupSendRecvRaw(std::vector<int64_t> sendAddresses, std::vector<int64_t> sendBytes,
+    std::vector<int64_t> sendPeers, std::vector<int64_t> recvAddresses, std::vector<int64_t> recvBytes,
+    std::vector<int64_t> recvPeers, int64_t stream) const
+{
+#if ENABLE_MULTI_DEVICE
+    TLLM_CHECK_WITH_INFO(sendAddresses.size() == sendBytes.size() && sendAddresses.size() == sendPeers.size(),
+        "Every send needs an address, a size and a peer: %zu, %zu, %zu", sendAddresses.size(), sendBytes.size(),
+        sendPeers.size());
+    TLLM_CHECK_WITH_INFO(recvAddresses.size() == recvBytes.size() && recvAddresses.size() == recvPeers.size(),
+        "Every receive needs an address, a size and a peer: %zu, %zu, %zu", recvAddresses.size(), recvBytes.size(),
+        recvPeers.size());
+    tensorrt_llm::runtime::CudaStream cudaStream{reinterpret_cast<cudaStream_t>(stream), mRank, false};
+    auto bytesAt = [](int64_t address, int64_t size)
+    { return tr::IBuffer::wrap(reinterpret_cast<std::uint8_t*>(static_cast<uintptr_t>(address)), size); };
+    TLLM_NCCL_CHECK(ncclGroupStart());
+    for (size_t i = 0; i < sendAddresses.size(); ++i)
+    {
+        mPipelineComm->send(*bytesAt(sendAddresses[i], sendBytes[i]), static_cast<int>(sendPeers[i]), cudaStream);
+    }
+    for (size_t i = 0; i < recvAddresses.size(); ++i)
+    {
+        mPipelineComm->receive(*bytesAt(recvAddresses[i], recvBytes[i]), static_cast<int>(recvPeers[i]), cudaStream);
+    }
+    TLLM_NCCL_CHECK(ncclGroupEnd());
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
+}
+
 void NcclCommunicatorOp::send(th::Tensor tensor, int64_t toRank) const
 {
     tensor.record_stream(at::cuda::getCurrentCUDAStream());
@@ -132,4 +161,5 @@ static auto trtllmNcclCommunicator
           .def("recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::recv)
           .def("send_on", &tensorrt_llm::torch_ext::NcclCommunicatorOp::sendOn)
           .def("recv_on", &tensorrt_llm::torch_ext::NcclCommunicatorOp::recvOn)
-          .def("group_send_recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::groupSendRecv);
+          .def("group_send_recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::groupSendRecv)
+          .def("group_send_recv_raw", &tensorrt_llm::torch_ext::NcclCommunicatorOp::groupSendRecvRaw);
