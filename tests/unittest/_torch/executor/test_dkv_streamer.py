@@ -31,6 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from dkv_fake_dataplane import (
@@ -664,6 +665,35 @@ def test_a_plan_of_another_ring_is_rejected(single) -> None:
             single.streamer.set_plan(plan)
     finally:
         other.close()
+
+
+def test_the_compiled_plan_keeps_its_own_copy_of_the_page_index_tables(single) -> None:
+    """The manager's table is a view that its next lifecycle operation invalidates.
+
+    The copier reads the indices during the whole forward pass, so the plan must not point
+    into that view.
+    """
+    manager = single.manager
+    manager.prepare(1, 0, 128)
+    tables: dict[tuple[int, int], np.ndarray] = {}
+    original = manager.get_base_page_indices
+
+    def persistent(request_id: int, group: int) -> np.ndarray:
+        return tables.setdefault((request_id, group), original(request_id, group))
+
+    manager.get_base_page_indices = persistent
+    streamer = single.streamer
+    streamer.set_plan(streamer.plan_for([PlanRequest(1, 0, 0, 128)]))
+    streamer.begin_iteration([1], [0], [128], single.spans([(0, 128)]))
+    assert streamer._base_indices, "the plan resolved pages of the request"
+    for key, indices in streamer._base_indices.items():
+        assert not np.shares_memory(indices, tables[key])
+        tables[key][:] = -1  # what a lifecycle operation leaves behind
+    for layer in range(len(_RATIOS)):
+        streamer.on_layer(layer)
+    streamer.end_forward()
+    streamer.drain(1.0)
+    assert streamer.stats.local_copies > 0
 
 
 def test_a_staged_batch_that_is_not_the_one_of_the_plan_is_rejected(single) -> None:

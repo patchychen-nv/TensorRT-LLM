@@ -1077,7 +1077,10 @@ class DkvStreamer:
             group, step, origin = self._affine(layer, attention_type)
             indices = self._base_indices.get((run.request_id, group))
             if indices is None:
-                indices = np.ascontiguousarray(
+                # A copy: the manager's table is a view that is valid only until the next
+                # lifecycle operation of the request, and the copier reads the indices during
+                # the whole forward pass.
+                indices = np.array(
                     self._manager.get_base_page_indices(run.request_id, group), dtype=np.int32
                 )
                 self._base_indices[run.request_id, group] = indices
