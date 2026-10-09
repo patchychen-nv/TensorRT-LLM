@@ -135,6 +135,14 @@ if TYPE_CHECKING:
 _UNBOUNDED_STATS_MAX_LEN = -1
 
 
+@dataclasses.dataclass
+class _DkvControlPlaneStats:
+    control_seconds: float = 0.0
+    control_calls: int = 0
+    sample_seconds: float = 0.0
+    sample_calls: int = 0
+
+
 class _ADPForwardIntent(IntEnum):
     # MAX reduction gives context precedence when ADP ranks have mixed work.
     NONE = 0
@@ -418,6 +426,7 @@ class PyExecutor:
     # The data plane that moves the KV of the layers between their owners and the ranks that compute
     # them under the layer-split layout; ``None`` otherwise.
     dkv_streamer = None
+    _dkv_control_plane_stats: _DkvControlPlaneStats | None = None
 
     def __init__(
             self,
@@ -2722,6 +2731,9 @@ class PyExecutor:
         if self.dkv_streamer is not None:
             # What the data plane of the layer-split layout has moved on this rank.
             result["data_plane"] = dataclasses.asdict(self.dkv_streamer.stats)
+        if self._dkv_control_plane_stats is not None:
+            result["control_plane"] = dataclasses.asdict(
+                self._dkv_control_plane_stats)
         return result
 
     def _process_iter_stats(
@@ -3810,6 +3822,18 @@ class PyExecutor:
 
     def _sync_dkv_control(self) -> None:
         """Agree on health and release pending responses before scheduling."""
+        stats = self._dkv_control_plane_stats
+        if stats is None:
+            self._sync_dkv_control_impl()
+            return
+        start = time.perf_counter()
+        try:
+            self._sync_dkv_control_impl()
+        finally:
+            stats.control_seconds += time.perf_counter() - start
+            stats.control_calls += 1
+
+    def _sync_dkv_control_impl(self) -> None:
         index_mapper_used, free_pages = (
             self.kv_cache_manager.get_dkv_control_digest())
         transfer_events = ()
@@ -3886,6 +3910,19 @@ class PyExecutor:
     def _sync_dkv_samples(self, scheduled_batch: ScheduledRequests,
                           forward_batch: ScheduledRequests) -> None:
         """Replicate sampler failures before healthy requests commit their KV."""
+        stats = self._dkv_control_plane_stats
+        if stats is None:
+            self._sync_dkv_samples_impl(scheduled_batch, forward_batch)
+            return
+        start = time.perf_counter()
+        try:
+            self._sync_dkv_samples_impl(scheduled_batch, forward_batch)
+        finally:
+            stats.sample_seconds += time.perf_counter() - start
+            stats.sample_calls += 1
+
+    def _sync_dkv_samples_impl(self, scheduled_batch: ScheduledRequests,
+                               forward_batch: ScheduledRequests) -> None:
         global_requests = scheduled_batch.all_requests()
         errors = sync_dkv_sample_results(self.dist, global_requests,
                                          forward_batch.all_requests(),
@@ -6500,6 +6537,9 @@ class PyExecutor:
 
     def _initialize_dkv_invariant_checker(self) -> None:
         """Check DKV startup configuration before entering the event loop."""
+        self._dkv_control_plane_stats = (
+            _DkvControlPlaneStats()
+            if os.environ.get("TRTLLM_DKV_MEASUREMENT") == "1" else None)
         startup_settings = {
             "dual_ledger": self.scheduler.dkv_dual_ledger_enabled,
             "metrics_all_ranks": os.environ.get("TLLM_METRICS_ALL_RANKS",

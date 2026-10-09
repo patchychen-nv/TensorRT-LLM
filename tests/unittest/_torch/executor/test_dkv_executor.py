@@ -21,7 +21,7 @@ import pytest
 import torch
 from dkv_test_utils import LockstepTpGroup, make_request
 
-from tensorrt_llm._torch.pyexecutor.dkv import DkvInvariantChecker
+from tensorrt_llm._torch.pyexecutor.dkv import DkvControlResult, DkvInvariantChecker
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import ExecutorRequest, LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -668,3 +668,107 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
         "fetch_wait_seconds": 0.0625,
         "drain_seconds": 0.125,
     }
+
+
+def _control_timing_executor() -> PyExecutor:
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.dkv_enabled = True
+    executor.dist = None
+    executor.iter_counter = 0
+    executor.active_requests = []
+    executor._dkv_commit_reason = None
+    executor._dkv_fatal_messages = []
+    executor._dkv_freed_request_ids = []
+    executor._dkv_sampler_errors = []
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor.kv_cache_transceiver = None
+    executor.kv_cache_manager = SimpleNamespace(
+        get_dkv_control_digest=lambda: (0, ((100,),)),
+        get_dkv_config_fingerprint=lambda: [],
+        get_dkv_startup_settings=lambda: {},
+        get_dkv_measurement_snapshot=lambda: {"rank": 0},
+    )
+    executor.scheduler = SimpleNamespace(dkv_dual_ledger_enabled=False)
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.DkvInvariantChecker",
+        return_value=Mock(enabled=False),
+    ):
+        executor._initialize_dkv_invariant_checker()
+    return executor
+
+
+@pytest.mark.parametrize("measurement", [None, "0", "1"])
+def test_control_plane_timing_is_opt_in_and_cumulative(
+    monkeypatch: pytest.MonkeyPatch, measurement: str | None
+) -> None:
+    if measurement is None:
+        monkeypatch.delenv("TRTLLM_DKV_MEASUREMENT", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DKV_MEASUREMENT", measurement)
+    executor = _control_timing_executor()
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.time.perf_counter",
+            side_effect=[10.0, 10.25, 20.0, 20.75, 30.0, 30.5, 40.0, 41.0],
+        ) as timer,
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.sync_dkv_control",
+            return_value=DkvControlResult(fatal_messages=(), has_pending_responses=False),
+        ) as control,
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.sync_dkv_sample_results", return_value=[]
+        ) as sample,
+    ):
+        for _ in range(2):
+            executor._sync_dkv_control()
+            executor._sync_dkv_samples(ScheduledRequests(), ScheduledRequests())
+    assert control.call_count == 2
+    assert sample.call_count == 2
+    snapshot = executor._dkv_measurement_snapshot()
+    if measurement == "1":
+        assert timer.call_count == 8
+        assert snapshot["control_plane"] == {
+            "control_seconds": 0.75,
+            "control_calls": 2,
+            "sample_seconds": 1.75,
+            "sample_calls": 2,
+        }
+        executor._dkv_control_plane_stats.control_calls += 1
+        assert snapshot["control_plane"]["control_calls"] == 2
+    else:
+        timer.assert_not_called()
+        assert snapshot == {"rank": 0}
+
+
+@pytest.mark.parametrize("phase", ["control", "sample"])
+def test_control_plane_timing_records_failed_collectives(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    monkeypatch.setenv("TRTLLM_DKV_MEASUREMENT", "1")
+    executor = _control_timing_executor()
+    collective = "sync_dkv_control" if phase == "control" else "sync_dkv_sample_results"
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.time.perf_counter",
+            side_effect=[2.0, 2.125],
+        ),
+        patch(
+            f"tensorrt_llm._torch.pyexecutor.py_executor.{collective}",
+            side_effect=RuntimeError("collective failed"),
+        ),
+        pytest.raises(RuntimeError, match="collective failed"),
+    ):
+        if phase == "control":
+            executor._sync_dkv_control()
+        else:
+            executor._sync_dkv_samples(ScheduledRequests(), ScheduledRequests())
+    expected = {
+        "control_seconds": 0.0,
+        "control_calls": 0,
+        "sample_seconds": 0.0,
+        "sample_calls": 0,
+    }
+    expected[f"{phase}_seconds"] = 0.125
+    expected[f"{phase}_calls"] = 1
+    assert executor._dkv_measurement_snapshot()["control_plane"] == expected
