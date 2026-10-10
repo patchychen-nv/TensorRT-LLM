@@ -723,11 +723,9 @@ rank cancels the sends of all.
 for the loopback. `TRTLLM_DKV_TRANSPORT_TIMEOUT_S` (default 60) is how long the host waits for
 the data plane at the end of an iteration before it fails; set it below the hang detector
 timeout. The plan of an iteration is resolved to device addresses once, when the staged batch is
-known, so the hooks of the forward pass only enqueue work. `TRTLLM_DKV_P2P_GROUPS=1` issues the
-messages a rank sends or receives in one step as one NCCL group, one kernel for all of them; it is
-off by default because a group finishes only when every peer has posted its side, which under a
-concurrent load makes the data stream of an owner, and the forward pass queued behind it, wait for
-the slowest peer. With `TRTLLM_DKV_DEBUG=1` every message is checksummed where it was packed, where it
+known, so the hooks of the forward pass only enqueue work. The messages a rank sends or receives
+in one step go out as one NCCL group, one kernel for all of them; `TRTLLM_DKV_P2P_GROUPS=0` issues
+them one by one. With `TRTLLM_DKV_DEBUG=1` every message is checksummed where it was packed, where it
 arrived and on the pages it was unpacked into, the ranks compare the checksums after every
 iteration, and a damaged message is named with its layer, direction and requests. To see that
 the check works, `TRTLLM_DKV_FAULT=<iteration or *>:<layer>:<fetch|writeback>[:<flip|zero>[:<rank>]]`

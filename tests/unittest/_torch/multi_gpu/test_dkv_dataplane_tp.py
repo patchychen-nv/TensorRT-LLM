@@ -97,8 +97,9 @@ class Scenario:
     debug: bool = False
     # The compress ratio of every layer of the model.
     ratios: tuple[int, ...] = tuple(_RATIOS)
-    # Issue the messages of a step as one NCCL group instead of one by one.
-    grouped: bool = False
+    # Issue the messages of a step as one NCCL group, as the executor does by default; False
+    # issues them one by one.
+    grouped: bool = True
 
     @classmethod
     def soak(cls, group_size: int, ring_depth: int, iterations: int) -> "Scenario":

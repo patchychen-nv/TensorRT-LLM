@@ -358,6 +358,18 @@ def test_a_staging_area_below_one_request_of_max_seq_len_is_rejected(monkeypatch
         executor._dkv_staging_settings()
 
 
+@pytest.mark.parametrize("value,grouped", [(None, True), ("1", True), ("0", False)])
+def test_the_messages_of_a_step_go_out_as_one_nccl_group_unless_turned_off(
+    monkeypatch, value, grouped: bool
+) -> None:
+    monkeypatch.delenv("TRTLLM_DKV_STAGING_TOKENS", raising=False)
+    if value is None:
+        monkeypatch.delenv("TRTLLM_DKV_P2P_GROUPS", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DKV_P2P_GROUPS", value)
+    assert _staging_executor()._dkv_layer_split_settings()["p2p_groups"] is grouped
+
+
 @pytest.mark.parametrize("checks", [False, True])
 def test_the_plan_is_fingerprinted_only_when_the_checks_are_on(monkeypatch, checks: bool) -> None:
     fingerprinted = []

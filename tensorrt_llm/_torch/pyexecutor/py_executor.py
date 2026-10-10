@@ -6358,6 +6358,22 @@ class PyExecutor:
         self.model_engine.dkv_staging = True
         self.dkv_staging_settings = settings
 
+    def _dkv_layer_split_settings(self) -> dict[str, object]:
+        """What the ranks of a layer-split group must agree on to run the same data plane."""
+        return {
+            "layer_split":
+            True,
+            **self._dkv_staging_settings(),
+            "transport_timeout_s":
+            float(os.environ.get("TRTLLM_DKV_TRANSPORT_TIMEOUT_S", "60")),
+            "fault":
+            os.environ.get("TRTLLM_DKV_FAULT", ""),
+            # The messages a rank sends or receives in one step go out as one NCCL group, one
+            # kernel for all of them; 0 issues them one by one.
+            "p2p_groups":
+            os.environ.get("TRTLLM_DKV_P2P_GROUPS", "1") == "1",
+        }
+
     def _initialize_dkv_layer_split(self) -> None:
         """Run the layers of this rank on the staging area and connect it to the other ranks.
 
@@ -6374,20 +6390,7 @@ class PyExecutor:
         manager = self.kv_cache_manager
         group_size = self.dist.tp_size
         rank = self.dist.tp_rank
-        settings = {
-            "layer_split":
-            True,
-            **self._dkv_staging_settings(),
-            "transport_timeout_s":
-            float(os.environ.get("TRTLLM_DKV_TRANSPORT_TIMEOUT_S", "60")),
-            "fault":
-            os.environ.get("TRTLLM_DKV_FAULT", ""),
-            # 1 issues all the messages of a step in one NCCL group. Off by default: a group
-            # finishes when every peer has posted its side, so under a concurrent load the data
-            # stream of an owner, and the forward pass queued behind it, waits for the slowest peer.
-            "p2p_groups":
-            os.environ.get("TRTLLM_DKV_P2P_GROUPS", "0") == "1",
-        }
+        settings = self._dkv_layer_split_settings()
         fault = (DataPlaneFault.parse(settings["fault"])
                  if settings["fault"] else None)
         if fault is not None and not dkv_debug_enabled():
