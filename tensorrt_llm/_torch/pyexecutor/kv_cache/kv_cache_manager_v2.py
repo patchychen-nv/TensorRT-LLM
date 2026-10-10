@@ -209,6 +209,11 @@ def _dkv_measurement_of(manager: object) -> DkvMeasurementCounters | None:
     return vars(manager).get("_dkv_measurement")
 
 
+def _own_events(events: list) -> list[list]:
+    """The attention-DP event gather of a rank whose events stand for its whole group."""
+    return [events]
+
+
 def _traced_dkv_operation(
     manager: "KVCacheManagerV2", operation: Callable[_DkvTraceParams, _DkvTraceResult]
 ) -> Callable[_DkvTraceParams, _DkvTraceResult]:
@@ -1305,6 +1310,8 @@ class KVCacheManagerV2(BaseResourceManager):
     _fixed_lifecycle_counts = False
     # Whether the manager holds the layers its rank owns under the layer-split layout of DKV only.
     dkv_layer_split = False
+    # The rank whose KV events stand for every rank of the group; None: each rank publishes its own.
+    _dkv_event_source_rank: int | None = None
     # The keys of its life cycles in life cycle id order, read off the config on first use.
     _dkv_lifecycle_keys: list | None = None
     _dkv_trace_enabled = False
@@ -1535,10 +1542,16 @@ class KVCacheManagerV2(BaseResourceManager):
                     "precedence and the buffered get_kv_cache_events() poll path "
                     "will return no events."
                 )
-            if mapping.enable_attention_dp or mpi_rank() == 0:
+            if self.dkv_layer_split:
+                # The ranks of a layer-split group publish equal events (see below): rank 0 alone.
+                publishes, event_rank = mapping.rank == 0, 0
+                self._dkv_event_source_rank = 0
+            else:
+                publishes = mapping.enable_attention_dp or mpi_rank() == 0
+                event_rank = mapping.rank if mapping.enable_attention_dp else 0
+            if publishes:
                 # Constructing it is side-effect free; start() below binds the socket
                 # and starts the publisher thread once every other check has passed.
-                event_rank = mapping.rank if mapping.enable_attention_dp else 0
                 self.event_manager = StreamingKVCacheEventManager(
                     kv_events_config,
                     data_parallel_rank=event_rank,
@@ -1546,7 +1559,25 @@ class KVCacheManagerV2(BaseResourceManager):
                     max_window_size=event_window_size,
                 )
         elif self.event_buffer_max_size > 0:
-            if mapping.enable_attention_dp:
+            if self.dkv_layer_split:
+                # Every rank of a layer-split group holds a page of every block of the group, and
+                # their life cycles are replicated, so the events of the ranks are equal. Rank 0
+                # publishes them for the group and the others create none. Its gather keeps its own
+                # events, which tags them with rank 0, and moves nothing between the ranks.
+                self._dkv_event_source_rank = 0
+                if mapping.rank == 0:
+                    event_gather = _own_events
+                    if self._dkv_measurement is not None:
+                        event_gather = self._dkv_measurement.wrap_event_gather(event_gather)
+                    self.event_manager = KVCacheEventManager(
+                        self.event_buffer_max_size,
+                        window_size=event_window_size,
+                        attention_dp_rank=0,
+                        attention_dp_gather=event_gather,
+                        hash_algo=kv_cache_event_hash_algo,
+                        mm_token_id_offset=vocab_size,
+                    )
+            elif mapping.enable_attention_dp:
                 event_gather = Distributed.get(mapping).allgather
                 if self._dkv_measurement is not None:
                     event_gather = self._dkv_measurement.wrap_event_gather(event_gather)
@@ -4932,6 +4963,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 else None
             ),
             "event_generation": measurement.event_generation,
+            **(
+                {}
+                if self._dkv_event_source_rank is None
+                else {"event_source_rank": self._dkv_event_source_rank}
+            ),
         }
 
     def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:

@@ -248,6 +248,43 @@ def test_ranks_that_disagree_on_the_number_of_layers_are_rejected() -> None:
         _report(rows)
 
 
+def _one_publisher_rows() -> list[dict]:
+    """A layer-split group whose rank 0 publishes the events of every rank, as the manager does:
+    the other ranks have no event manager and so no watermark."""
+    rows = _layer_split_rows()
+    for row in rows:
+        row["event_source_rank"] = 0
+    rows[1]["event_next_id"] = None
+    return rows
+
+
+def test_the_events_rank_0_publishes_for_a_layer_split_group_stand_for_every_rank() -> None:
+    events = [_event(0, 0, "created"), _event(0, 1, "stored", [11, 12])]
+    report = _report(_one_publisher_rows(), events)
+    storage = report["storage"]
+    assert storage["complete_by_rank"] == [True, True]
+    assert storage["resident_blocks_by_rank"] == [2, 2]
+    assert storage["unique_resident_blocks"] == 2
+    assert storage["duplicate_storage_ratio"] == 0
+    assert report["validity"]["prefix_hit_rate_proxy_valid"]
+
+    rows = _one_publisher_rows()
+    rows[0]["event_next_id"] = 3
+    storage = _report(rows, [*events, _event(0, 2, "removed", [12])])["storage"]
+    assert storage["resident_blocks_by_rank"] == [1, 1]
+    assert storage["removed_blocks_by_rank"] == [1, 1]
+    assert storage["removed_blocks_logical"] == 1
+
+
+def test_one_publisher_is_named_by_every_rank_and_no_other_rank_sends_events() -> None:
+    rows = _one_publisher_rows()
+    with pytest.raises(ValueError, match=r"ranks \[1\] sent some"):
+        _report(rows, [*_events()])
+    rows[1]["event_source_rank"] = 1
+    with pytest.raises(ValueError, match="different ranks"):
+        _report(rows, [_event(0, 0, "created")])
+
+
 def test_token_hit_rate_is_weighted_globally() -> None:
     rows = [_snapshot(0), _snapshot(1)]
     rows[0]["counters"]["eligible_prefix_tokens"] = 128

@@ -220,58 +220,94 @@ def _capacity_comparison(
     }
 
 
-def _event_measurement(
-    snapshots: Sequence[dict], events: Sequence[dict], baseline: Sequence[dict] | None
-) -> dict:
-    residents: list[set[tuple]] = [set() for _ in snapshots]
-    last_ids = [-1] * len(snapshots)
-    created = [False] * len(snapshots)
-    removed = [0] * len(snapshots)
-    complete = [True] * len(snapshots)
+def _replay_events(
+    events: Sequence[dict], row: dict, baseline_row: dict | None
+) -> tuple[set[tuple], int, bool, set[str | None]]:
+    """Replay the events of one rank up to the watermark of its snapshot ``row``.
+
+    Returns the resident blocks, the blocks removed since ``baseline_row``, whether the stream is
+    complete (no event lost, a created event seen, and the watermarks in order) and the hash
+    algorithms of the stored blocks.
+    """
+    watermark = row.get("event_next_id")
+    start = baseline_row.get("event_next_id") if baseline_row is not None else 0
+    residents: set[tuple] = set()
+    last_id = -1
+    created = False
+    removed = 0
+    complete = True
     hash_algorithms: set[str | None] = set()
     for event in events:
-        rank = event.get("attention_dp_rank")
-        if type(rank) is not int or not 0 <= rank < len(snapshots):
-            raise ValueError("Every measurement event must identify its attention-DP rank")
         event_id = event["event_id"]
-        watermark = snapshots[rank].get("event_next_id")
         if type(watermark) is not int:
-            complete[rank] = False
+            complete = False
             continue
         if event_id >= watermark:
             continue
-        if event_id != last_ids[rank] + 1:
-            complete[rank] = False
-        last_ids[rank] = event_id
+        if event_id != last_id + 1:
+            complete = False
+        last_id = event_id
         data = event["data"]
         kind = data["type"]
         group = (event.get("layer_group_id"), event["window_size"])
         if kind == "created":
-            created[rank] = True
+            created = True
         elif kind == "stored":
             hash_algorithms.add(event.get("hash_algo"))
             for block in data["blocks"]:
-                residents[rank].add((*group, block["block_hash"]))
+                residents.add((*group, block["block_hash"]))
         elif kind == "removed":
             for block_hash in data["block_hashes"]:
-                residents[rank].discard((*group, block_hash))
-                start = baseline[rank].get("event_next_id") if baseline is not None else 0
+                residents.discard((*group, block_hash))
                 if type(start) is not int:
-                    complete[rank] = False
+                    complete = False
                 elif event_id >= start:
-                    removed[rank] += 1
+                    removed += 1
         elif kind != "updated":
-            complete[rank] = False
-    for rank, row in enumerate(snapshots):
-        watermark = row.get("event_next_id")
-        complete[rank] &= (
-            created[rank] and type(watermark) is int and last_ids[rank] + 1 == watermark
-        )
-        if baseline is not None:
-            start = baseline[rank].get("event_next_id")
-            complete[rank] &= (
-                type(start) is int and type(watermark) is int and 0 <= start <= watermark
+            complete = False
+    complete &= created and type(watermark) is int and last_id + 1 == watermark
+    if baseline_row is not None:
+        complete &= type(start) is int and type(watermark) is int and 0 <= start <= watermark
+    return residents, removed, complete, hash_algorithms
+
+
+def _event_measurement(
+    snapshots: Sequence[dict], events: Sequence[dict], baseline: Sequence[dict] | None
+) -> dict:
+    events_by_rank: list[list[dict]] = [[] for _ in snapshots]
+    for event in events:
+        rank = event.get("attention_dp_rank")
+        if type(rank) is not int or not 0 <= rank < len(snapshots):
+            raise ValueError("Every measurement event must identify its attention-DP rank")
+        events_by_rank[rank].append(event)
+    sources = {row.get("event_source_rank") for row in snapshots}
+    if sources == {None}:
+        replayed = [
+            _replay_events(
+                events_by_rank[rank], row, baseline[rank] if baseline is not None else None
             )
+            for rank, row in enumerate(snapshots)
+        ]
+    else:
+        # Under the layer-split layout one rank publishes the events of the group: every rank
+        # holds a page of each of its blocks, so its stream stands for each of them.
+        (source,) = sources if len(sources) == 1 else (None,)
+        if type(source) is not int or not 0 <= source < len(snapshots):
+            raise ValueError(f"The ranks name different ranks that publish the events: {sources}")
+        strays = [rank for rank, own in enumerate(events_by_rank) if own and rank != source]
+        if strays:
+            raise ValueError(f"Rank {source} publishes the events, yet ranks {strays} sent some")
+        replayed = [
+            _replay_events(
+                events_by_rank[source],
+                snapshots[source],
+                baseline[source] if baseline is not None else None,
+            )
+        ] * len(snapshots)
+    residents = [resident for resident, _, _, _ in replayed]
+    removed = [count for _, count, _, _ in replayed]
+    complete = [done for _, _, done, _ in replayed]
+    hash_algorithms = set().union(*(algorithms for _, _, _, algorithms in replayed))
     observable = all(complete) and len(hash_algorithms) <= 1
     copies = sum(map(len, residents))
     unique = len(set().union(*residents))
