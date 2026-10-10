@@ -70,6 +70,18 @@ def test_options_survive_a_round_trip_through_json() -> None:
     assert again == options
 
 
+def test_a_phase_pulls_the_streams_only_after_it_unless_an_interval_is_given() -> None:
+    assert _RUNNER.Phase6Options(model="model", mode="dkv").pull_interval == 0
+    assert _RUNNER.throttled(lambda: None, 0) is None
+    now = [0.0]
+    pulls = []
+    pull = _RUNNER.throttled(lambda: pulls.append(now[0]), 0.5, clock=lambda: now[0])
+    for moment in (0.0, 0.1, 0.49, 0.5, 0.7, 1.2):
+        now[0] = moment
+        pull()
+    assert pulls == [0.0, 0.5, 1.2]
+
+
 def test_worker_timing_and_page_fill_are_opt_in(monkeypatch) -> None:
     monkeypatch.setattr(
         _RUNNER,

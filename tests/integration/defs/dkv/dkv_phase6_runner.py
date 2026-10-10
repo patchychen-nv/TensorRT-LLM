@@ -126,6 +126,8 @@ class Phase6Options:
     kv_max_tokens: int = 4194304
     kv_quota_gib: float | None = None
     event_buffer: int = 262144
+    # Seconds between pulls of the KV events and stats while a phase runs; 0: only between phases.
+    pull_interval: float = 0.0
     adp_reference: str | None = None
     capacity_tolerance_pages: int = 0
     request_timeout: int = 900
@@ -135,6 +137,28 @@ class Phase6Options:
 
 
 _OPTION_NAMES = {field.name for field in dataclasses.fields(Phase6Options)}
+
+
+def throttled(
+    function: Callable[[], object], interval: float, clock: Callable[[], float] = time.monotonic
+) -> Callable[[], None] | None:
+    """``function``, called at most once every ``interval`` seconds; None if ``interval`` <= 0.
+
+    The KV events and stats are served by the rank 0 worker, whose executor loop shares the GIL with
+    the server, and the client waits for every pull: pulls during a phase slow down what it
+    measures. The events and stats stay buffered until the pull after the phase.
+    """
+    if interval <= 0:
+        return None
+    last = [float("-inf")]
+
+    def call() -> None:
+        now = clock()
+        if now - last[0] >= interval:
+            last[0] = now
+            function()
+
+    return call
 
 
 def _lengths(text: str) -> list[int]:
@@ -533,7 +557,7 @@ def run_mode(options: Phase6Options, directory: Path) -> dict:
                 part,
                 concurrency=options.concurrency,
                 completed_turns=served,
-                idle=lambda: observer.pull(timeout=0),
+                idle=throttled(lambda: observer.pull(timeout=0), options.pull_interval),
             )
             finished = max(result.completed_at for result in results)
             seconds = finished - began
@@ -730,6 +754,12 @@ def _add_options(parser: argparse.ArgumentParser, *, model_required: bool = True
         help="KV bytes per rank (max_gpu_total_bytes) in GiB; replaces --kv-max-tokens",
     )
     parser.add_argument("--event-buffer", type=int, default=defaults.event_buffer)
+    parser.add_argument(
+        "--pull-interval",
+        type=float,
+        default=defaults.pull_interval,
+        help="seconds between pulls of KV events and stats while a phase runs; 0: only after it",
+    )
     parser.add_argument("--adp-reference", default=None, help="result.json of an adp run")
     parser.add_argument("--capacity-tolerance-pages", type=int, default=0)
     parser.add_argument("--request-timeout", type=int, default=defaults.request_timeout)
