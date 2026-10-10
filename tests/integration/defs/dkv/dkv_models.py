@@ -98,9 +98,13 @@ def dkv_worker_env(*, measurement: bool = False) -> dict[str, str]:
     """The DKV switches a test turns on, as ``env_overrides`` for the LLM.
 
     Ranks that were launched through MPI do not see the environment a test sets, so the LLM carries
-    these to every worker, the staging switches among them when the test has set them.
+    these to every worker, the staging switches among them when the test has set them. The checksums
+    of ``TRTLLM_DKV_DEBUG`` are on unless the test turned them off.
     """
-    env = {"TRTLLM_DKV_DEBUG": "1", "TRTLLM_DKV_DUAL_LEDGER": "1"}
+    env = {
+        "TRTLLM_DKV_DEBUG": os.environ.get("TRTLLM_DKV_DEBUG", "1"),
+        "TRTLLM_DKV_DUAL_LEDGER": "1",
+    }
     if measurement:
         # Each rank's own pool snapshot rides on the iteration stats.
         env["TRTLLM_DKV_MEASUREMENT"] = "1"

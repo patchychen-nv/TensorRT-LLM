@@ -100,6 +100,9 @@ class Scenario:
     # Issue the messages of a step as one NCCL group, as the executor does by default; False
     # issues them one by one.
     grouped: bool = True
+    # Carry out the program with the C++ executor, as the executor does by default; it takes over
+    # only without the checksums of debug and with grouped messages.
+    native: bool = True
 
     @classmethod
     def soak(cls, group_size: int, ring_depth: int, iterations: int) -> "Scenario":
@@ -318,6 +321,7 @@ def _probe_rank(scenario: Scenario) -> dict:
         debug=DeviceDataPlaneDebug(data_stream) if scenario.debug else None,
         fault=DataPlaneFault.parse(scenario.fault) if scenario.fault else None,
         group_messages=scenario.grouped,
+        native=scenario.native,
     )
     view.dkv_streamer = streamer
     requests: dict[int, LlmRequest] = {}
@@ -403,6 +407,7 @@ def _probe_rank(scenario: Scenario) -> dict:
             "bytes_received": stats.bytes_received,
             "bytes_local": stats.bytes_local,
             "iterations": stats.iterations,
+            "native": streamer.uses_native,
         }
     finally:
         for request in requests.values():
@@ -441,6 +446,38 @@ def test_the_pages_of_every_layer_reach_the_compute_rank_and_come_back(
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * group_size, timeout=900))
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"
+        assert result["iterations"] == scenario.iterations
+    assert sum(r["bytes_sent"] for r in results) == sum(r["bytes_received"] for r in results)
+    assert sum(r["bytes_sent"] for r in results) > 0
+
+
+def _has_native_data_plane() -> bool:
+    try:
+        torch.classes.trtllm.DkvDataPlane
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
+
+@pytest.mark.parametrize("ring_depth", [1, 2, 3])
+@pytest.mark.parametrize("placement", ["spread", "one_rank"])
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_the_cpp_executor_moves_the_pages_of_every_layer(
+    mpi_pool_executor: MPIPoolExecutor, placement: str, ring_depth: int
+) -> None:
+    """Without the checksums of debug the C++ executor carries out the program; the stand-in of the
+    attention and the pages written back check every page it moved."""
+    group_size = mpi_pool_executor.num_workers
+    if torch.cuda.device_count() < group_size:
+        pytest.skip(f"Requires {group_size} GPUs")
+    if not _has_native_data_plane():
+        pytest.skip("the native build has no trtllm.DkvDataPlane")
+    ranks = _spread(group_size, _PROMPTS) if placement == "spread" else {rid: 0 for rid in _PROMPTS}
+    scenario = Scenario(group_size, ring_depth, _PROMPTS, ranks, arrival={4: 1, 5: 2})
+    results = list(mpi_pool_executor.map(_probe_rank, [scenario] * group_size, timeout=900))
+    for rank, result in enumerate(results):
+        assert result["errors"] == [], f"rank {rank}"
+        assert result["native"], f"rank {rank}"
         assert result["iterations"] == scenario.iterations
     assert sum(r["bytes_sent"] for r in results) == sum(r["bytes_received"] for r in results)
     assert sum(r["bytes_sent"] for r in results) > 0
@@ -500,6 +537,7 @@ def test_a_soak_of_requests_that_come_and_go_neither_hangs_nor_corrupts(
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * 4, timeout=7200))
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"
+        assert result["native"] == _has_native_data_plane(), f"rank {rank}"
         assert result["iterations"] == scenario.iterations
 
 
@@ -507,8 +545,11 @@ def test_a_soak_of_requests_that_come_and_go_neither_hangs_nor_corrupts(
     MPI.COMM_WORLD.Get_size() != 8,
     reason="needs a job of eight MPI ranks, with one task per GPU on two nodes",
 )
-def test_the_pages_of_every_layer_reach_the_compute_rank_between_two_nodes() -> None:
-    """Every task of the job is a rank of the group, so half of the messages cross the nodes."""
+@pytest.mark.parametrize("native", [False, True])
+def test_the_pages_of_every_layer_reach_the_compute_rank_between_two_nodes(native: bool) -> None:
+    """Every task of the job is a rank of the group, so half of the messages cross the nodes.
+
+    The Python steps run with the checksums of debug, the C++ executor without them."""
     group_size = 8
     # One request per rank: a cache manager has room for eight requests at a time.
     lengths = (90, 300, 150, 700, 1000, 520, 260, 130)
@@ -519,12 +560,14 @@ def test_the_pages_of_every_layer_reach_the_compute_rank_between_two_nodes() -> 
         prompts,
         _spread(group_size, prompts),
         arrival={5: 1, 6: 2, 7: 3},
-        debug=True,
+        debug=not native,
         ratios=tuple(_RATIOS) * 2,
+        native=native,
     )
     results = mpi_comm().allgather(_probe_rank(scenario))
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"
+        assert result["native"] == (native and _has_native_data_plane()), f"rank {rank}"
         assert result["iterations"] == scenario.iterations
         assert result["bytes_sent"] > 0 and result["bytes_received"] > 0, f"rank {rank}"
     assert sum(r["bytes_sent"] for r in results) == sum(r["bytes_received"] for r in results)

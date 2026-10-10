@@ -96,11 +96,14 @@ l0_gb300_multi_gpus:
   # DKV layer split on DeepSeek-V4: each rank keeps the KV of the layers it owns only.
   - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_like_the_replicated_group[layer-split] TIMEOUT (90)
   - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_like_the_replicated_group[layer-split-nan] TIMEOUT (90)
-  - dkv/test_dkv_layer_split.py::test_the_layer_split_keeps_the_aggregate_lifetime_of_a_request TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_like_the_replicated_group[layer-split-cpp] TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_keeps_the_aggregate_lifetime_of_a_request[checksums] TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_keeps_the_aggregate_lifetime_of_a_request[cpp] TIMEOUT (90)
   - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_every_request_of_a_burst_once_and_leaks_nothing[g2] TIMEOUT (60)
   - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_every_request_of_a_burst_once_and_leaks_nothing[chunked-g2] TIMEOUT (60)
   - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_every_request_of_a_burst_once_and_leaks_nothing[pressure-g2] TIMEOUT (60)
   - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_like_the_replicated_group[layer-split-nan-g4] TIMEOUT (90)
+  - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_like_the_replicated_group[layer-split-cpp-g4] TIMEOUT (90)
   - dkv/test_dkv_layer_split.py::test_the_layer_split_answers_chunked_prompts_like_the_replicated_group TIMEOUT (90)
   - dkv/test_dkv_layer_split.py::test_the_layer_split_serves_a_burst_through_a_staging_area_of_one_request TIMEOUT (60)
   # Prefix reuse across ranks, its negative control, conversations and the host tier.

@@ -174,6 +174,8 @@ class RankReport:
     # The checksum records and the plan of every iteration, when the run is in debug.
     records: list = field(default_factory=list)
     plans: list = field(default_factory=list)
+    # Whether the stand-in of the C++ executor carried out the program.
+    native: bool = False
 
 
 class Stall:
@@ -209,6 +211,8 @@ class Options:
     grouped: bool = True
     # The cache manager maps blocks to pages by an affine function of their base page index.
     affine: bool = True
+    # The transport offers the stand-in of the C++ executor of the program.
+    native: bool = False
 
 
 def _corrupting(transport: FakeTransport, rank: int, options: Options) -> FakeTransport:
@@ -253,7 +257,11 @@ def _run_rank(
     streamer = DkvStreamer(
         manager,
         SimpleNamespace(layout=layout, pool=pool),
-        _corrupting(FakeTransport(network, rank, grouped=options.grouped), rank, options),
+        _corrupting(
+            FakeTransport(network, rank, grouped=options.grouped, native=options.native),
+            rank,
+            options,
+        ),
         owners,
         rank,
         group_size=group_size,
@@ -308,7 +316,13 @@ def _run_rank(
         errors.extend(_check_owner_pages(rank, layout, manager, written))
         largest = max((size for sizes in network.sent.values() for size in sizes), default=0)
         return RankReport(
-            streamer.stats, errors, largest, streamer._send_arena.numel(), records, plans
+            streamer.stats,
+            errors,
+            largest,
+            streamer._send_arena.numel(),
+            records,
+            plans,
+            streamer.uses_native,
         )
     finally:
         exec_stream.close()
@@ -432,17 +446,20 @@ def _spread(group_size: int, prompts: dict[int, int]) -> dict[int, int]:
 _PROMPTS = {1: 300, 2: 700, 3: 150, 4: 1000, 5: 90}
 
 
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("ring_depth", [1, 2, 3])
 @pytest.mark.parametrize("group_size", [1, 2, 3, 4])
 def test_the_pages_of_every_layer_reach_the_compute_rank_and_come_back(
-    group_size: int, ring_depth: int
+    group_size: int, ring_depth: int, native: bool
 ) -> None:
     scenario = Scenario(
         group_size, ring_depth, _PROMPTS, _spread(group_size, _PROMPTS), arrival={4: 1, 5: 2}
     )
-    reports = run_group(scenario, Options(data_jitter=0.001, exec_jitter=0.001, seed=group_size))
+    options = Options(data_jitter=0.001, exec_jitter=0.001, seed=group_size, native=native)
+    reports = run_group(scenario, options)
     for rank, report in enumerate(reports):
         assert report.errors == [], f"rank {rank}"
+        assert report.native == native
         assert report.largest_message <= report.buffer_bytes
     stats = [report.stats for report in reports]
     assert sum(s.bytes_sent for s in stats) == sum(s.bytes_received for s in stats)
@@ -482,20 +499,24 @@ def test_the_pages_arrive_without_grouped_messages_and_without_the_affine_page_m
         assert report.stats.bytes_local == sum(local_bytes.values())
 
 
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("group_size", [2, 3, 4])
-def test_ranks_without_requests_still_serve_the_layers_they_own(group_size: int) -> None:
+def test_ranks_without_requests_still_serve_the_layers_they_own(
+    group_size: int, native: bool
+) -> None:
     prompts = {1: 400, 2: 260}
     scenario = Scenario(group_size, 2, prompts, {1: 0, 2: 0})
-    reports = run_group(scenario, Options(data_jitter=0.001, exec_jitter=0.001))
+    reports = run_group(scenario, Options(data_jitter=0.001, exec_jitter=0.001, native=native))
     for rank, report in enumerate(reports):
         assert report.errors == [], f"rank {rank}"
     assert reports[group_size - 1].stats.messages_sent > 0
     assert reports[group_size - 1].stats.messages_received > 0
 
 
-def test_a_rank_that_computes_nothing_receives_a_layer_only_after_its_forward_pass_got_there() -> (
-    None
-):
+@pytest.mark.parametrize("native", [False, True])
+def test_a_rank_that_computes_nothing_receives_a_layer_only_after_its_forward_pass_got_there(
+    native: bool,
+) -> None:
     """The host of an idle rank runs far ahead of its GPU. A receive that does not wait for the
     layers before it would start at once and spin on the GPU until the compute rank sends."""
     group_size, stalled_layer = 2, 6
@@ -524,7 +545,7 @@ def test_a_rank_that_computes_nothing_receives_a_layer_only_after_its_forward_pa
 
     def run() -> None:
         try:
-            outcome.append(run_group(scenario, Options(stall=stall), network))
+            outcome.append(run_group(scenario, Options(stall=stall, native=native), network))
         except BaseException as error:  # reported by the assertion below
             outcome.append(error)
 
@@ -542,18 +563,84 @@ def test_a_rank_that_computes_nothing_receives_a_layer_only_after_its_forward_pa
     assert len(network.received[0, 1]) == messages(served)
 
 
-@pytest.mark.parametrize("seed", range(3))
-def test_a_busy_group_with_many_requests_on_every_rank(seed: int) -> None:
+def _busy_scenario() -> Scenario:
     prompts = {request_id: 120 + 97 * request_id for request_id in range(1, 9)}
-    scenario = Scenario(
+    return Scenario(
         4,
         2,
         prompts,
         _spread(4, prompts),
         arrival={request_id: request_id // 3 for request_id in prompts},
     )
-    reports = run_group(scenario, Options(data_jitter=0.0015, exec_jitter=0.0015, seed=seed))
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("seed", range(3))
+def test_a_busy_group_with_many_requests_on_every_rank(seed: int, native: bool) -> None:
+    options = Options(data_jitter=0.0015, exec_jitter=0.0015, seed=seed, native=native)
+    reports = run_group(_busy_scenario(), options)
     assert [report.errors for report in reports] == [[], [], [], []]
+
+
+def test_the_cpp_executor_moves_the_messages_of_the_python_steps() -> None:
+    """The same plan carried out by either sends every message in the same order and size."""
+    networks = {}
+    stats = {}
+    for native in (False, True):
+        networks[native] = FakeNetwork(4, timeout=_TIMEOUT)
+        reports = run_group(_busy_scenario(), Options(native=native), networks[native])
+        assert [report.errors for report in reports] == [[], [], [], []]
+        assert all(report.native == native for report in reports)
+        stats[native] = [
+            (
+                s.messages_sent,
+                s.bytes_sent,
+                s.messages_received,
+                s.bytes_received,
+                s.local_copies,
+                s.bytes_local,
+                s.bytes_local_fetch,
+                s.bytes_local_writeback,
+            )
+            for s in (report.stats for report in reports)
+        ]
+    assert networks[True].sent == networks[False].sent
+    assert networks[True].received == networks[False].received
+    assert stats[True] == stats[False]
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["none", "native_off", "debug", "fill", "one_by_one", "no_affine_map", "no_executor"],
+)
+def test_the_cpp_executor_runs_only_when_no_step_needs_python(change: str) -> None:
+    layout = StagingLayout(_geometry(2))
+    pool = StagingPool(layout, device="cpu")
+    owners = compute_ownership(len(_RATIOS), 1)
+    manager = FakeKvManager(layout, range(len(_RATIOS)), pages=8, affine=change != "no_affine_map")
+    data, compute = FakeStream("data", timeout=1.0), FakeStream("exec", timeout=1.0)
+    transport = FakeTransport(
+        FakeNetwork(1), 0, grouped=change != "one_by_one", native=change != "no_executor"
+    )
+    try:
+        streamer = DkvStreamer(
+            manager,
+            SimpleNamespace(layout=layout, pool=pool),
+            transport,
+            owners,
+            0,
+            group_size=1,
+            copier=FakeCopier(),
+            data_stream=data,
+            current_stream=lambda: compute,
+            fill="zero" if change == "fill" else "",
+            debug=HostDataPlaneDebug(data) if change == "debug" else None,
+            native=change != "native_off",
+        )
+        assert streamer.uses_native == (change == "none")
+    finally:
+        data.close()
+        compute.close()
 
 
 # What the tests above need from the test itself
@@ -572,16 +659,20 @@ def test_a_stream_that_waits_for_a_never_recorded_event_fails_instead_of_hanging
 _MUTATION_SCENARIO = Scenario(3, 2, {1: 500, 2: 520, 3: 380}, {1: 0, 2: 1, 3: 2}, arrival={})
 
 
-def test_a_forward_pass_that_does_not_wait_for_the_fetch_reads_pages_that_have_not_arrived() -> (
-    None
-):
-    reports = run_group(_MUTATION_SCENARIO, Options(data_jitter=0.01, deaf="exec"))
+@pytest.mark.parametrize("native", [False, True])
+def test_a_forward_pass_that_does_not_wait_for_the_fetch_reads_pages_that_have_not_arrived(
+    native: bool,
+) -> None:
+    reports = run_group(_MUTATION_SCENARIO, Options(data_jitter=0.01, deaf="exec", native=native))
     errors = [error for report in reports for error in report.errors]
     assert any("was not fetched" in error for error in errors), errors
 
 
-def test_a_data_stream_that_does_not_wait_for_the_forward_pass_corrupts_the_cache() -> None:
-    reports = run_group(_MUTATION_SCENARIO, Options(exec_jitter=0.01, deaf="data"))
+@pytest.mark.parametrize("native", [False, True])
+def test_a_data_stream_that_does_not_wait_for_the_forward_pass_corrupts_the_cache(
+    native: bool,
+) -> None:
+    reports = run_group(_MUTATION_SCENARIO, Options(exec_jitter=0.01, deaf="data", native=native))
     errors = [error for report in reports for error in report.errors]
     assert errors, "the corruption of the owner pages or of the slots went unnoticed"
 
@@ -833,10 +924,11 @@ def test_disabled_fetch_wait_timing_creates_no_events(monkeypatch, setting: str 
         rank.close()
 
 
-def test_fetch_wait_timing_measures_only_ranks_that_compute(monkeypatch) -> None:
+@pytest.mark.parametrize("native", [False, True])
+def test_fetch_wait_timing_measures_only_ranks_that_compute(monkeypatch, native: bool) -> None:
     monkeypatch.setenv("TRTLLM_DKV_WAIT_TIMING", "1")
     scenario = Scenario(2, 2, {1: 300}, {1: 0})
-    reports = run_group(scenario, Options(data_jitter=0.001))
+    reports = run_group(scenario, Options(data_jitter=0.001, native=native))
     assert [report.errors for report in reports] == [[], []]
     assert reports[0].stats.fetch_wait_seconds > 0.0
     assert reports[1].stats.fetch_wait_seconds == 0.0

@@ -370,6 +370,18 @@ def test_the_messages_of_a_step_go_out_as_one_nccl_group_unless_turned_off(
     assert _staging_executor()._dkv_layer_split_settings()["p2p_groups"] is grouped
 
 
+@pytest.mark.parametrize("value,native", [(None, True), ("1", True), ("0", False)])
+def test_the_cpp_executor_carries_out_the_data_plane_unless_turned_off(
+    monkeypatch, value, native: bool
+) -> None:
+    monkeypatch.delenv("TRTLLM_DKV_STAGING_TOKENS", raising=False)
+    if value is None:
+        monkeypatch.delenv("TRTLLM_DKV_NATIVE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DKV_NATIVE", value)
+    assert _staging_executor()._dkv_layer_split_settings()["native_data_plane"] is native
+
+
 @pytest.mark.parametrize("checks", [False, True])
 def test_the_plan_is_fingerprinted_only_when_the_checks_are_on(monkeypatch, checks: bool) -> None:
     fingerprinted = []
@@ -663,6 +675,7 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
             compile_seconds=0.05,
             copy_seconds=0.03,
             transport_seconds=0.02,
+            native_seconds=0.015625,
             fetch_wait_seconds=0.0625,
             drain_seconds=0.125,
         )
@@ -683,6 +696,7 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
         "compile_seconds": 0.05,
         "copy_seconds": 0.03,
         "transport_seconds": 0.02,
+        "native_seconds": 0.015625,
         "fetch_wait_seconds": 0.0625,
         "drain_seconds": 0.125,
     }

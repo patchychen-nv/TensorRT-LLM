@@ -58,7 +58,8 @@ class NcclP2PTransport:
 
     ``group_send_recv`` issues all the messages of a step in one NCCL group, which NCCL runs as one
     kernel. It is ``None`` on a native build whose communicator op has no group call; the streamer
-    then sends and receives one message at a time.
+    then sends and receives one message at a time. ``native_data_plane`` makes the C++ executor of
+    the streamer's program on the same communicator; it is ``None`` on a native build without it.
     """
 
     def __init__(self, world_size: int, rank: int) -> None:
@@ -71,6 +72,14 @@ class NcclP2PTransport:
             self.group_send_recv = None
         # The raw entry point takes addresses and sizes, which spares the op the tensor arguments.
         self._raw_groups = hasattr(self._comm, "group_send_recv_raw")
+        try:
+            self._data_plane_class = torch.classes.trtllm.DkvDataPlane
+        except (AttributeError, RuntimeError):
+            self.native_data_plane = None
+
+    def native_data_plane(self, num_layers: int, data_stream: torch.cuda.Stream):
+        """The C++ executor of a ``DkvStreamer`` program that issues on ``data_stream``."""
+        return self._data_plane_class(self._comm, num_layers, data_stream.cuda_stream)
 
     def send(self, buffer: torch.Tensor, peer: int, stream: torch.cuda.Stream) -> None:
         with torch.cuda.stream(stream):

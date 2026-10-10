@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+#include "tensorrt_llm/thop/dkvDataPlaneOp.h"
 
 #include <c10/cuda/CUDAStream.h>
 #if ENABLE_MULTI_DEVICE
@@ -163,3 +164,6 @@ static auto trtllmNcclCommunicator
           .def("recv_on", &tensorrt_llm::torch_ext::NcclCommunicatorOp::recvOn)
           .def("group_send_recv", &tensorrt_llm::torch_ext::NcclCommunicatorOp::groupSendRecv)
           .def("group_send_recv_raw", &tensorrt_llm::torch_ext::NcclCommunicatorOp::groupSendRecvRaw);
+
+// Static initialization is ordered only within a translation unit, and DkvDataPlane takes a NcclCommunicatorOp.
+static auto trtllmDkvDataPlane = tensorrt_llm::torch_ext::registerDkvDataPlane();

@@ -185,13 +185,33 @@ class FakeTransport:
     sends and receives one message at a time.
     """
 
-    def __init__(self, network: FakeNetwork, rank: int, *, grouped: bool = True) -> None:
+    def __init__(
+        self, network: FakeNetwork, rank: int, *, grouped: bool = True, native: bool = False
+    ) -> None:
+        """``native`` offers ``native_data_plane``, the stand-in of the C++ executor."""
         self._network = network
         self._rank = rank
         # Hook for fault injection: called with the bytes of a message before it is delivered.
         self.corrupt: Callable[[int, int, bytearray], None] | None = None
         if not grouped:
             self.group_send_recv = None
+        if not native:
+            self.native_data_plane = None
+
+    def native_data_plane(self, num_layers: int, data_stream: FakeStream) -> "FakeNativeDataPlane":
+        return FakeNativeDataPlane(self, num_layers, data_stream)
+
+    def group_send_recv_raw(
+        self,
+        sends: Sequence[tuple[int, int, int]],
+        recvs: Sequence[tuple[int, int, int]],
+        stream: FakeStream,
+    ) -> None:
+        """``group_send_recv`` on host memory given as ``(address, bytes, peer)``."""
+        for address, nbytes, peer in sends:
+            self.send(_host_bytes(address, nbytes), peer, stream)
+        for address, nbytes, peer in recvs:
+            self.recv(_host_bytes(address, nbytes), peer, stream)
 
     def group_send_recv(
         self,
@@ -240,6 +260,183 @@ class FakeTransport:
                 taken.set()
 
         stream.enqueue(work)
+
+
+def _host_bytes(address: int, nbytes: int) -> torch.Tensor:
+    """The ``nbytes`` bytes of host memory at ``address`` as a tensor, without a copy."""
+    return torch.frombuffer((ctypes.c_uint8 * nbytes).from_address(address), dtype=torch.uint8)
+
+
+class FakeNativeDataPlane:
+    """``trtllm.DkvDataPlane`` on host memory: the tables, the address arithmetic, the checks and the
+    order of the work of the C++ executor, with the streams, events, copies and messages of these
+    stand-ins. See ``cpp/tensorrt_llm/thop/dkvDataPlaneOp.h`` for the tables."""
+
+    def __init__(self, transport: FakeTransport, num_layers: int, data_stream: FakeStream) -> None:
+        self._transport = transport
+        self._num_layers = num_layers
+        self._data = data_stream
+        self._copier = FakeCopier()
+        self._compute_events = [FakeEvent() for _ in range(num_layers + 2)]
+        self._fetch_events = [FakeEvent() for _ in range(num_layers)]
+        self._fetch_recorded = [False] * num_layers
+        self._waits: list[tuple[FakeEvent, FakeEvent]] = []
+        self._components: list[list[int]] | None = None
+        self._steps_at: dict[int, list[int]] = {}
+
+    def set_static(
+        self,
+        components: torch.Tensor,
+        pool_affine: torch.Tensor,
+        staging_pointers: torch.Tensor,
+        slot_offsets: torch.Tensor,
+    ) -> None:
+        assert pool_affine.shape[0] == staging_pointers.shape[0] == self._num_layers
+        self._components = components.tolist()
+        self._pool_affine = pool_affine.tolist()
+        self._staging = staging_pointers.tolist()
+        self._slot_offsets = slot_offsets.tolist()
+        self._kinds = slot_offsets.shape[1]
+
+    def set_iteration(
+        self,
+        requests: torch.Tensor,
+        templates: torch.Tensor,
+        runs: torch.Tensor,
+        steps: torch.Tensor,
+        ops: torch.Tensor,
+        send_arena: int,
+        recv_arena: int,
+    ) -> None:
+        if self._components is None:
+            raise RuntimeError("set_static must come before the first iteration")
+        self._groups = (requests.shape[1] - 1 - 3 * self._kinds) // 2
+        self._requests = requests.tolist()
+        self._templates = templates.tolist()
+        self._runs = runs.tolist()
+        self._steps = steps.tolist()
+        self._ops = ops.tolist()
+        self._send_arena, self._recv_arena = send_arena, recv_arena
+        self._steps_at = {}
+        previous = -1
+        for index, step in enumerate(self._steps):
+            if step[0] < previous:
+                raise RuntimeError("the steps must be in issue order")
+            previous = step[0]
+            self._steps_at.setdefault(step[0], []).append(index)
+        self._fetch_recorded = [False] * self._num_layers
+
+    def run(self, issue_point: int, compute_stream: int, time_fetch_waits: bool) -> None:
+        compute = FakeStream.of_handle(compute_stream)
+        if issue_point != 0:
+            self._data.wait_event(compute.record_event(self._compute_events[issue_point + 1]))
+        for index in self._steps_at.get(issue_point, ()):
+            self._issue(index)
+        if 0 <= issue_point < self._num_layers and self._fetch_recorded[issue_point]:
+            fetched = self._fetch_events[issue_point]
+            if time_fetch_waits:
+                start, end = FakeEvent(enable_timing=True), FakeEvent(enable_timing=True)
+                compute.record_event(start)
+                compute.wait_event(fetched)
+                compute.record_event(end)
+                self._waits.append((start, end))
+            else:
+                compute.wait_event(fetched)
+
+    def fetch_wait_ms(self) -> float:
+        total = 0.0
+        for start, end in self._waits:
+            end.synchronize()
+            total += start.elapsed_time(end)
+        self._waits.clear()
+        return total
+
+    def _issue(self, index: int) -> None:
+        _, direction, layer, record_fetch, first, count = self._steps[index]
+        fetch = direction == 0
+        ops = self._ops[first : first + count]
+        local: list[int] = []
+        for action, template, _, _, _ in ops:
+            if action == 2:
+                for run in self._runs_of(template):
+                    pool, staging = self._pool_side(layer, run), self._staging_side(layer, run)
+                    local += self._copy_run(
+                        run, staging if fetch else pool, pool if fetch else staging
+                    )
+        self._copier.copy_runs(local, self._data.cuda_stream)
+        packs: list[int] = []
+        sends = []
+        for action, template, peer, offset, nbytes in ops:
+            if action == 0:
+                base = self._send_arena + offset
+                for run in self._runs_of(template):
+                    pages = self._pool_side(layer, run) if fetch else self._staging_side(layer, run)
+                    packs += self._copy_run(run, self._message_side(base, run), pages)
+                sends.append((base, nbytes, peer))
+        self._copier.copy_runs(packs, self._data.cuda_stream)
+        if sends:
+            self._transport.group_send_recv_raw(sends, [], self._data)
+        receives = [
+            (self._recv_arena + offset, nbytes, peer)
+            for action, _, peer, offset, nbytes in ops
+            if action == 1
+        ]
+        if receives:
+            self._transport.group_send_recv_raw([], receives, self._data)
+            unpacks: list[int] = []
+            for action, template, _, offset, _ in ops:
+                if action == 1:
+                    base = self._recv_arena + offset
+                    for run in self._runs_of(template):
+                        pages = (
+                            self._staging_side(layer, run) if fetch else self._pool_side(layer, run)
+                        )
+                        unpacks += self._copy_run(run, pages, self._message_side(base, run))
+            self._copier.copy_runs(unpacks, self._data.cuda_stream)
+        if record_fetch:
+            self._data.record_event(self._fetch_events[layer])
+            self._fetch_recorded[layer] = True
+
+    def _runs_of(self, template: int) -> list[list[int]]:
+        return self._runs[self._templates[template] : self._templates[template + 1]]
+
+    def _pool_side(self, layer: int, run: list[int]) -> tuple[int, int, int]:
+        component = self._components[run[0]]
+        group, step, origin = self._pool_affine[layer][component[1]]
+        if not 0 <= group < self._groups:
+            raise RuntimeError(f"layer {layer} is not in the cache manager of this rank")
+        request = self._requests[run[1]]
+        address, length = request[1 + 2 * group], request[2 + 2 * group]
+        if address == 0 or run[2] + run[3] > length:
+            raise RuntimeError(
+                f"the cache manager has no page for block {max(length, run[2])} of request "
+                f"{request[0]} in layer {layer}"
+            )
+        return origin, step, address + 4 * run[2]
+
+    def _staging_side(self, layer: int, run: list[int]) -> tuple[int, int, int]:
+        kind, _, page_bytes = self._components[run[0]]
+        request = self._requests[run[1]]
+        first_block, page_offset, num_pages = request[
+            1 + 2 * self._groups + 3 * kind : 4 + 2 * self._groups + 3 * kind
+        ]
+        if num_pages < 0:
+            raise RuntimeError(f"request {request[0]} is not in the staged batch")
+        if not first_block <= run[2] or run[2] + run[3] > first_block + num_pages:
+            raise RuntimeError(f"blocks of request {request[0]} are outside the staged blocks")
+        pointer = self._staging[layer][run[0]]
+        if pointer == 0:
+            raise RuntimeError(f"layer {layer} has no staging slot for component {run[0]}")
+        entry = self._slot_offsets[layer][kind] + page_offset + run[2] - first_block
+        return pointer + entry * page_bytes, page_bytes, 0
+
+    def _message_side(self, base: int, run: list[int]) -> tuple[int, int, int]:
+        return base + run[4], self._components[run[0]][2], 0
+
+    def _copy_run(
+        self, run: list[int], destination: tuple[int, int, int], source: tuple[int, int, int]
+    ) -> list[int]:
+        return [self._components[run[0]][2], run[3], *destination, *source]
 
 
 class FakeCopier:

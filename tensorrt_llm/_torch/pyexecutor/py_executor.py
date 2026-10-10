@@ -6372,6 +6372,10 @@ class PyExecutor:
             # kernel for all of them; 0 issues them one by one.
             "p2p_groups":
             os.environ.get("TRTLLM_DKV_P2P_GROUPS", "1") == "1",
+            # The C++ executor carries out the program of an iteration, one call per hook; 0
+            # issues the steps from Python.
+            "native_data_plane":
+            os.environ.get("TRTLLM_DKV_NATIVE", "1") == "1",
         }
 
     def _initialize_dkv_layer_split(self) -> None:
@@ -6414,13 +6418,15 @@ class PyExecutor:
             debug=(DeviceDataPlaneDebug(data_stream)
                    if dkv_debug_enabled() else None),
             fault=fault,
-            group_messages=settings["p2p_groups"])
+            group_messages=settings["p2p_groups"],
+            native=settings["native_data_plane"])
         self._install_dkv_staged_view(view, settings)
         logger.info(
             f"DKV layer split: staging {pool.bytes_reserved / (1 << 20):.0f} MiB, "
             f"ring depth {settings['staging_depth']}, "
             f"{settings['staging_tokens']} staged tokens per iteration, "
-            f"rank {rank} owns {len(manager.pp_layers)} of {manager.num_layers} layers"
+            f"rank {rank} owns {len(manager.pp_layers)} of {manager.num_layers} layers, "
+            f"{'C++' if self.dkv_streamer.uses_native else 'Python'} data plane"
         )
 
     def _check_dkv_data_plane(self, records) -> None:

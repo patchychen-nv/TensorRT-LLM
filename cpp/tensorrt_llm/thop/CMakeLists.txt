@@ -126,6 +126,7 @@ add_th_common_family(
   ulyssesPostUnscatterOp.cpp
   ulyssesPermuteScatterOp.cpp
   helixPostProcessOp.cpp
+  dkvDataPlaneOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   reducescatterOp.cpp
@@ -134,6 +135,12 @@ add_th_common_family(
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
   fusedGemmAllreduceOp.cpp)
+
+# dkvDataPlaneOp.cpp copies pages with the KV cache manager V2 helpers, whose
+# headers resolve from batch_manager/.
+target_include_directories(
+  th_common_distributed
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 
 add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)

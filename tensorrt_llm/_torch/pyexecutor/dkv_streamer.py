@@ -257,11 +257,13 @@ class DataPlaneStats:
     ``hook_seconds`` is the host time of the hooks of the forward pass, which run between the
     launches of its layers and so add to a pass that is bound by the host, and ``drain_seconds`` the
     host time that ``drain`` waited for the data stream, the part of the data plane that the
-    forward pass did not hide. Three parts of ``hook_seconds`` are told apart: ``compile_seconds``
+    forward pass did not hide. Parts of ``hook_seconds`` are told apart: ``compile_seconds``
     resolved the plan of an iteration to device addresses, ``copy_seconds`` was spent inside the
     page copies and ``transport_seconds`` inside the transport calls; the last two enqueue work
-    on the GPU and wait only when its queue is full. ``fetch_wait_seconds`` is the GPU time the
-    compute stream spent waiting for layer fetches, measured only with ``TRTLLM_DKV_WAIT_TIMING=1``.
+    on the GPU and wait only when its queue is full. With the C++ executor of the program,
+    ``native_seconds`` is the time of its calls, which do the copies and the transport.
+    ``fetch_wait_seconds`` is the GPU time the compute stream spent waiting for layer fetches,
+    measured only with ``TRTLLM_DKV_WAIT_TIMING=1``.
     """
 
     iterations: int = 0
@@ -277,6 +279,7 @@ class DataPlaneStats:
     compile_seconds: float = 0.0
     copy_seconds: float = 0.0
     transport_seconds: float = 0.0
+    native_seconds: float = 0.0
     drain_seconds: float = 0.0
     fetch_wait_seconds: float = 0.0
 
@@ -566,6 +569,7 @@ class DkvStreamer:
         fault: DataPlaneFault | None = None,
         timing_event_factory: Callable[[], torch.cuda.Event] | None = None,
         group_messages: bool = True,
+        native: bool = True,
     ) -> None:
         """Build the streamer of ``rank``.
 
@@ -587,6 +591,10 @@ class DkvStreamer:
                 ``TRTLLM_DKV_WAIT_TIMING=1``; CUDA events by default.
             group_messages: Hand all the messages of a step to the transport in one call when it
                 has a ``group_send_recv`` method that is not None; else one message at a time.
+            native: Carry out the program with the C++ executor the transport makes with
+                ``native_data_plane``, if it has one: a hook of the forward pass is then one call.
+                Not with ``debug``, ``fault`` or ``fill``, which act on the messages and slots in
+                Python, nor without grouped messages or the affine page map of the cache manager.
         """
         layout = view.layout
         owners = tuple(owner_of_layer)
@@ -659,6 +667,31 @@ class DkvStreamer:
         self._base_indices: dict[tuple[int, int], np.ndarray] = {}
         self._indices: dict[tuple[int, int, object], np.ndarray] = {}
         self._page_tables: dict[tuple[int, object], tuple[int, int]] = {}
+        make_native = getattr(transport, "native_data_plane", None) if native else None
+        self._native = (
+            make_native(len(owners), self._data_stream)
+            if make_native is not None
+            and debug is None
+            and fault is None
+            and not fill
+            and self._group_send_recv is not None
+            and self._affine_pages
+            else None
+        )
+        self._native_static = False
+        self._native_compiled = False
+        self._native_kinds: dict[StagingKind, int] = {}
+        self._native_components: dict[StagingComponent, int] = {}
+        self._native_groups = 0
+        # Per issue point: messages and bytes sent and received, local copies and their bytes.
+        self._native_counts: dict[int, list[int]] = {}
+        # The base page indices the executor reads while it builds the copies of the iteration.
+        self._native_indices: list[np.ndarray] = []
+
+    @property
+    def uses_native(self) -> bool:
+        """Whether the C++ executor carries out the program."""
+        return self._native is not None
 
     # ---- the plan -------------------------------------------------------------------------
 
@@ -705,6 +738,9 @@ class DkvStreamer:
         self._fetch_done = {}
         self._base_indices = {}
         self._indices = {}
+        self._native_compiled = False
+        self._native_counts = {}
+        self._native_indices = []
 
     # ---- hooks of the forward pass --------------------------------------------------------
 
@@ -748,6 +784,9 @@ class DkvStreamer:
             return
         if not self._begun:
             self._begin()
+        if self._native is not None:
+            self._run_native(layer)
+            return
         stream = self._current_stream()
         if layer >= 1:
             # Also on a rank that computes nothing: the host of an idle rank runs far ahead of its
@@ -777,9 +816,12 @@ class DkvStreamer:
             return
         if not self._begun:
             self._begin()
-        self._data_stream.wait_event(self._record(self._current_stream(), ("end",)))
-        for compiled in self._program.get(plan.num_layers, ()):
-            self._issue(compiled)
+        if self._native is not None:
+            self._run_native(plan.num_layers)
+        else:
+            self._data_stream.wait_event(self._record(self._current_stream(), ("end",)))
+            for compiled in self._program.get(plan.num_layers, ()):
+                self._issue(compiled)
         self._data_done = self._record(self._data_stream, ("done",))
         self.last_plan = plan
         self._plan = None
@@ -826,6 +868,10 @@ class DkvStreamer:
             end.synchronize()
             self.stats.fetch_wait_seconds += start.elapsed_time(end) / 1000.0
         self._fetch_wait_events.clear()
+        if self._native is not None:
+            if self._wait_timing:
+                self.stats.fetch_wait_seconds += self._native.fetch_wait_ms() / 1000.0
+            self._native_indices = []
         return self._debug.collect() if self._debug is not None else []
 
     # ---- compiling the plan ---------------------------------------------------------------
@@ -912,6 +958,231 @@ class DkvStreamer:
         compiled = _CompiledOp(op, message_key(transfer), message, copies, runs, (pages,))
         return compiled, -(-end // _MESSAGE_ALIGNMENT) * _MESSAGE_ALIGNMENT
 
+    # ---- compiling the plan for the C++ executor ------------------------------------------
+
+    def _set_native_static(self) -> None:
+        """Hand the executor the addresses that stay the same: pools, slots, page sizes."""
+        layout = self._layout
+        num_layers = len(self._owners)
+        self._native_kinds = {kind: index for index, kind in enumerate(layout.kinds)}
+        self._native_components = {
+            component: index for index, component in enumerate(layout.components)
+        }
+        attention_types = list(dict.fromkeys(c.attention_type for c in layout.components))
+        attention_index = {
+            attention_type: index for index, attention_type in enumerate(attention_types)
+        }
+        components = np.array(
+            [
+                [
+                    self._native_kinds[component.kind],
+                    attention_index[component.attention_type],
+                    layout.page_bytes(component),
+                ]
+                for component in layout.components
+            ],
+            dtype=np.int64,
+        ).reshape(len(layout.components), 3)
+        pool = np.zeros((num_layers, len(attention_types), 3), dtype=np.int64)
+        pool[:, :, 0] = -1
+        staging = np.zeros((num_layers, len(layout.components)), dtype=np.int64)
+        slots = np.zeros((num_layers, len(layout.kinds)), dtype=np.int64)
+        groups = 0
+        for component, index in self._native_components.items():
+            kind = self._native_kinds[component.kind]
+            for layer in layout.layers_of(component.kind):
+                staging[layer, index] = self._pool.layer_pointer(layer, component)
+                slots[layer, kind] = layout.slot_page_offset(layer, component.kind)
+                if self._owners[layer] == self._rank:
+                    group, step, origin = self._affine(layer, component.attention_type)
+                    pool[layer, attention_index[component.attention_type]] = (group, step, origin)
+                    groups = max(groups, group + 1)
+        self._native.set_static(
+            torch.from_numpy(components),
+            torch.from_numpy(pool),
+            torch.from_numpy(staging),
+            torch.from_numpy(slots),
+        )
+        self._native_groups = groups
+        self._native_static = True
+
+    def _compile_native(self) -> None:
+        """Compile the plan of the iteration into the tables of the C++ executor.
+
+        The runs of the messages of a transfer depend only on its direction, the layer type, the
+        deadline class and the compute rank, so they are built once per such template and placed
+        in a layer and a message by the operations of the steps. The executor resolves them to
+        addresses when it issues a step.
+        """
+        started = time.perf_counter()
+        if not self._native_static:
+            self._set_native_static()
+        plan = self._plan
+        layout = self._layout
+        slots: dict[int, int] = {}
+        requests: list[int] = []
+        indices: list[np.ndarray] = []
+        for request in plan.requests:
+            if request.is_dummy:
+                continue
+            slots[request.request_id] = len(slots)
+            requests.append(request.request_id)
+            for group in range(self._native_groups):
+                # A copy: the manager's table is valid only until the next lifecycle operation.
+                table = np.array(
+                    self._manager.get_base_page_indices(request.request_id, group), dtype=np.int32
+                )
+                indices.append(table)
+                requests += (table.ctypes.data if len(table) else 0, len(table))
+            index = (
+                self._local_index.get(request.request_id)
+                if request.compute_rank == self._rank
+                else None
+            )
+            for kind in layout.kinds:
+                if index is None:
+                    requests += (-1, -1, -1)
+                else:
+                    span = self._spans[kind][index]
+                    requests += (span.first_block, span.page_offset, span.num_pages)
+        templates: dict[tuple, tuple[int, int]] = {}
+        offsets = [0]
+        runs: list[int] = []
+        steps: list[int] = []
+        ops: list[int] = []
+        counts: dict[int, list[int]] = {}
+        layer_types = self._layer_types
+        for step in plan.steps:
+            fetch = step.direction is Direction.FETCH
+            record_fetch = fetch and self._computes
+            step_ops = step.ops_for(self._rank)
+            if not step_ops and not record_fetch:
+                continue
+            first = len(ops) // 5
+            send_offset = recv_offset = 0
+            tally = counts.setdefault(step.issue_point, [0] * 8)
+            for op in step_ops:
+                transfer = op.transfer
+                key = (
+                    transfer.direction,
+                    layer_types[transfer.layer],
+                    transfer.deadline,
+                    transfer.compute,
+                )
+                template = templates.get(key)
+                if template is None:
+                    template = (len(templates), self._native_template(transfer, slots, runs))
+                    templates[key] = template
+                    offsets.append(len(runs) // 5)
+                nbytes = transfer.nbytes
+                if template[1] != nbytes:
+                    raise RuntimeError(
+                        f"rank {self._rank}: {transfer.label} has {nbytes} bytes in the plan, "
+                        f"other layers of its type {template[1]}"
+                    )
+                if op.action is OpAction.LOCAL:
+                    offset = 0
+                    tally[4] += 1
+                    tally[5] += nbytes
+                    tally[6 if fetch else 7] += nbytes
+                elif op.action is OpAction.SEND:
+                    offset = send_offset
+                    send_offset = self._next_message(send_offset, transfer, self._send_arena)
+                    tally[0] += 1
+                    tally[1] += nbytes
+                else:
+                    offset = recv_offset
+                    recv_offset = self._next_message(recv_offset, transfer, self._recv_arena)
+                    tally[2] += 1
+                    tally[3] += nbytes
+                ops += (int(op.action), template[0], op.peer, offset, nbytes)
+            steps += (
+                step.issue_point,
+                int(step.direction),
+                step.layer,
+                int(record_fetch),
+                first,
+                len(step_ops),
+            )
+        width = 1 + 2 * self._native_groups + 3 * len(layout.kinds)
+        self._native.set_iteration(
+            torch.from_numpy(np.array(requests, dtype=np.int64).reshape(-1, width)),
+            torch.from_numpy(np.array(offsets, dtype=np.int64)),
+            torch.from_numpy(np.array(runs, dtype=np.int64).reshape(-1, 5)),
+            torch.from_numpy(np.array(steps, dtype=np.int64).reshape(-1, 6)),
+            torch.from_numpy(np.array(ops, dtype=np.int64).reshape(-1, 5)),
+            self._send_arena.data_ptr(),
+            self._recv_arena.data_ptr(),
+        )
+        self._native_indices = indices
+        self._native_counts = counts
+        self._native_compiled = True
+        self.stats.compile_seconds += time.perf_counter() - started
+
+    def _native_template(self, transfer: Transfer, slots: dict[int, int], runs: list[int]) -> int:
+        """Append the runs of the messages of ``transfer`` to ``runs``; returns their bytes."""
+        layout = self._layout
+        span_of = (
+            layout.fetch_range if transfer.direction is Direction.FETCH else layout.writeback_range
+        )
+        offset = 0
+        for segment in transfer.segments:
+            request = self._requests[segment.request_id]
+            first, count = span_of(
+                segment.kind, request.context_current_position, request.context_chunk_size
+            )
+            if count != segment.pages:
+                raise RuntimeError(
+                    f"rank {self._rank}: {transfer.label} of request {segment.request_id} has "
+                    f"{segment.pages} {segment.kind.label} pages in the plan, the layout {count}"
+                )
+            if count == 0:
+                continue
+            slot = slots[segment.request_id]
+            for component in layout.components_of(segment.kind):
+                runs += (self._native_components[component], slot, first, count, offset)
+                offset += count * layout.page_bytes(component)
+        if offset != transfer.nbytes:
+            raise RuntimeError(
+                f"rank {self._rank}: {transfer.label} has {transfer.nbytes} bytes in the plan, "
+                f"the layout {offset}"
+            )
+        return offset
+
+    def _next_message(self, offset: int, transfer: Transfer, arena: torch.Tensor) -> int:
+        """Where the message after ``transfer``'s, which starts at ``offset``, starts."""
+        end = offset + transfer.nbytes
+        if end > arena.numel():
+            raise RuntimeError(
+                f"rank {self._rank}: the messages of "
+                f"{step_label(transfer.direction, transfer.layer)} need {end} bytes, the message "
+                f"arena has {arena.numel()}"
+            )
+        return -(-end // _MESSAGE_ALIGNMENT) * _MESSAGE_ALIGNMENT
+
+    def _run_native(self, issue_point: int) -> None:
+        """Enqueue the steps of ``issue_point`` with the C++ executor."""
+        started = time.perf_counter()
+        try:
+            self._native.run(issue_point, self._current_stream().cuda_stream, self._wait_timing)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"rank {self._rank}: the data plane at issue point {issue_point}: {error}"
+            ) from error
+        finally:
+            self.stats.native_seconds += time.perf_counter() - started
+        counts = self._native_counts.get(issue_point)
+        if counts is not None:
+            stats = self.stats
+            stats.messages_sent += counts[0]
+            stats.bytes_sent += counts[1]
+            stats.messages_received += counts[2]
+            stats.bytes_received += counts[3]
+            stats.local_copies += counts[4]
+            stats.bytes_local += counts[5]
+            stats.bytes_local_fetch += counts[6]
+            stats.bytes_local_writeback += counts[7]
+
     def _copy_runs(
         self, runs: Sequence[_Run], destinations: Sequence[_Side], sources: Sequence[_Side]
     ) -> list[int]:
@@ -935,6 +1206,11 @@ class DkvStreamer:
 
     def _begin(self) -> None:
         self._begun = True
+        if self._native is not None:
+            if not self._native_compiled:
+                self._compile_native()
+            self._run_native(ISSUE_AT_BEGIN)
+            return
         if self._program is None:
             self._compile()
         self._data_stream.wait_event(self._record(self._current_stream(), ("begin",)))

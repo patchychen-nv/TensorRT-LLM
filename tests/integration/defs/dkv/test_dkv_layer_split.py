@@ -81,11 +81,17 @@ def _precision(model: DkvModel) -> PrecisionPolicy:
     return dataclasses.replace(model.precision, mean_extra_sigmas=MEAN_EXTRA_SIGMAS)
 
 
-def _layer_split(monkeypatch: pytest.MonkeyPatch, fill: str = "") -> None:
-    """Build the DKV LLMs of this test from now on with the layer-split layout."""
+def _layer_split(monkeypatch: pytest.MonkeyPatch, fill: str = "", checksums: bool = True) -> None:
+    """Build the DKV LLMs of this test from now on with the layer-split layout.
+
+    Without ``checksums`` the ranks leave out the checksums of debug, so the C++ executor carries
+    out the data plane.
+    """
     monkeypatch.setenv("DKV_TEST_KV_LAYOUT", "layer_split")
     if fill:
         monkeypatch.setenv("TRTLLM_DKV_STAGING_FILL", fill)
+    if not checksums:
+        monkeypatch.setenv("TRTLLM_DKV_DEBUG", "0")
     # The ranks may have been launched with the environment of an earlier LLM.
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
 
@@ -97,6 +103,7 @@ def _replicated_unless_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
         "TRTLLM_DKV_STAGING_FILL",
         "TRTLLM_DKV_STAGING_LOOPBACK",
         "TRTLLM_DKV_FAULT",
+        "TRTLLM_DKV_DEBUG",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in dkv_worker_env().items():
@@ -106,18 +113,25 @@ def _replicated_unless_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize(
-    ("fill", "group_size"),
-    [("", 2), ("nan", 2), ("nan", 4)],
-    ids=["layer-split", "layer-split-nan", "layer-split-nan-g4"],
+    ("fill", "group_size", "checksums"),
+    [("", 2, True), ("nan", 2, True), ("nan", 4, True), ("", 2, False), ("", 4, False)],
+    ids=[
+        "layer-split",
+        "layer-split-nan",
+        "layer-split-nan-g4",
+        "layer-split-cpp",
+        "layer-split-cpp-g4",
+    ],
 )
 def test_the_layer_split_answers_like_the_replicated_group(
-    monkeypatch: pytest.MonkeyPatch, fill: str, group_size: int
+    monkeypatch: pytest.MonkeyPatch, fill: str, group_size: int, checksums: bool
 ) -> None:
     """The discriminating prompts get the answers of the replicated group.
 
     The two are compared within the run-to-run noise of the model. With ``fill="nan"`` the slots
     are overwritten with NaN before every layer's fetch, so a page that the layer reads without it
-    having been fetched or written turns the logits into NaN, which the run rejects.
+    having been fetched or written turns the logits into NaN, which the run rejects. Without the
+    checksums of debug the C++ executor carries out the data plane.
     """
     model = DEEPSEEK_V4
     _require(model, group_size)
@@ -126,7 +140,7 @@ def test_the_layer_split_answers_like_the_replicated_group(
     control, replay = run_precision_passes(
         model, dkv_enabled=True, prompts=prompts, passes=2, group_size=group_size
     )
-    _layer_split(monkeypatch, fill)
+    _layer_split(monkeypatch, fill, checksums)
     (split,) = run_precision_passes(
         model, dkv_enabled=True, prompts=prompts, passes=1, group_size=group_size
     )
@@ -135,7 +149,10 @@ def test_the_layer_split_answers_like_the_replicated_group(
     assess_prompt_separation(control, result["mean_adp_self_tv"], model.precision)
     assert_known_answers(control, answers, tokenizer.decode, "DKV replicated")
     assert_known_answers(split, answers, tokenizer.decode, "DKV layer split")
-    print(f"layer split precision ({fill or 'no fill'}): {result}")
+    print(
+        f"layer split precision ({fill or 'no fill'}, "
+        f"{'checksums' if checksums else 'C++ executor'}): {result}"
+    )
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -169,13 +186,17 @@ def test_the_layer_split_answers_chunked_prompts_like_the_replicated_group(
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("checksums", [True, False], ids=["checksums", "cpp"])
 def test_the_layer_split_keeps_the_aggregate_lifetime_of_a_request(
-    monkeypatch: pytest.MonkeyPatch, capfd
+    monkeypatch: pytest.MonkeyPatch, capfd, checksums: bool
 ) -> None:
-    """One prefill per iteration for 1000 iterations: every request returns its pages."""
+    """One prefill per iteration for 1000 iterations: every request returns its pages.
+
+    Without the checksums of debug the C++ executor carries out the data plane on every rank.
+    """
     model = DEEPSEEK_V4
     _require(model)
-    _layer_split(monkeypatch)
+    _layer_split(monkeypatch, checksums=checksums)
     for key, value in dkv_worker_env(measurement=True).items():
         monkeypatch.setenv(key, value)
     result = run_aggregate_soak(model, group_size=_GROUP_SIZE)
@@ -188,6 +209,7 @@ def test_the_layer_split_keeps_the_aggregate_lifetime_of_a_request(
         assert counters is not None, f"rank {rank} exported no data plane counters"
         assert counters["bytes_sent"] > 0 and counters["bytes_received"] > 0, (rank, counters)
         assert counters["iterations"] >= 1000, (rank, counters)
+        assert (counters["native_seconds"] > 0) == (not checksums), (rank, counters)
     logs = "".join(capfd.readouterr())
     assert "DKV invariant violation" not in logs
     assert "StagingOverflow" not in logs

@@ -51,6 +51,17 @@ public:
         std::vector<int64_t> sendPeers, std::vector<int64_t> recvAddresses, std::vector<int64_t> recvBytes,
         std::vector<int64_t> recvPeers, int64_t stream) const;
 
+    //! The communicator and the rank in it, for other ops that issue their NCCL calls on it.
+    std::shared_ptr<tensorrt_llm::runtime::NcclCommunicator> const& communicator() const noexcept
+    {
+        return mPipelineComm;
+    }
+
+    int32_t rank() const noexcept
+    {
+        return mRank;
+    }
+
 private:
     int32_t mRank;
     std::shared_ptr<tensorrt_llm::runtime::NcclCommunicator> mPipelineComm;
