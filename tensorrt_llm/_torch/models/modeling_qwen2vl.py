@@ -1599,10 +1599,9 @@ class Qwen2_5_VLVisionAttention(Attention):
                 return q, k, v
             except (RuntimeError, ValueError) as err:
                 logger.warning(
-                    "Qwen2.5-VL vision RoPE: FlashInfer failed (%s); "
-                    "falling back to PyTorch RotaryEmbedding.apply_rotary_pos_emb.",
-                    err,
-                )
+                    f"Qwen2.5-VL vision RoPE: FlashInfer failed ({err}); "
+                    f"falling back to PyTorch "
+                    f"RotaryEmbedding.apply_rotary_pos_emb.")
 
         # cos/sin are typically already in `q.dtype` upstream; `.to`
         # short-circuits when the dtype already matches, so this is a

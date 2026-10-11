@@ -32,8 +32,14 @@ Relay mode (`--yaml` without `--no-relay`) additionally submits the successor
 job before the current one hits its wall clock and reclaims the predecessor
 once the successor has proven itself. That half drives the serving jobs through
 a launcher script exposing `submit`, `restart` and `quit` subcommands, passed
-with `--serve-sh`. That script is not part of this example yet, so relay mode
-refuses to start without one rather than failing at the first handover.
+with `--serve-sh`; `serve.sh` beside this file provides them and is the
+default, so relay mode needs no extra argument here. On a fleet where several
+instances serve at once, `--relay-per-instance` rolls each one against its own
+wall clock through fleetctl instead of running a single lineage.
+
+Nothing schedules the handover: `elect` simply prefers the healthy backend
+with the furthest end time, so a successor wins the moment it passes /health,
+and `--lead-time` decides only how early it is submitted.
 
 Standard library only, on purpose: the gateway has to outlive every serving
 job, so it runs outside the TRT-LLM container on whatever long-lived host is
@@ -47,7 +53,9 @@ end, which is the only way to read the log at all once requests overlap. The
 status field is the backend's own status plus at most two suffixes:
 
     200     relayed intact
-    200!    the stream had no terminal event, so the gateway appended one
+    200!    the backend's response ended early: a stream with no terminal
+            event got one appended, any other body was cut off by closing
+            the connection
     200?    the ending could not be delivered; the client had already gone
     502     the BACKEND failed -- it never answered, or answered unusably
 
@@ -55,11 +63,28 @@ The distinction between `200?` and `502` is the point. Both used to be logged
 as 502, so a client that hung up mid-stream was indistinguishable from a
 serving job that had fallen over, and the counts blamed the backend for both.
 `side=` on each warning names which end of the proxy actually broke.
+
+Pools: more than one fleet directory
+------------------------------------
+`--fleet-dir` is the default pool. Each `--pool NAME=FLEET_DIR[,FLEET_CONFIG]`
+adds another fleet directory -- a second model's fleet, say -- and the same
+specs are read, one per line, from `pools.conf` beside the users file (see
+`--pools-file`). A pool decides two things and only two: where its backends
+are discovered, and what supervises them -- revive, recovery, walltime relay
+and drain act on a pool's jobs through that pool's own fleet config, and a
+pool with none is never acted on. Routing sees pools in one place only: a
+new conversation may be placed on any backend of any pool, whatever model a
+request names, but once served it is only re-placed (a lost backend, an
+abandoned request, a retry) inside the pool it started in -- pools are models,
+and a conversation must not continue on a model that did not write its history
+(`--pool-affinity`, on by default; see Router). With no extra pool configured
+nothing here changes -- not a log line, not a status field.
 """
 
 import argparse
 import asyncio
 import collections
+import errno
 import fcntl
 import glob
 import hashlib
@@ -99,6 +124,10 @@ STRIP_REQUEST_HEADERS = {
 MAX_HEAD_BYTES = 64 * 1024
 RELAY_CHUNK = 64 * 1024
 PENDING_VISIBILITY_GRACE = 60
+
+# The pool `--fleet-dir` describes. Reserved: no extra pool may take the name,
+# so a status report or a control request can always say "default" and mean it.
+DEFAULT_POOL = "default"
 
 # Identity used when a client sends no key at all. It is an ordinary allowlist
 # entry, not a bypass: keyless requests are refused unless this name is listed
@@ -149,6 +178,18 @@ _REQUEST_IDS = itertools.count(1)
 
 def next_request_id():
     return "r%06d" % (next(_REQUEST_IDS) % 1000000)
+
+
+class ClientAbandoned(ConnectionError):
+    """The client hung up while its request was still waiting on the backend.
+
+    Raised by the watcher in `proxy`, not by an I/O call: nothing on the
+    client socket fails when the client leaves quietly, so without the watcher
+    the gateway learns of the departure only at the first write -- which for a
+    request stuck in a saturated backend's queue is minutes away. By then the
+    abandoned request has held its queue slot the whole time and every retry
+    the client sent has stacked up behind it.
+    """
 
 
 class SideError(OSError):
@@ -252,7 +293,7 @@ class RequestTrace:
     single grep on the id reconstructs one request end to end.
     """
 
-    __slots__ = ("rid", "upstream_status", "tracker", "request_body_error", "conversation")
+    __slots__ = ("rid", "upstream_status", "tracker", "request_body_error", "conversation", "pool")
 
     def __init__(self):
         self.rid = next_request_id()
@@ -260,9 +301,15 @@ class RequestTrace:
         self.tracker = None
         self.request_body_error = None
         self.conversation = None
+        # The extra pool the serving backend registered in, so the access log
+        # says which fleet answered. None for the default pool, so a
+        # default-pool line reads exactly as it did before pools existed.
+        self.pool = None
 
     def detail(self):
         parts = ["rid=%s" % self.rid]
+        if self.pool is not None:
+            parts.append("pool=%s" % self.pool)
         if self.conversation is not None:
             # Which conversation a failure belongs to is the first thing wanted
             # when one agent session misbehaves and five others are fine.
@@ -300,8 +347,13 @@ def finite_float(value, field, source=""):
 class Backend:
     """One serving job, as seen through its registration file."""
 
-    def __init__(self, record):
+    def __init__(self, record, pool=DEFAULT_POOL):
         self.job_id = str(record["job_id"])
+        # Which pool's directory it registered in, and so which fleet config
+        # supervises it. Decided by the directory, never by anything the record
+        # says about itself: a record that could name its own pool could hand
+        # its lifecycle to another fleet's supervisor. Routing never reads it.
+        self.pool = pool
         self.url = record["url"].rstrip("/")
         self.run_dir = record.get("run_dir", "")
         self.state = record.get("state", "")
@@ -310,6 +362,14 @@ class Backend:
         self.healthy = False
         self.timeouts = 0  # consecutive probe timeouts
         self.healthy_since = 0.0
+        # Timestamps of recent connection refusals on REAL requests, which is
+        # the same evidence probe() acts on ("dead") arriving from a much
+        # denser sampler. The probe asks once every few seconds; traffic asks
+        # hundreds of times. When a backend died here the request stream
+        # reported 192 refusals inside one minute while the probe had taken
+        # about seven samples, and every one of those 192 was a 502 somebody
+        # had to retry.
+        self.refusals = []
         # Probing resolves the URL once; every request reuses host/port.
         match = re.match(r"^http://([^:/]+):(\d+)$", self.url)
         if not match:
@@ -348,6 +408,152 @@ class Backend:
                 self.port = int(match.group(2))
 
 
+# ---------------------------------------------------------------------------
+# Pools: fleet directories beyond --fleet-dir
+# ---------------------------------------------------------------------------
+PoolSpec = collections.namedtuple("PoolSpec", "name fleet_dir fleet_config")
+
+# The name tags log lines, keys the status report, and is what an HTTP
+# registration says to land in a pool's directory, so it gets the same
+# whitelist a job id does.
+_POOL_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def parse_pool_spec(text):
+    """`NAME=FLEET_DIR[,FLEET_CONFIG]` as a PoolSpec. Raises ValueError.
+
+    FLEET_CONFIG is kept exactly as written, like --fleet-config: it is handed
+    to fleetctl, which may run on another host where this one's idea of a
+    relative path means nothing.
+    """
+    text = (text or "").strip()
+    name, sep, rest = text.partition("=")
+    name = name.strip()
+    if not sep or not name:
+        raise ValueError("pool spec %r is not NAME=FLEET_DIR[,FLEET_CONFIG]" % text)
+    if not _POOL_NAME.match(name):
+        raise ValueError(
+            "pool name %r must be 1-64 chars of [A-Za-z0-9._-] and start alphanumeric" % name
+        )
+    if name == DEFAULT_POOL:
+        raise ValueError("pool name %r is reserved for --fleet-dir" % name)
+    items = [item.strip() for item in rest.split(",")]
+    if not items[0]:
+        raise ValueError("pool %s names no fleet directory" % name)
+    if len(items) > 2:
+        raise ValueError("pool %s: %r has more than NAME=FLEET_DIR[,FLEET_CONFIG]" % (name, text))
+    fleet_config = items[1] if len(items) == 2 else ""
+    if len(items) == 2 and not fleet_config:
+        raise ValueError("pool %s: empty fleet config in %r" % (name, text))
+    return PoolSpec(name, os.path.abspath(items[0]), fleet_config)
+
+
+def read_pools_file(path):
+    """Pool specs from a file, one per line, `#` comments. [] if there is no file.
+
+    Any other failure raises, deliberately: a gateway that started without a
+    pool it was told about would silently drop that pool's backends -- out of
+    routing, and out of supervision. Refusing to start is safe -- a handover
+    successor that exits is aborted, and its predecessor keeps serving.
+    """
+    try:
+        with open(path) as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return []
+    specs = []
+    for number, line in enumerate(lines, 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            specs.append(parse_pool_spec(line))
+        except ValueError as exc:
+            raise ValueError("%s:%d: %s" % (path, number, exc)) from None
+    return specs
+
+
+def combine_pools(flags, from_file, default_fleet_dir):
+    """The configured pools, checked as a set. Raises ValueError.
+
+    A pool may be stated both by flag and in the file -- the usual way to move
+    one from the file a live gateway picked it up from into the job script for
+    its next start -- but only if both say the same thing.
+    """
+    pools = collections.OrderedDict()
+    for spec in list(flags) + list(from_file):
+        known = pools.get(spec.name)
+        if known is not None and known != spec:
+            raise ValueError(
+                "pool %s is defined twice, differently: %s / %s" % (spec.name, known, spec)
+            )
+        pools[spec.name] = spec
+    owners = {os.path.abspath(default_fleet_dir): DEFAULT_POOL}
+    for spec in pools.values():
+        # One directory, one pool: a backend's pool is read off the directory
+        # its registration is in, so a shared one would make it both.
+        if spec.fleet_dir in owners:
+            raise ValueError(
+                "pool %s shares fleet dir %s with pool %s"
+                % (spec.name, spec.fleet_dir, owners[spec.fleet_dir])
+            )
+        owners[spec.fleet_dir] = spec.name
+    return list(pools.values())
+
+
+class Pool:
+    """An extra pool: its configuration, and the lifecycle state kept per pool.
+
+    The state attributes have the names and meanings of the Fleet attributes
+    the default pool has always kept them in. PoolView relies on that to run
+    one lifecycle implementation over either. None of it is routing state:
+    new conversations are placed across every directory, and only the Router
+    keeps a placed conversation inside its pool.
+    """
+
+    def __init__(self, spec):
+        self.name = spec.name
+        self.fleet_dir = spec.fleet_dir
+        self.fleet_config = spec.fleet_config
+        self.active = None
+        self.pending = None
+        self.ever_active = False
+        self.stopped = False
+        self.last_submit = 0.0
+        self.seen_running = set()
+        self.superseded = set()
+        self.draining = {}
+        self.relaying = {}
+        self.lost = {}
+        self.recovered = {}
+        self.last_recovery = 0.0
+
+
+def pool_tag(fleet):
+    """Log-line prefix naming the pool a lifecycle message is about.
+
+    Empty for the default pool -- and for anything that predates pools, which
+    is what the getattr is for -- so its lines read exactly as they always did.
+    """
+    return getattr(fleet, "pool_tag", "")
+
+
+def extra_pool(backend):
+    """The pool a backend registered in, for a log line -- None for the default."""
+    return None if backend.pool == DEFAULT_POOL else backend.pool
+
+
+def decode_json_object(data):
+    """A request body as a dict, or None for anything that is not a JSON object."""
+    if not data:
+        return None
+    try:
+        payload = json.loads(data)
+    except (ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 class Fleet:
     """Everything the request path and the supervisor share."""
 
@@ -375,6 +581,9 @@ class Fleet:
         # Replaced, but not yet cleared for reclaim: draining ends in a `quit`,
         # so it waits until the successor has proven itself.
         self.superseded = set()
+        # instance label -> when its successor was last submitted. Per label so
+        # that one instance rolling never delays another.
+        self.relaying = {}
         # job_id -> (restarts attempted, last attempt). Kept on the fleet
         # rather than the Backend so a job that re-registers cannot reset its
         # own budget by being rediscovered.
@@ -391,6 +600,18 @@ class Fleet:
         # fresh budget just for having been rediscovered.
         self.recovered = {}
         self.last_recovery = 0.0
+        # Extra pools -- fleet directories beyond --fleet-dir -- in the order
+        # configured. The default pool is not in here: its lifecycle state is
+        # this object's own attributes above, exactly as before pools existed,
+        # and each Pool carries the same attributes for itself.
+        self.pools = collections.OrderedDict(
+            (spec.name, Pool(spec)) for spec in getattr(args, "pools", None) or ()
+        )
+        # The default pool's log prefix. A PoolView carries its own.
+        self.pool_tag = ""
+        # (job id, pool) pairs already reported as registered in two pools, so
+        # a stray copy of a registration says so once rather than every sweep.
+        self._collisions = set()
         # Lifecycle authority, which is not routing authority: during a handover
         # two gateways both route, and only the one holding this may act on the
         # fleet. It lives here rather than in main_async because "everything the
@@ -403,13 +624,20 @@ class Fleet:
             or os.path.join(args.fleet_dir, ".supervisor.lock")
         )
         self.started = time.time()
-        # job id -> (host, port) to copy that backend's requests to. The target
-        # is not a fleet member and never becomes one: it is not discovered, not
-        # probed, not routed to, and its answers are read only to be thrown
-        # away. The point is to put a real workload in front of a server whose
-        # behaviour is being compared, without that server being able to affect
-        # the answer any caller receives.
+        # job id -> [(host, port), ...] to copy that backend's requests to.
+        # A target is not a fleet member and never becomes one: it is not
+        # discovered, not probed, not routed to, and its answers are read only
+        # to be thrown away. The point is to put a real workload in front of a
+        # server whose behaviour is being compared, without that server being
+        # able to affect the answer any caller receives. Several targets per
+        # backend, because the comparison is usually between candidates -- two
+        # builds shadowing one live instance -- and running them one at a time
+        # is comparing against different traffic.
         self.mirror_stats = collections.Counter()
+        # The same counters, split by target. With one target the totals were
+        # the story; with two, "failed: 50" does not say which one, and the
+        # answer decides whether an experiment's numbers are worth keeping.
+        self.mirror_target_stats = collections.defaultdict(collections.Counter)
         # Consecutive failures per target. A mirror is added to measure
         # something and then forgotten about; without this, a target that goes
         # away leaves the gateway attempting a connection per request for as
@@ -427,6 +655,7 @@ class Fleet:
             policy=args.route_policy,
             state_path=args.router_state,
             key_sources=args.key_sources or DEFAULT_KEY_SOURCES,
+            pool_affinity=getattr(args, "pool_affinity", True),
         )
         # Loaded before the saved state is restored, so a policy that came from
         # a file is a legitimate thing to have been using before the restart.
@@ -481,18 +710,114 @@ class Fleet:
         stream in flight. Only the reads move -- applying the result stays on
         the loop, because the backend table is read by the request path and a
         dict that changes size mid-iteration raises.
+
+        Every pool's directory, the default first: (path, record, pool).
         """
         records = []
-        for path in glob.glob(os.path.join(self.args.fleet_dir, "*.json")):
-            try:
-                with open(path) as handle:
-                    records.append((path, json.load(handle)))
-            except (OSError, ValueError):
-                # Mid-rename or truncated. The writer replaces the file
-                # atomically, so the next sweep gets a whole one. Stay quiet:
-                # this is expected and would otherwise log on every sweep.
-                continue
+        for pool, fleet_dir in self.pool_dirs():
+            for path in glob.glob(os.path.join(fleet_dir, "*.json")):
+                try:
+                    with open(path) as handle:
+                        records.append((path, json.load(handle), pool))
+                except (OSError, ValueError):
+                    # Mid-rename or truncated. The writer replaces the file
+                    # atomically, so the next sweep gets a whole one. Stay
+                    # quiet: this is expected and would otherwise log on
+                    # every sweep.
+                    continue
         return records
+
+    # -- pools ------------------------------------------------------------
+    def pool_names(self):
+        return [DEFAULT_POOL] + list(self.pools)
+
+    def pool_dirs(self):
+        """(pool, fleet dir) for every pool, the default first."""
+        return [(DEFAULT_POOL, self.args.fleet_dir)] + [
+            (pool.name, pool.fleet_dir) for pool in self.pools.values()
+        ]
+
+    def pool_dir(self, name):
+        return self.args.fleet_dir if name == DEFAULT_POOL else self.pools[name].fleet_dir
+
+    def known_pool(self, name):
+        return name == DEFAULT_POOL or name in self.pools
+
+    def state_for(self, name):
+        """Where a pool's lifecycle state lives: an extra pool's own, or here."""
+        return self if name == DEFAULT_POOL else self.pools.get(name, self)
+
+    @staticmethod
+    def tag_for(name):
+        return "" if name == DEFAULT_POOL else "[%s] " % name
+
+    def view(self, name):
+        return PoolView(self, name)
+
+    def lifecycle_view(self):
+        """What the default pool's lifecycle endpoints act on.
+
+        The Fleet itself while it is the only pool, which is exactly what they
+        always acted on; with extra pools, the default pool's view, so that
+        stop_server cannot release jobs another pool's fleet config owns.
+        """
+        return self.view(DEFAULT_POOL) if self.pools else self
+
+    def supervised_views(self):
+        """Every pool that lifecycle actions may touch.
+
+        The default pool always, and each extra pool with a fleet config --
+        the only thing that may act on that pool's jobs.
+        """
+        return [self.view(DEFAULT_POOL)] + [
+            self.view(pool.name) for pool in self.pools.values() if pool.fleet_config
+        ]
+
+    def pool_actives(self):
+        return [(DEFAULT_POOL, self.active)] + [
+            (pool.name, pool.active) for pool in self.pools.values()
+        ]
+
+    def overall_active(self):
+        """The backend one election over every pool would pick.
+
+        Each pool elects its own `active` for its lifecycle -- whose successor
+        supersedes whom is a question inside one fleet. Routing is one pool, so
+        what /health reports is the longest-lived of those winners, which is
+        exactly what a single election over every backend picks. With no extra
+        pool it is simply `active`.
+        """
+        if not self.pools:
+            return self.active
+        winners = [job for _, job in self.pool_actives() if job in self.backends]
+        if not winners:
+            return None
+        return max(winners, key=lambda job: self.backends[job].end_time)
+
+    def pool_report(self, accepting, conversations):
+        """Per-pool counts for /_gateway/fleet."""
+        report = {}
+        for name in self.pool_names():
+            pool = self.pools.get(name)
+            members = {j: b for j, b in self.backends.items() if b.pool == name}
+            report[name] = {
+                "fleet_dir": pool.fleet_dir if pool else self.args.fleet_dir,
+                "fleet_config": (
+                    pool.fleet_config if pool else getattr(self.args, "fleet_config", "")
+                )
+                or None,
+                # The default pool is always supervised; recovery inside it
+                # still needs --fleet-config, as it always has.
+                "supervised": bool(pool.fleet_config) if pool else True,
+                "active": pool.active if pool else self.active,
+                "backends": len(members),
+                "healthy": sum(1 for b in members.values() if b.healthy),
+                "accepting": sorted(j for j in members if j in accepting),
+                "serving": sorted(j for j, b in members.items() if b.healthy),
+                "inflight": sum(self.inflight.get(j, 0) for j in members),
+                "conversations": sum(conversations.get(j, 0) for j in members),
+            }
+        return report
 
     def discover(self, records=None):
         """Rebuild the backend table from the registration directory.
@@ -509,7 +834,9 @@ class Fleet:
         seen = set()
         if records is None:
             records = self.read_registrations()
-        for path, record in records:
+        for item in records:
+            path, record = item[0], item[1]
+            pool = item[2] if len(item) > 2 else DEFAULT_POOL
             # A registration has to be a JSON object. Valid JSON that is not one
             # (a bare array, string or number) would otherwise reach .get() and
             # raise AttributeError, which is not a coercion error and escapes
@@ -526,6 +853,21 @@ class Fleet:
                 LOG.warning("ignoring %s: %s", path, exc)
                 continue
             if not job_id:
+                continue
+            known = self.backends.get(job_id)
+            if known is not None and known.pool != pool:
+                # Job ids are unique per scheduler, so this is a registration
+                # copied or misdirected into a second pool's directory. The
+                # pool that has the backend keeps it: flapping between two
+                # would hand its lifecycle to each pool's supervisor in turn.
+                if (job_id, pool) not in self._collisions:
+                    self._collisions.add((job_id, pool))
+                    LOG.warning(
+                        "ignoring %s: job %s is already registered in pool %s",
+                        path,
+                        job_id,
+                        known.pool,
+                    )
                 continue
             if record.get("manual") and job_id in self.backends:
                 # Nothing writes heartbeats for a backend registered by hand,
@@ -566,7 +908,7 @@ class Fleet:
                     LOG.warning("ignoring refresh from %s: %s", path, exc)
             else:
                 try:
-                    self.backends[job_id] = Backend(record)
+                    self.backends[job_id] = Backend(record, pool)
                 # AttributeError covers a non-string url, which reaches
                 # .rstrip() in __init__. One unusable record must cost only
                 # itself, never the rest of the sweep.
@@ -576,25 +918,35 @@ class Fleet:
                 self.inflight.setdefault(job_id, 0)
                 # It came back on its own -- SLURM requeued it, or an operator
                 # brought it up. Either way nothing needs recovering.
-                self.lost.pop(job_id, None)
+                self.state_for(pool).lost.pop(job_id, None)
                 LOG.info(
-                    "backend appeared: %s at %s (ends %s)",
+                    "%sbackend appeared: %s at %s (ends %s)",
+                    self.tag_for(pool),
                     job_id,
                     self.backends[job_id].url,
                     fmt_time(self.backends[job_id].end_time),
                 )
 
         for job_id in [j for j in self.backends if j not in seen]:
-            LOG.info("backend gone: %s (no heartbeat for %ds)", job_id, self.args.stale_after)
+            backend = self.backends[job_id]
+            # Each pool's own records: recovering this one is its pool's
+            # business, under that pool's fleet config.
+            state = self.state_for(backend.pool)
+            LOG.info(
+                "%sbackend gone: %s (no heartbeat for %ds)",
+                self.tag_for(backend.pool),
+                job_id,
+                self.args.stale_after,
+            )
             # Remember it before dropping it. Every way a node is preempted
             # ends here -- SIGTERM and "allocation gone" both delete the
             # registration through clear_fleet, and SIGKILL leaves one that
             # goes stale -- so this is the single place that sees all three,
             # and the only place still holding the run_dir.
-            self.lost.setdefault(job_id, (self.backends[job_id].run_dir, now))
+            state.lost.setdefault(job_id, (backend.run_dir, now))
             self.backends.pop(job_id, None)
-            self.draining.pop(job_id, None)
-            self.superseded.discard(job_id)
+            state.draining.pop(job_id, None)
+            state.superseded.discard(job_id)
             # Keep the counter while anything is still streaming off this
             # backend; a later sweep collects it once the count reaches zero.
             if not self.inflight.get(job_id):
@@ -607,6 +959,10 @@ class Fleet:
         if self.active is not None and self.active not in self.backends:
             LOG.warning("active backend %s retired; serving 503", self.active)
             self.active = None
+        for pool in self.pools.values():
+            if pool.active is not None and pool.active not in self.backends:
+                LOG.warning("[%s] active backend %s retired; serving 503", pool.name, pool.active)
+                pool.active = None
 
     # -- routable sets ----------------------------------------------------
     def serving(self):
@@ -641,6 +997,10 @@ class Fleet:
         single-active election -- instead of one backend holding all traffic
         until it is replaced, an ageing backend simply stops being offered new
         work and empties out on its own.
+
+        Every pool's backends alike: a new conversation may go to any pool
+        (Router.route keeps an existing one inside its pool). Only the drain
+        is read per pool, because each pool's supervisor keeps its own.
         """
         now = time.time()
         horizon = self.args.new_conversation_margin
@@ -656,7 +1016,7 @@ class Fleet:
             # was elected, because every other instance is superseded by
             # definition. Only `draining`, which means "this one is going
             # away", keeps new conversations out.
-            if job_id in self.draining:
+            if job_id in self.state_for(backend.pool).draining:
                 continue
             if job_id in self.router.paused:
                 continue
@@ -680,15 +1040,30 @@ class Fleet:
 
     # -- election ---------------------------------------------------------
     def elect(self):
+        """Run the election in every pool, each over its own backends only.
+
+        The election is lifecycle state, not routing: it decides which job
+        supersedes which, and so what a pool's supervisor drains and quits.
+        One election across pools would let a K3 job that outlives every GLM
+        job become GLM's `active` -- and mark GLM's own active superseded,
+        which ends in a drain and a `quit`.
+        """
+        if not getattr(self, "pools", None):
+            return self._elect_one()
+        for name in self.pool_names():
+            self.view(name)._elect_one()
+
+    def _elect_one(self):
         """Pick the healthy backend that will live the longest.
 
         Choosing by end time is what makes relay work without anybody
         orchestrating it: a freshly started job outlives the one it replaces,
         so the moment it passes /health it wins the election on its own.
         """
+        tag = pool_tag(self)
         candidates = [j for j, b in self.backends.items() if b.healthy]
         if self.pending and self.pending[0] in candidates:
-            LOG.info("successor %s is healthy", self.pending[0])
+            LOG.info("%ssuccessor %s is healthy", tag, self.pending[0])
             self.pending = None
         winner = max(candidates, key=lambda j: self.backends[j].end_time) if candidates else None
         if winner == self.active:
@@ -696,31 +1071,128 @@ class Fleet:
         previous = self.active
         self.active = winner
         if winner is None:
-            LOG.warning("no healthy backend; serving 503")
+            LOG.warning("%sno healthy backend; serving 503", tag)
         else:
             self.ever_active = True
-            LOG.info("active backend -> %s (%s)", winner, self.backends[winner].url)
+            LOG.info("%sactive backend -> %s (%s)", tag, winner, self.backends[winner].url)
             # Won the election back: whatever replaced it is gone or sicker, so
             # it is no longer a candidate for reclaim.
             self.superseded.discard(winner)
             if winner in self.draining:
                 self.draining.pop(winner, None)
-                LOG.info("cancelled drain of re-elected backend %s", winner)
+                LOG.info("%scancelled drain of re-elected backend %s", tag, winner)
 
         # Only a forward handover marks the predecessor. Falling back to an
         # older job after the active backend fails is reversible: the newer job
         # may merely be restarting and must remain eligible to win back routing.
+        #
+        # And only within one instance. The election ranks every backend by end
+        # time, which across a multi-instance fleet says nothing about
+        # replacement: i02 submitted an hour after i00 outlives it and would
+        # "supersede" it here, though the two serve side by side and neither is
+        # replacing anything. Acting on that drained every instance but the
+        # longest-lived one, which is why relay had to be switched off
+        # fleet-wide. Comparing labels costs nothing in the single-instance
+        # case -- consecutive jobs of one instance share a label, so the
+        # condition is simply true.
         if winner is not None and previous and previous in self.backends:
-            if self.backends[winner].end_time > self.backends[previous].end_time:
+            same_instance = instance_label(self.backends[winner].run_dir) == instance_label(
+                self.backends[previous].run_dir
+            )
+            if not same_instance:
+                LOG.info(
+                    "%s%s outlives %s but is a different instance; neither supersedes the other",
+                    tag,
+                    winner,
+                    previous,
+                )
+            elif self.backends[winner].end_time > self.backends[previous].end_time:
                 self.superseded.add(previous)
-                LOG.info("superseded %s; reclaim held until %s is stable", previous, winner)
+                LOG.info("%ssuperseded %s; reclaim held until %s is stable", tag, previous, winner)
             else:
                 LOG.warning(
-                    "failed back from %s to older backend %s; keeping %s available for recovery",
+                    "%sfailed back from %s to older backend %s; keeping %s available for recovery",
+                    tag,
                     previous,
                     winner,
                     previous,
                 )
+
+
+class PoolView:
+    """One pool of the fleet, shaped like the Fleet itself.
+
+    The lifecycle code -- election, revive, recovery, relay, drain, reclaim and
+    the start/stop endpoints -- was written against a Fleet, and every line of
+    it is right for a single pool. Rather than teach each function about
+    pools, each is handed one of these: `backends` holds only this pool's
+    members, `args` names this pool's fleet config, and the per-pool state
+    lives on the pool. For the default pool that state is the Fleet's own
+    attributes, so its supervision reads and writes exactly what it always did.
+
+    `inflight` and `revived` stay shared: both are keyed by job id, and no job
+    id is in two pools (discovery refuses the second).
+    """
+
+    STATE = (
+        "active",
+        "pending",
+        "ever_active",
+        "stopped",
+        "last_submit",
+        "seen_running",
+        "superseded",
+        "draining",
+        "relaying",
+        "lost",
+        "recovered",
+        "last_recovery",
+    )
+
+    def __init__(self, fleet, name):
+        pool = fleet.pools.get(name)
+        args = fleet.args
+        if pool is not None:
+            # A copy, so the pool's fleet config is what run_fleetctl passes
+            # and the default pool's stays the default pool's.
+            args = argparse.Namespace(**vars(fleet.args))
+            args.fleet_dir = pool.fleet_dir
+            args.fleet_config = pool.fleet_config
+            args.yaml = ""
+        set_ = object.__setattr__
+        set_(self, "fleet", fleet)
+        set_(self, "name", name)
+        set_(self, "args", args)
+        set_(self, "state", pool if pool is not None else fleet)
+        # The single-lineage relay resubmits --yaml, one serve.sh deployment;
+        # it is the default pool's alone. An extra pool rolls per instance.
+        set_(self, "single_lineage", pool is None)
+        set_(self, "pool_tag", fleet.tag_for(name))
+
+    @property
+    def backends(self):
+        return {j: b for j, b in self.fleet.backends.items() if b.pool == self.name}
+
+    @property
+    def inflight(self):
+        return self.fleet.inflight
+
+    @property
+    def revived(self):
+        return self.fleet.revived
+
+    def __getattr__(self, attr):
+        if attr in PoolView.STATE:
+            return getattr(self.state, attr)
+        raise AttributeError("a pool view has no %r" % attr)
+
+    def __setattr__(self, attr, value):
+        if attr not in PoolView.STATE:
+            raise AttributeError("%r is not per-pool state" % attr)
+        setattr(self.state, attr, value)
+
+    # The election, over this pool's backends and this pool's state.
+    _elect_one = Fleet._elect_one
 
 
 def fmt_time(ts):
@@ -1339,7 +1811,22 @@ class Router:
 
     So a broken pin is a slowdown, never a wrong answer. That is what lets
     every failure here resolve by re-pinning rather than by refusing to serve.
+
+    The exception is a gateway fronting several models, one per pool. A
+    conversation that moves to another pool's backend continues on a
+    different model: that model reads the first one's output as its own
+    history and copies its habits, and the recorded trajectory mixes two
+    models. So each conversation also remembers the pool it was first placed
+    in (`families`), longer than its pin. With `pool_affinity` it is only
+    ever re-placed inside that pool; while no backend of it is accepting, the
+    request gets no backend rather than another model's.
     """
+
+    # How long a conversation's pool is remembered after its last request.
+    # Longer than the pin: a pin lapses after a quiet spell and is simply
+    # rebuilt, but the conversation must come back to the same model even
+    # after an agent's longest wait. Campaigns run for at most four hours.
+    FAMILY_TTL = 6 * 3600.0
 
     def __init__(
         self,
@@ -1348,18 +1835,29 @@ class Router:
         policy="least_conversations",
         state_path=None,
         key_sources=DEFAULT_KEY_SOURCES,
+        pool_affinity=True,
     ):
         self.ttl = ttl
         self.capacity = capacity
         self.policy = policy
         self.key_sources = list(key_sources)
         self.state_path = state_path
+        self.pool_affinity = pool_affinity
         self.pins = collections.OrderedDict()  # key -> (job_id, last_seen)
+        # key -> (pool, last_seen): the pool a conversation was first placed
+        # in. Kept through unpin, which is the point: a pin is dropped when a
+        # client gives up on a backend, and the retry must still find the
+        # same model.
+        self.families = collections.OrderedDict()
+        # Placements refused because no backend of the conversation's pool
+        # was accepting, and when that was last logged, per pool.
+        self.family_waits = 0
+        self._family_wait_logged = {}
         # Set by hand and authoritative: never expired, never displaced by a
         # placement decision. Only a backend that has actually gone away can
         # override one, because the alternative is refusing to serve.
         self.manual = {}  # key -> job_id
-        # Which backends are being copied elsewhere, job id -> (host, port).
+        # Which backends are being copied elsewhere, job id -> [(host, port)].
         # Kept here, with the pins, because this file is the set of things a
         # successor has to inherit -- and a handover that silently ends a
         # running mirror experiment is a handover that did not keep its
@@ -1415,21 +1913,45 @@ class Router:
             if now - last_seen <= self.ttl:
                 self.pins[key] = (job_id, last_seen)
                 restored += 1
+        # Absent from a file written before conversations remembered their
+        # pool, which is every predecessor in the first handover after the
+        # upgrade; pinned conversations then learn their pool on their next
+        # request (route()).
+        for key, value in (state.get("families") or {}).items():
+            try:
+                pool, last_seen = str(value[0]), float(value[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if now - last_seen <= self.FAMILY_TTL:
+                self.families[key] = (pool, last_seen)
         self.manual = {
             str(k): str(v) for k, v in (state.get("manual") or {}).items() if isinstance(v, str)
         }
         self.paused = {str(j) for j in (state.get("paused") or [])}
         restored_mirrors = {}
-        for job, target in (state.get("mirrors") or {}).items():
-            # A malformed entry drops that one mirror rather than the whole
-            # restore: everything else in this file is still worth having.
-            try:
-                host, port = str(target[0]), int(target[1])
-            except (TypeError, ValueError, IndexError):
-                LOG.warning("ignoring unusable mirror entry for %s: %r", job, target)
-                continue
-            if host and 0 < port < 65536:
-                restored_mirrors[str(job)] = (host, port)
+        for job, entry in (state.get("mirrors") or {}).items():
+            # Two shapes on disk. A file written before mirrors went
+            # multi-target holds ["host", port]; one written after holds
+            # [["host", port], ...]. The predecessor in a live handover is by
+            # definition running the older code, so the old shape is not a
+            # legacy to migrate once -- it arrives at every upgrade.
+            if isinstance(entry, (list, tuple)) and entry and isinstance(entry[0], (list, tuple)):
+                candidates = entry
+            else:
+                candidates = [entry]
+            targets = []
+            for target in candidates:
+                # A malformed entry drops that one target rather than the whole
+                # restore: everything else in this file is still worth having.
+                try:
+                    host, port = str(target[0]), int(target[1])
+                except (TypeError, ValueError, IndexError):
+                    LOG.warning("ignoring unusable mirror entry for %s: %r", job, target)
+                    continue
+                if host and 0 < port < 65536 and (host, port) not in targets:
+                    targets.append((host, port))
+            if targets:
+                restored_mirrors[str(job)] = targets
         self.mirrors = restored_mirrors
         if state.get("policy") in known_policies(self):
             self.policy = state["policy"]
@@ -1449,6 +1971,8 @@ class Router:
             len(self.paused),
             self.policy,
         )
+        if self.families:
+            LOG.info("router state restored: %d conversations' pools", len(self.families))
 
     def _read_state(self):
         """Decode the state file, or None if it cannot be read right now.
@@ -1505,20 +2029,27 @@ class Router:
         # the write will persist, so a mutation arriving while it is in flight
         # belongs to the next flush and has to re-dirty the table itself.
         self.dirty = False
-        return {
+        state = {
             # Popped by write_snapshot before the dump. It orders two writes
             # against each other inside this process and would mean nothing to
             # anyone reading the file back, so it does not belong on disk.
             "_seq": next(self._snapshots),
             "version": 1,
             "saved_at": time.time(),
-            "mirrors": {job: list(t) for job, t in self.mirrors.items()},
+            # Always the multi-target shape, [[host, port], ...]. load()
+            # accepts both, so a successor on either version reads this.
+            "mirrors": {job: [list(t) for t in targets] for job, targets in self.mirrors.items()},
             "policy": self.policy,
             "key_sources": list(self.key_sources),
             "manual": dict(self.manual),
             "paused": sorted(self.paused),
             "pins": {k: [j, t] for k, (j, t) in self.pins.items()},
         }
+        if self.families:
+            # Ignored by a predecessor's code, which reads only the keys it
+            # knows. Left out when empty, as on any single-pool gateway.
+            state["families"] = {k: [p, t] for k, (p, t) in self.families.items()}
+        return state
 
     def _fsync_directory(self):
         """Make the rename durable as well as the bytes. Best effort.
@@ -1660,6 +2191,26 @@ class Router:
         self._last_expire = now
         for key in [k for k, (_, seen) in self.pins.items() if now - seen > self.ttl]:
             self._drop_pin(key)
+        for key in [k for k, (_, seen) in self.families.items() if now - seen > self.FAMILY_TTL]:
+            del self.families[key]
+
+    def _note_family(self, key, pool, now):
+        """Remember (or refresh) the pool a conversation is served from."""
+        if pool is None:
+            return
+        previous = self.families.get(key)
+        self.families[key] = (pool, now)
+        self.families.move_to_end(key)
+        if previous is None or previous[0] != pool:
+            self.dirty = True
+        while len(self.families) > self.capacity:
+            self.families.popitem(last=False)
+
+    def _family_of(self, key, now):
+        family = self.families.get(key)
+        if family is None or now - family[1] > self.FAMILY_TTL:
+            return None
+        return family[0]
 
     def _trim(self):
         # Runs after the insert, not before it. Trimming first leaves room for
@@ -1668,16 +2219,22 @@ class Router:
             key, (job_id, _) = self.pins.popitem(last=False)
             self._tally[job_id] -= 1
 
-    def route(self, key, accepting, serving, now=None):
+    def route(self, key, accepting, serving, now=None, pool_of=None):
         """Return the job id to use, pinning the conversation on first sight.
 
         `accepting` are the backends taking new conversations; `serving` also
         includes those that are draining, because a conversation already pinned
         to one should stay there while it lasts rather than lose its cache to a
         handover it did not need.
+
+        `pool_of` maps job id to pool. With it, a conversation that has been
+        served before is re-placed only inside its pool (see the class
+        docstring); without it, or with `pool_affinity` off, placement spans
+        every pool.
         """
         now = time.time() if now is None else now
         self._expire(now)
+        pool_of = pool_of or {}
         if key is None:
             return self.select(accepting) if accepting else None
         # A hand-placed pin outranks everything, including the load picture --
@@ -1687,6 +2244,7 @@ class Router:
         if manual is not None:
             if manual in serving:
                 self.hits += 1
+                self._note_family(key, pool_of.get(manual), now)
                 return manual
             LOG.warning("manual pin %s -> %s is not serving; falling back", key[:40], manual)
         pinned = self.pins.get(key)
@@ -1701,6 +2259,7 @@ class Router:
             if job_id in serving:
                 self._set_pin(key, job_id, now)
                 self.hits += 1
+                self._note_family(key, pool_of.get(job_id), now)
                 return job_id
             # The backend it was pinned to is gone. Re-pin rather than fail:
             # the conversation loses its cache, which is the whole cost.
@@ -1708,11 +2267,39 @@ class Router:
             LOG.info("conversation %s lost backend %s; re-homing", key[:40], job_id)
         else:
             self.misses += 1
+        family = None
+        if self.pool_affinity:
+            family = self._family_of(key, now)
+            if family is None and pinned is not None:
+                # Pinned before its pool was recorded -- every conversation
+                # restored from a predecessor that did not record pools. Its
+                # backend says which pool it belongs to, registered or not.
+                family = pool_of.get(pinned[0])
+        if family is not None:
+            accepting = {j: v for j, v in accepting.items() if pool_of.get(j) == family}
+            if not accepting:
+                # Another pool's backend would continue this conversation on a
+                # different model. No backend is the lesser harm: the client
+                # retries, and the pool's backends come back.
+                self.family_waits += 1
+                # Every conversation of the pool retries while it is out, so
+                # this is reported per pool at most every 30 s, with the count.
+                if now - self._family_wait_logged.get(family, 0.0) >= 30.0:
+                    self._family_wait_logged[family] = now
+                    LOG.warning(
+                        "no backend of pool %s is accepting; conversation %s and the pool's "
+                        "others wait rather than move to another pool (%d held so far)",
+                        family,
+                        key[:40],
+                        self.family_waits,
+                    )
+                return None
         if not accepting:
             return None
         job_id = self.select(accepting)
         self._set_pin(key, job_id, now)
         self._trim()
+        self._note_family(key, pool_of.get(job_id), now)
         self.dirty = True
         return job_id
 
@@ -1871,7 +2458,12 @@ HANDOVER_KILL_GRACE = 10.0
 # 202 and 409 are not errors, so they are not in ERROR_REASONS -- which
 # error_response() indexes in step with ERROR_BODIES, and neither has a body
 # for these. Kept here rather than widening that pair.
-HANDOVER_REASONS = {202: "Accepted", 409: "Conflict", 503: "Service Unavailable"}
+HANDOVER_REASONS = {
+    202: "Accepted",
+    400: "Bad Request",
+    409: "Conflict",
+    503: "Service Unavailable",
+}
 
 
 def dial_host(host):
@@ -1959,6 +2551,10 @@ async def successor_ready(host, port, pid, timeout):
     outgoing listener while the successor was still loading: precisely the
     outage this sequence exists to prevent. Every new connection re-hashes, so
     the poll that reaches the successor arrives within a few attempts.
+
+    The answer is the successor's ready report when it is the successor and
+    ready -- truthy, so a caller that only asks "is it" can treat it as a
+    bool -- and False otherwise.
     """
     writer = None
     raw = b""
@@ -1987,10 +2583,11 @@ async def successor_ready(host, port, pid, timeout):
     if b" 200 " not in status_line:
         return False
     try:
-        answered_by = json.loads(body).get("pid")
+        report = json.loads(body)
+        answered_by = report.get("pid")
     except (ValueError, AttributeError):
         return False
-    return answered_by == pid
+    return report if answered_by == pid else False
 
 
 async def terminate_successor(proc):
@@ -2073,6 +2670,9 @@ class Handover:
         self.detail = "no handover has been started"
         # Held so the task is not collected mid-handover; see _run().
         self.task = None
+        # Pools the operator retired with this handover. Any other pool this
+        # process serves, the successor has to serve too; see _wait_ready().
+        self.dropping = ()
 
     def attach(self, server):
         """Take the listener. Called once the bind has succeeded, never before."""
@@ -2171,13 +2771,17 @@ class Handover:
         }
 
     # -- steps 1-3, on the request's own task ------------------------------
-    async def start(self):
+    async def start(self, drop_pools=()):
         """Steps 1 to 3. Returns (http status, body).
 
         The spawn happens here rather than on the background task because the
         answer has to carry the successor's pid, and a 503 has to mean "the
         spawn failed" rather than "ask again later". Everything after the spawn
         can be answered for asynchronously, and is.
+
+        `drop_pools` names pools this process serves that the successor may
+        leave out: retiring a pool, on purpose. Any other pool the successor
+        lacks aborts the handover -- see _wait_ready().
         """
         if self.phase not in HANDOVER_RESTARTABLE:
             return 409, {
@@ -2186,6 +2790,15 @@ class Handover:
                 "phase": self.phase,
                 "detail": self.detail,
             }
+        unknown = sorted(set(drop_pools) - set(self.fleet.pools))
+        if unknown:
+            return 400, {
+                "status": "bad_request",
+                "detail": "drop_pools names pool(s) this gateway does not serve: %s"
+                % ", ".join(unknown),
+                "pools": list(self.fleet.pools),
+            }
+        self.dropping = tuple(drop_pools)
         # The test above and the claim below are one block on purpose: there is
         # no await between them, so on a single-threaded loop a second POST
         # arriving mid-handover cannot pass the test. An await here would
@@ -2327,7 +2940,27 @@ class Handover:
                     self.successor.returncode,
                 )
                 return False
-            if await successor_ready(host, args.port, self.successor_pid, args.probe_timeout):
+            report = await successor_ready(host, args.port, self.successor_pid, args.probe_timeout)
+            if report:
+                missing = self.missing_pools(report)
+                if missing:
+                    # Ready, and incomplete. From the moment the listener
+                    # closes a missing pool's backends would get no traffic,
+                    # their conversations would re-home and nothing would
+                    # supervise them -- so this is refused outright rather
+                    # than waited on: nothing about the successor will change
+                    # by itself.
+                    self.detail = (
+                        "successor %d does not serve pool(s) %s, so their backends would drop "
+                        "out of routing and supervision; restore them (--pool or %s) and hand "
+                        'over again, or retire them on purpose with {"drop_pools": [...]}'
+                        % (
+                            self.successor_pid,
+                            ", ".join(missing),
+                            getattr(args, "pools_file", None) or "a pools file",
+                        )
+                    )
+                    return False
                 LOG.info("handover: successor %d reports ready", self.successor_pid)
                 return True
             left = limit - time.monotonic()
@@ -2342,6 +2975,16 @@ class Handover:
                 round(left),
             )
             await asyncio.sleep(HANDOVER_POLL_INTERVAL)
+
+    def missing_pools(self, report):
+        """Pools this process serves that the successor's ready report lacks.
+
+        Less the ones being retired with this handover. A successor that says
+        nothing about pools -- one built before they existed -- serves none.
+        """
+        theirs = report.get("pools") if isinstance(report, dict) else None
+        theirs = set(theirs) if isinstance(theirs, list) else set()
+        return sorted(set(self.fleet.pools) - set(self.dropping) - theirs)
 
     async def _abort(self, why):
         """Kill the successor and stay in service.
@@ -2435,6 +3078,28 @@ class Handover:
         self.detail = detail
 
 
+def mirror_table(mirrors):
+    """The mirror map as it is reported: job id -> ["host:port", ...].
+
+    A list even when there is one entry. The value used to be a bare string,
+    and a shape that changes with the count makes every reader carry both
+    branches forever; the count is visible from the length.
+    """
+    return {job: ["%s:%d" % t for t in targets] for job, targets in sorted(mirrors.items())}
+
+
+def _mirror_count(fleet, target, key):
+    """One event, counted twice: in the totals and against its target.
+
+    The totals answer "is mirroring working"; the per-target split answers
+    "which one" -- a question that does not exist with one target and decides
+    everything with two, because a comparison where one side silently received
+    half the copies is not a comparison.
+    """
+    fleet.mirror_stats[key] += 1
+    fleet.mirror_target_stats["%s:%d" % target][key] += 1
+
+
 def _mirror_missed(fleet, target, why):
     """Count a failed copy, and stop mirroring to a target that has gone.
 
@@ -2455,11 +3120,18 @@ def _mirror_missed(fleet, target, why):
     if misses < fleet.args.mirror_max_misses:
         return
     host, port = target
-    stopped = [job for job, t in fleet.mirrors.items() if t == target]
-    for job in stopped:
-        fleet.mirrors.pop(job, None)
+    # Only the dead target is removed. A backend mirrored to two places where
+    # one has gone must keep copying to the other -- the healthy half of an
+    # experiment is precisely the half still worth having.
+    stopped = []
+    for job, targets in list(fleet.mirrors.items()):
+        if target in targets:
+            targets.remove(target)
+            stopped.append(job)
+            if not targets:
+                fleet.mirrors.pop(job, None)
     fleet.mirror_misses.pop(target, None)
-    fleet.mirror_stats["disabled"] += 1
+    _mirror_count(fleet, target, "disabled")
     # Or a successor would pick the dead target back up from the state file.
     fleet.router.dirty = True
     fleet.router.save()
@@ -2492,7 +3164,7 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
         # Already at the ceiling. Dropping is the right answer rather than
         # queueing: a target that has stopped draining would otherwise build a
         # backlog of copies that are stale by the time they are sent.
-        fleet.mirror_stats["dropped"] += 1
+        _mirror_count(fleet, target, "dropped")
         return
     host, port = target
     async with fleet.mirror_slots:
@@ -2553,12 +3225,12 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
                     except (ValueError, IndexError):
                         status = 0
             if 200 <= status < 300:
-                fleet.mirror_stats["sent"] += 1
+                _mirror_count(fleet, target, "sent")
                 fleet.mirror_misses.pop(target, None)
             elif status == 0:
                 # Connected, wrote, and got nothing back that parses as a
                 # response. Not a transport failure and not an answer either.
-                fleet.mirror_stats["no_response"] += 1
+                _mirror_count(fleet, target, "no_response")
                 _mirror_missed(fleet, target, "no parsable response")
             else:
                 # A target rejecting every copy is as useless as one that is
@@ -2566,20 +3238,20 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
                 # only symptom is a counter nobody is watching -- which is how
                 # a mirror can run for an hour against a server that processed
                 # none of it.
-                fleet.mirror_stats["rejected_%dxx" % (status // 100)] += 1
+                _mirror_count(fleet, target, "rejected_%dxx" % (status // 100))
                 _mirror_missed(fleet, target, "HTTP %d" % status)
         except asyncio.CancelledError:
-            fleet.mirror_stats["failed"] += 1
+            _mirror_count(fleet, target, "failed")
             raise
         except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
-            fleet.mirror_stats["failed"] += 1
+            _mirror_count(fleet, target, "failed")
             _mirror_missed(fleet, target, exc)
             # One line per distinct failure would be one line per request when
             # a target is down, so this is deliberately quiet; the counters in
             # /_gateway/fleet are the place to notice.
             LOG.debug("mirror to %s:%d failed: %s", host, port, exc)
         except Exception:  # noqa: BLE001 - a mirror may not take down a request
-            fleet.mirror_stats["failed"] += 1
+            _mirror_count(fleet, target, "failed")
             LOG.exception("mirror to %s:%d raised", host, port)
         finally:
             if up_writer is not None:
@@ -2661,54 +3333,134 @@ class Gateway:
             LOG.info("503 %s %s user=%s (no backend) [rid=%s]", method, path, key, trace.rid)
             await respond(writer, error_response(503, retry_after=20))
             return
-        self.fleet.inflight[job_id] += 1
+        trace.pool = extra_pool(backend)
         status = "-"
+        tried = []
         # Closing the client socket sits in its own finally so that no amount of
         # bookkeeping trouble above can leak the connection.
         try:
-            try:
-                status = await self.proxy(
-                    backend, method, path, headers, rest, body, reader, writer, key, trace
-                )
-            # ValueError covers an unusable upstream head: read_head raises it
-            # past MAX_HEAD_BYTES and parse_response_head on a malformed one.
-            # Both happen before anything is written downstream, so 502 is
-            # safe here -- without it the client just sees the socket close
-            # with no status at all. Framing failures after the head is out are
-            # caught in relay_response, which cannot use this path.
-            except (ConnectionError, OSError, ValueError) as exc:
-                # `side` distinguishes a backend that never answered from one
-                # whose response could not be handed to the client. Both used
-                # to be logged as "upstream failed" and counted as 502, which
-                # blamed the serving job for client-side disconnects.
-                # "upstream" is the justified default HERE and only here: every
-                # untagged failure that can reach this handler is backend-side
-                # (open_connection, the request head write, or read_head on the
-                # upstream reader). All client writes happen inside
-                # relay_response, which handles them itself.
-                LOG.warning(
-                    "upstream %s failed side=%s: %s [%s]",
-                    backend.url,
-                    error_side(exc, "upstream"),
-                    exc,
-                    trace.detail(),
-                )
-                status = "502"
-                await respond(writer, error_response(502))
-            finally:
-                self.fleet.inflight[job_id] -= 1
-                LOG.info(
-                    "%s %s %s user=%s backend=%s convo=%s %.1fs [%s]",
-                    status,
-                    method,
-                    path,
-                    key,
-                    job_id,
-                    short_convo(convo),
-                    time.time() - started,
-                    trace.detail(),
-                )
+            while True:
+                # The attempt's own backend, because job_id moves when a retry
+                # picks another one and the decrement below must land on the
+                # counter the increment did. Getting this wrong leaks inflight
+                # on one backend and underflows another, and the router places
+                # on those numbers.
+                here, here_backend = job_id, backend
+                self.fleet.inflight[here] += 1
+                try:
+                    status = await self.proxy(
+                        here_backend, method, path, headers, rest, body, reader, writer, key, trace
+                    )
+                    break
+                # ValueError covers an unusable upstream head: read_head raises
+                # it past MAX_HEAD_BYTES and parse_response_head on a malformed
+                # one. Both happen before anything is written downstream, so
+                # 502 is safe here -- without it the client just sees the
+                # socket close with no status at all. Framing failures after
+                # the head is out are caught in relay_response, which cannot
+                # use this path.
+                except ClientAbandoned:
+                    # The client gave up waiting -- on this fleet that is the
+                    # Codex 120s no-response timeout -- and its retry is
+                    # already on its way with the same conversation key. Two
+                    # consequences, both handled here and nowhere else:
+                    #
+                    # The upstream socket is already closed (proxy's finally),
+                    # which arms the serving stack's own abort chain: the
+                    # disagg proxy cancels its worker requests, and the
+                    # worker's 1Hz disconnect poll aborts the engine request,
+                    # queued or running. The abandoned request stops holding a
+                    # queue slot for a response nobody can receive.
+                    #
+                    # The pin is dropped -- but only when nothing was
+                    # delivered. Zero events is the timeout signature: the
+                    # request never got its first byte, which is a statement
+                    # about the backend's queue, so the retry must be free to
+                    # land elsewhere. A stream that died with events already
+                    # delivered is a different animal (mid-stream disconnect),
+                    # and re-homing those would shed load the backend was in
+                    # fact serving.
+                    delivered = trace.tracker.events if trace.tracker else 0
+                    if convo is not None and delivered == 0:
+                        was = self.fleet.router.unpin(convo)
+                        LOG.warning(
+                            "client abandoned before first event; unpinned %s (was %s) [%s]",
+                            short_convo(convo),
+                            was,
+                            trace.detail(),
+                        )
+                    else:
+                        LOG.warning(
+                            "client abandoned after %d event(s); pin kept [%s]",
+                            delivered,
+                            trace.detail(),
+                        )
+                    # 499, nginx's "client closed request". No response is
+                    # written: there is no one to write it to.
+                    status = "499"
+                    break
+                except (ConnectionError, OSError, ValueError) as exc:
+                    # `side` distinguishes a backend that never answered from
+                    # one whose response could not be handed to the client.
+                    # Both used to be logged as "upstream failed" and counted
+                    # as 502, which blamed the serving job for client-side
+                    # disconnects. "upstream" is the justified default HERE and
+                    # only here: every untagged failure that can reach this
+                    # handler is backend-side (open_connection, the request
+                    # head write, or read_head on the upstream reader). All
+                    # client writes happen inside relay_response, which handles
+                    # them itself.
+                    side = error_side(exc, "upstream")
+                    LOG.warning(
+                        "upstream %s failed side=%s: %s [%s]",
+                        here_backend.url,
+                        side,
+                        exc,
+                        trace.detail(),
+                    )
+                    if side == "upstream" and is_refusal(exc):
+                        note_refusal(
+                            here_backend,
+                            time.time(),
+                            self.fleet.args.refusal_window,
+                            self.fleet.args.refusals_before_drop,
+                        )
+                    # Retry only on the side that proves nothing reached the
+                    # client. A client-side failure has already had bytes
+                    # written to it, so re-sending would put a second response
+                    # into the same stream.
+                    nxt = None
+                    if side == "upstream" and len(tried) < self.fleet.args.retry_upstream:
+                        tried.append(here)
+                        nxt = self.route(convo, exclude=tried)
+                    if nxt is None:
+                        status = "502"
+                        await respond(writer, error_response(502))
+                        break
+                    job_id, backend = nxt, self.fleet.backends.get(nxt)
+                    if backend is None:
+                        # Retired between the route call and here. Nothing was
+                        # written downstream, so this is still a clean 502.
+                        status = "502"
+                        await respond(writer, error_response(502))
+                        break
+                    LOG.info("retrying on %s after %s failed [%s]", job_id, here, trace.detail())
+                    trace.pool = extra_pool(backend)
+                finally:
+                    self.fleet.inflight[here] -= 1
         finally:
+            LOG.info(
+                "%s %s %s user=%s backend=%s convo=%s %.1fs%s [%s]",
+                status,
+                method,
+                path,
+                key,
+                job_id,
+                short_convo(convo),
+                time.time() - started,
+                " retried=%d" % len(tried) if tried else "",
+                trace.detail(),
+            )
             await close(writer)
 
     async def serve_introspection(self, method, path, headers, rest, reader, writer):
@@ -2716,16 +3468,25 @@ class Gateway:
             # Deliberately unauthenticated: whatever watches the gateway from
             # outside has no reason to hold an allowlist entry, and the answer
             # names no user and no request.
-            healthy = self.fleet.active is not None
+            # Over every pool: routing is one pool, so the gateway can serve
+            # while any of them has a healthy backend. Without extra pools this
+            # is `active`, exactly as it always was.
+            active = self.fleet.overall_active()
             payload = {
-                "status": "ok" if healthy else "no_backend",
+                "status": "ok" if active is not None else "no_backend",
                 # Which deployment is answering, so a caller about to stop a
                 # serving job can check it has reached the right gateway.
                 "deployment": os.path.basename(os.path.normpath(self.fleet.args.fleet_dir)),
-                "active": self.fleet.active,
+                "active": active,
                 "pending": self.fleet.pending[0] if self.fleet.pending else None,
                 "uptime_s": round(time.time() - self.fleet.started),
             }
+            if self.fleet.pools:
+                # Whether each pool's fleet has anything healthy right now.
+                payload["pools"] = {
+                    name: {"status": "ok" if job else "no_backend", "active": job}
+                    for name, job in self.fleet.pool_actives()
+                }
             await respond(writer, json_response(payload))
             return
         if path in ("/_gateway/start_server", "/_gateway/stop_server"):
@@ -2741,10 +3502,13 @@ class Gateway:
                 LOG.warning("refusing %s: %s", path, refusal["error"])
                 await respond(writer, json_response(refusal, 409, "Conflict"))
                 return
+            # The default pool's jobs only: these predate pools, and a
+            # `stop_server` releasing jobs another pool's fleet config owns
+            # would be a surprise nobody could undo quickly.
             if path.endswith("/start_server"):
-                status, payload = await start_server(self.fleet)
+                status, payload = await start_server(self.fleet.lifecycle_view())
             else:
-                status, payload = await stop_server(self.fleet)
+                status, payload = await stop_server(self.fleet.lifecycle_view())
             await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
             return
         if path == "/_gateway/ready":
@@ -2757,6 +3521,11 @@ class Gateway:
             ready, why = self.handover.ready()
             status = 200 if ready else 503
             payload = {"ready": ready, "pid": os.getpid(), "detail": why}
+            if self.fleet.pools:
+                # What a predecessor checks before handing this process its
+                # listener: a pool it serves and this one does not would drop
+                # out of routing and supervision. See _wait_ready().
+                payload["pools"] = list(self.fleet.pools)
             # The pid is load-bearing, not diagnostic: during a handover two
             # processes share this port, so the poller needs to know which one
             # answered. See successor_ready().
@@ -2775,7 +3544,32 @@ class Gateway:
             if method != "POST":
                 await respond(writer, error_response(405))
                 return
-            status, payload = await self.handover.start()
+            drop = []
+            if self.fleet.pools:
+                # Only a gateway with extra pools has any to drop, so only it
+                # reads the body; without them the POST is handled exactly as
+                # it always was. Read leniently: anything that is not a JSON
+                # object asks for nothing, and only `drop_pools`, when
+                # present, has to be well formed.
+                try:
+                    body, _ = await read_body(reader, rest, headers, 64 * 1024)
+                except (ValueError, OSError):
+                    body = None
+                drop = (decode_json_object(body) or {}).get("drop_pools", [])
+                if not isinstance(drop, list) or not all(isinstance(name, str) for name in drop):
+                    await respond(
+                        writer,
+                        json_response(
+                            {
+                                "status": "bad_request",
+                                "detail": "drop_pools must be a list of pool names",
+                            },
+                            400,
+                            HANDOVER_REASONS[400],
+                        ),
+                    )
+                    return
+            status, payload = await self.handover.start(drop_pools=drop)
             reason = HANDOVER_REASONS.get(status, "OK")
             await respond(writer, json_response(payload, status, reason))
             return
@@ -2806,34 +3600,47 @@ class Gateway:
             router = self.fleet.router
             accepting = self.fleet.accepting()
             conversations = router.counts(self.fleet.backends)
-            mirrors = {job: "%s:%d" % t for job, t in sorted(self.fleet.mirrors.items())}
+            mirrors = mirror_table(self.fleet.mirrors)
+            backends = {}
+            for job_id, b in sorted(self.fleet.backends.items()):
+                state = self.fleet.state_for(b.pool)
+                entry = {
+                    "url": b.url,
+                    "healthy": b.healthy,
+                    "healthy_for_s": round(now - b.healthy_since) if b.healthy_since else None,
+                    "probe_timeouts": b.timeouts,
+                    "state": b.state,
+                    "ends_at": fmt_time(b.end_time),
+                    "ends_in_s": round(b.end_time - now),
+                    "last_beat_s": round(now - b.heartbeat, 1),
+                    "inflight": self.fleet.inflight.get(job_id, 0),
+                    "conversations": conversations.get(job_id, 0),
+                    "accepting": job_id in accepting,
+                    "superseded": job_id in state.superseded,
+                    "revived": self.fleet.revived.get(job_id, (0, 0.0))[0],
+                    "draining": job_id in state.draining,
+                }
+                if self.fleet.pools:
+                    # Which fleet directory it registered in -- and so which
+                    # fleet config supervises it. Routing does not read it.
+                    entry["pool"] = b.pool
+                backends[job_id] = entry
             payload = {
-                "active": self.fleet.active,
+                # The same answer /_gateway/health gives; each pool's own
+                # election is under "pools".
+                "active": self.fleet.overall_active(),
                 "pending_successor": self.fleet.pending[0] if self.fleet.pending else None,
                 # Which backends are being copied elsewhere, and how those
                 # copies have fared. Here rather than in /_gateway/health
                 # because a mirror is an operator's business, not a caller's.
+                # mirroring values are lists of "host:port" -- one entry per
+                # target -- and mirror_targets splits the counters the same
+                # way, because totals across two targets answer neither
+                # question anyone asks of them.
                 "mirroring": mirrors,
                 "mirror_stats": dict(self.fleet.mirror_stats),
-                "backends": {
-                    job_id: {
-                        "url": b.url,
-                        "healthy": b.healthy,
-                        "healthy_for_s": round(now - b.healthy_since) if b.healthy_since else None,
-                        "probe_timeouts": b.timeouts,
-                        "state": b.state,
-                        "ends_at": fmt_time(b.end_time),
-                        "ends_in_s": round(b.end_time - now),
-                        "last_beat_s": round(now - b.heartbeat, 1),
-                        "inflight": self.fleet.inflight.get(job_id, 0),
-                        "conversations": conversations.get(job_id, 0),
-                        "accepting": job_id in accepting,
-                        "superseded": job_id in self.fleet.superseded,
-                        "revived": self.fleet.revived.get(job_id, (0, 0.0))[0],
-                        "draining": job_id in self.fleet.draining,
-                    }
-                    for job_id, b in sorted(self.fleet.backends.items())
-                },
+                "mirror_targets": {t: dict(c) for t, c in self.fleet.mirror_target_stats.items()},
+                "backends": backends,
                 "routing": {
                     "enabled": self.fleet.args.route_by_conversation,
                     "policy": router.policy,
@@ -2849,19 +3656,43 @@ class Gateway:
                     "serving": sorted(self.fleet.serving()),
                 },
             }
+            if self.fleet.pools:
+                payload["pools"] = self.fleet.pool_report(accepting, conversations)
+                payload["routing"].update(
+                    pool_affinity=router.pool_affinity,
+                    conversation_pools=len(router.families),
+                    held_for_pool=router.family_waits,
+                )
             await respond(writer, json_response(payload))
             return
         await respond(writer, error_response(404))
 
-    def route(self, convo):
-        """Choose the backend for this request."""
+    def route(self, convo, exclude=()):
+        """Choose the backend for this request.
+
+        `exclude` names backends this request has already failed against. They
+        are removed from `serving` as well as from the candidates, because a
+        pinned conversation is only re-homed when its pin is absent from
+        `serving` -- leaving it there would hand the retry straight back to the
+        backend that just refused it, which is precisely the loop the retry
+        exists to break.
+        """
         accepting = self.fleet.accepting()
+        serving = self.fleet.serving()
+        if exclude:
+            accepting = {j: v for j, v in accepting.items() if j not in exclude}
+            serving = serving - set(exclude)
         conversations = self.fleet.router.counts(accepting)
         loads = {
             job_id: (conversations.get(job_id, 0), inflight, remaining)
             for job_id, (_, inflight, remaining) in accepting.items()
         }
-        return self.fleet.router.route(convo, loads, self.fleet.serving())
+        # Pools are only told to the router when there is more than one: a
+        # single-pool gateway places and records exactly as it always has.
+        pool_of = None
+        if self.fleet.pools:
+            pool_of = {job_id: backend.pool for job_id, backend in self.fleet.backends.items()}
+        return self.fleet.router.route(convo, loads, serving, pool_of=pool_of)
 
     async def control(self, path, rest, reader, headers):
         """Change routing while the gateway keeps running.
@@ -2888,22 +3719,67 @@ class Gateway:
                 return 400, {"error": "target is required (an addr:port, or null to stop)"}
             target = request["target"]
             if target in (None, "", False):
+                # No target names them all. That was the whole meaning of stop
+                # when a backend had one mirror, and every existing caller --
+                # curl by hand, the dashboard -- says it this way.
                 gone = self.fleet.mirrors.pop(job_id, None)
                 router.dirty = True
                 router.save()
                 LOG.info("mirror of %s stopped (was %s)", job_id, gone)
                 return 200, {
                     "job_id": job_id,
-                    "mirroring": None,
-                    "was": "%s:%d" % gone if gone else None,
-                    "mirrors": {j: "%s:%d" % t for j, t in sorted(self.fleet.mirrors.items())},
+                    "mirroring": [],
+                    "was": ["%s:%d" % t for t in gone] if gone else None,
+                    "mirrors": mirror_table(self.fleet.mirrors),
                 }
-            # The backend has to exist, because mirroring something that is not
-            # being served is a silent no-op that looks like it is working.
-            # The target deliberately does not: it is not ours, it may not be
-            # up yet, and probing it here would make starting a mirror depend
-            # on something the gateway has no business waiting for.
-            if job_id not in self.fleet.backends:
+            if not isinstance(target, str):
+                return 400, {"error": "target must be a string addr:port"}
+            host, _, port = target.rpartition(":")
+            if not host or not port.isdigit() or not 0 < int(port) < 65536:
+                return 400, {"error": "target must look like host:port", "target": target}
+            if request.get("stop"):
+                # Stop one of several. `stop` rides beside the target rather
+                # than replacing the null convention above, so a caller who has
+                # never heard of multiple targets loses nothing.
+                targets = self.fleet.mirrors.get(job_id) or []
+                pair = (host, int(port))
+                if pair not in targets:
+                    return 404, {
+                        "error": "that target is not mirroring this backend",
+                        "job_id": job_id,
+                        "target": target,
+                        "mirroring": ["%s:%d" % t for t in targets],
+                    }
+                targets.remove(pair)
+                if not targets:
+                    self.fleet.mirrors.pop(job_id, None)
+                router.dirty = True
+                router.save()
+                LOG.info(
+                    "mirror of %s to %s stopped; %d target(s) remain", job_id, target, len(targets)
+                )
+                return 200, {
+                    "job_id": job_id,
+                    "mirroring": ["%s:%d" % t for t in targets],
+                    "was": target,
+                    "mirrors": mirror_table(self.fleet.mirrors),
+                }
+            # Both ends are checked before the table is written, because every
+            # way this can be wrong is otherwise silent. A mirror of a backend
+            # that is not served copies nothing; a mirror to an address that
+            # answers nothing burns one real request per copy until the
+            # auto-disable budget runs out. That budget is a backstop for a
+            # target that dies later, not a way to discover a typo -- it cost
+            # 50 requests to find out that a target 404ed everything, which is
+            # 50 more than asking once.
+            #
+            # `force` exists because "not up yet" is a legitimate order to give:
+            # staging the mirror before starting the target is reasonable, and
+            # refusing it outright would trade one silent failure for a
+            # different one. It is opt-in so that the quiet default is the safe
+            # one.
+            source = self.fleet.backends.get(job_id)
+            if source is None:
                 return 404, {
                     "error": "no such backend",
                     "backend": job_id,
@@ -2914,17 +3790,65 @@ class Gateway:
             host, _, port = target.rpartition(":")
             if not host or not port.isdigit() or not 0 < int(port) < 65536:
                 return 400, {"error": "target must look like host:port", "target": target}
-            self.fleet.mirrors[job_id] = (host, int(port))
+            forced = bool(request.get("force"))
+            if not source.healthy and not forced:
+                return 409, {
+                    "error": "backend is not serving; it would mirror nothing",
+                    "backend": job_id,
+                    "state": source.state,
+                    "hint": 'pass "force": true to mirror it anyway',
+                }
+            reached = await probe_addr(host, int(port), self.fleet.args.probe_timeout)
+            if reached != "ok" and not forced:
+                return 502, {
+                    "error": "target did not answer %s" % PROBE_PATH,
+                    "target": target,
+                    "probe": reached,
+                    "means": {
+                        "dead": "nothing is listening there, or it answered "
+                        "something other than 200",
+                        "timeout": "it accepted the connection but did not "
+                        "answer in %.1fs" % self.fleet.args.probe_timeout,
+                    }.get(reached, reached),
+                    "hint": 'pass "force": true if the target is not up yet',
+                }
+            # Added beside whatever is already there, never in place of it.
+            # Overwriting was the single-target behaviour, and keeping it
+            # would make "add the second target" silently end the first
+            # experiment -- the same POST that used to mean "start" has to
+            # keep meaning "start", not "replace".
+            targets = self.fleet.mirrors.setdefault(job_id, [])
+            pair = (host, int(port))
+            already = pair in targets
+            if not already:
+                targets.append(pair)
             # Persisted immediately rather than at the next periodic save: the
             # window between the two is exactly when a handover would hand the
             # successor a table without this in it.
             router.dirty = True
             router.save()
-            LOG.info("mirroring %s to %s:%s; responses are read and discarded", job_id, host, port)
+            LOG.info(
+                "mirroring %s to %s:%s (%d target(s) total, source healthy=%s, "
+                "target probe=%s%s); responses are read and discarded",
+                job_id,
+                host,
+                port,
+                len(targets),
+                source.healthy,
+                reached,
+                ", forced" if forced else "",
+            )
             return 200, {
                 "job_id": job_id,
-                "mirroring": "%s:%s" % (host, port),
-                "mirrors": {j: "%s:%d" % t for j, t in sorted(self.fleet.mirrors.items())},
+                "mirroring": ["%s:%d" % t for t in targets],
+                # Both checks are reported rather than merely implied by the
+                # 200, so that a caller who passed force can see what it
+                # overrode instead of having to infer it.
+                "source": {"healthy": source.healthy, "state": source.state},
+                "target": {"probe": reached},
+                "forced": forced,
+                "already": already,
+                "mirrors": mirror_table(self.fleet.mirrors),
                 "stats": dict(self.fleet.mirror_stats),
             }
 
@@ -3014,7 +3938,17 @@ class Gateway:
             # seconds later for not being in the directory.
             job_id = request.get("job_id")
             url = request.get("url")
-            reg = registration_path(self.fleet.args.fleet_dir, job_id)
+            # Which pool's directory the record is written into, and therefore
+            # which fleet config supervises the backend. Routing does not care.
+            # Absent is the default pool.
+            pool = request.get("pool") or DEFAULT_POOL
+            if not isinstance(pool, str) or not self.fleet.known_pool(pool):
+                return 400, {
+                    "error": "no such pool",
+                    "pool": pool,
+                    "known": self.fleet.pool_names(),
+                }
+            reg = registration_path(self.fleet.pool_dir(pool), job_id)
             if reg is None:
                 return 400, {
                     "error": "job_id must be 1-64 chars of [A-Za-z0-9._-] and start alphanumeric",
@@ -3022,6 +3956,12 @@ class Gateway:
                 }
             if not isinstance(url, str) or not url.startswith(("http://", "https://")):
                 return 400, {"error": "url is required and must be http(s)://", "url": url}
+            other = self.fleet.backends.get(job_id)
+            if other is not None and other.pool != pool:
+                return 409, {
+                    "error": "job %s is already registered in pool %s" % (job_id, other.pool),
+                    "job_id": job_id,
+                }
             record = {
                 "job_id": job_id,
                 "url": url.rstrip("/"),
@@ -3033,7 +3973,7 @@ class Gateway:
                 "manual": True,
             }
             try:
-                candidate = Backend(record)
+                candidate = Backend(record, pool)
             except (KeyError, ValueError, TypeError, AttributeError) as exc:
                 return 400, {"error": "unusable registration: %s" % exc}
             # Probe before writing. fleetctl once decided a deployment was ready
@@ -3063,19 +4003,37 @@ class Gateway:
             # send the next request to a fleet that already contains this.
             self.fleet.discover()
             LOG.info(
-                "backend registered by hand: %s at %s (probe %s)", job_id, record["url"], verdict
+                "%sbackend registered by hand: %s at %s (probe %s)",
+                self.fleet.tag_for(pool),
+                job_id,
+                record["url"],
+                verdict,
             )
-            return 200, {
+            reply = {
                 "registered": job_id,
                 "url": record["url"],
                 "probe": verdict,
                 "replaced": existing,
                 "backends": sorted(self.fleet.backends),
             }
+            if self.fleet.pools:
+                reply["pool"] = pool
+            return 200, reply
 
         if path.endswith("/backend/remove"):
             job_id = request.get("job_id")
-            reg = registration_path(self.fleet.args.fleet_dir, job_id)
+            # The pool it is registered in, unless the caller says otherwise:
+            # a deregistration that does not name one must still find a
+            # backend that lives in another pool's directory.
+            known = self.fleet.backends.get(job_id) if isinstance(job_id, str) else None
+            pool = request.get("pool") or (known.pool if known is not None else DEFAULT_POOL)
+            if not isinstance(pool, str) or not self.fleet.known_pool(pool):
+                return 400, {
+                    "error": "no such pool",
+                    "pool": pool,
+                    "known": self.fleet.pool_names(),
+                }
+            reg = registration_path(self.fleet.pool_dir(pool), job_id)
             if reg is None:
                 return 400, {"error": "job_id is not a usable name", "job_id": job_id}
             if not os.path.exists(reg) and job_id not in self.fleet.backends:
@@ -3156,7 +4114,18 @@ class Gateway:
         }
 
     async def proxy(self, backend, method, path, headers, rest, body, reader, writer, user, trace):
-        up_reader, up_writer = await asyncio.open_connection(backend.host, backend.port)
+        timeout = self.fleet.args.upstream_connect_timeout
+        try:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(backend.host, backend.port), timeout
+            )
+        except asyncio.TimeoutError as exc:
+            # A backend whose listen queue is full drops the SYN instead of
+            # refusing it, and the kernel keeps retrying for about two minutes:
+            # past the client's own first-event timeout, so a retry on another
+            # backend would only reach a client that had already left. As a
+            # ConnectionError it takes the same retry path as a refusal.
+            raise ConnectionError(f"upstream connect timed out after {timeout:g}s") from exc
         try:
             up_writer.write(self.upstream_head(backend, method, path, headers, user))
             pump = None
@@ -3173,8 +4142,11 @@ class Gateway:
                 # mirrored: a streamed body has already been handed to the
                 # pump, and teeing it would mean holding an upload the gateway
                 # deliberately refuses to hold.
-                target = self.fleet.mirrors.get(backend.job_id)
-                if target is not None:
+                # One copy per target, each its own task. tuple() because the
+                # list is shared state: an auto-disable between two of these
+                # create_task calls mutates it, and iterating the live list
+                # would then skip or double a target mid-request.
+                for target in tuple(self.fleet.mirrors.get(backend.job_id) or ()):
                     asyncio.create_task(
                         mirror_request(self.fleet, target, method, path, headers, body, user)
                     )
@@ -3194,7 +4166,56 @@ class Gateway:
                     self.fleet.mirror_stats["skipped_unbuffered"] += 1
                 pump = asyncio.create_task(relay(reader, up_writer, trace))
             try:
-                return await self.relay_response(up_reader, writer, trace)
+                if pump is not None:
+                    # A streamed request body: the client socket is in active
+                    # use, so its EOF is not a signal -- half of these uploads
+                    # end exactly that way.
+                    return await self.relay_response(backend, up_reader, writer, trace)
+
+                # Buffered request: the body has been read in full, so the
+                # client has nothing left to send and a read on its socket can
+                # only resolve when it disconnects. That makes the socket a
+                # free abandonment signal for precisely the window where the
+                # gateway is otherwise blind -- blocked on the backend's first
+                # byte, which on a saturated instance is minutes away. Without
+                # this, a client that times out and hangs up leaves its request
+                # occupying the backend's queue until that first byte arrives,
+                # and every retry it sends queues behind the abandoned one.
+                #
+                # Caveat, documented rather than solved: a client that
+                # half-closes (shutdown(SHUT_WR) after the request, reading
+                # the response on the other direction) reads as abandonment
+                # here. None of this deployment's clients do that.
+                relay_task = asyncio.create_task(
+                    self.relay_response(backend, up_reader, writer, trace)
+                )
+                watcher = asyncio.create_task(reader.read(1))
+                try:
+                    done, _ = await asyncio.wait(
+                        {relay_task, watcher}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    # When both finish in the same tick, the response verdict
+                    # wins: a client that closed right after reading the whole
+                    # response is a completed request, not an abandoned one.
+                    if relay_task in done:
+                        return relay_task.result()
+                    stray = b""
+                    try:
+                        stray = watcher.result()
+                    except OSError:
+                        pass  # a reset is the same statement as a close
+                    raise ClientAbandoned(
+                        "client %s while %s had yet to answer"
+                        % ("sent bytes mid-response" if stray else "hung up", backend.url)
+                    )
+                finally:
+                    for task in (relay_task, watcher):
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, OSError, ValueError):
+                                pass
             finally:
                 if pump is not None:
                     pump.cancel()
@@ -3223,7 +4244,7 @@ class Gateway:
             lines.append("%s: %s" % (name, value))
         return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
-    async def relay_response(self, up_reader, writer, trace):
+    async def relay_response(self, backend, up_reader, writer, trace):
         head, rest = await read_head(up_reader)
         if head is None:
             raise ConnectionError("upstream closed before sending a response")
@@ -3254,11 +4275,42 @@ class Gateway:
         # safe fallback for encoded bodies or unknown transfer codings.
         if not is_sse or content_encoding.lower() not in ("", "identity") or not supported_transfer:
             await write_client(writer, head + b"\r\n\r\n" + rest)
-            while True:
-                chunk = await read_upstream(up_reader, RELAY_CHUNK)
-                if not chunk:
-                    return status
-                await write_client(writer, chunk)
+            relayed = len(rest)
+            # The head is on the client's socket from here on, so a failure can
+            # be neither retried nor answered with a 502: both put a second
+            # status line into a response the client is partway through. A
+            # body that is not SSE has no terminal event to append either, so
+            # the ending left is closing the connection short of the length or
+            # final chunk the head framed, which the client reads as a failure.
+            try:
+                while True:
+                    chunk = await read_upstream(up_reader, RELAY_CHUNK)
+                    if not chunk:
+                        return status
+                    await write_client(writer, chunk)
+                    relayed += len(chunk)
+            except OSError as exc:
+                side = error_side(exc)
+                if side == "client_write":
+                    LOG.warning(
+                        "could not deliver body side=%s after %d byte(s): %s [%s]",
+                        side,
+                        relayed,
+                        exc,
+                        trace.detail(),
+                    )
+                    return status + "?"
+                LOG.warning(
+                    "upstream %s failed mid-body side=%s after %d byte(s); "
+                    "closing the client connection: %s [%s]",
+                    backend.url,
+                    side,
+                    relayed,
+                    exc,
+                    trace.detail(),
+                )
+                await close(writer)
+                return status + "!"
 
         await write_client(writer, rewrite_sse_head(status_line, headers))
         source = BufferedUpstream(up_reader, rest)
@@ -3409,14 +4461,27 @@ async def probe(backend, timeout):
     is listening, and that something is ours and ready. It costs a static list
     and no engine work.
     """
+    return await probe_addr(backend.host, backend.port, timeout)
+
+
+async def probe_addr(host, port, timeout):
+    """probe(), addressed directly rather than through a Backend record.
+
+    Split out for the mirror control endpoint, which has to ask the same
+    question about something that is not a fleet member and therefore has no
+    Backend. Sharing the body rather than writing a second check keeps one
+    definition of "reachable and ours" -- including the reason probe() uses
+    PROBE_PATH and not /health, which applies to a mirror target unchanged and
+    for the same reason: a registry container answering 200 to /health on the
+    port a fleet member might have used is exactly the thing that looks
+    healthy and serves nothing.
+    """
     writer = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(backend.host, backend.port), timeout
-        )
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
         writer.write(
             b"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
-            % (PROBE_PATH.encode("latin-1"), backend.host.encode("latin-1"))
+            % (PROBE_PATH.encode("latin-1"), host.encode("latin-1"))
         )
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout)
@@ -3430,9 +4495,60 @@ async def probe(backend, timeout):
             await close(writer)
 
 
+def is_refusal(exc):
+    """True when nothing was listening, as opposed to anything else.
+
+    ECONNREFUSED only. A timeout is deliberately not counted: a backend too
+    busy to accept a connection is usually still generating tokens, and that
+    is the case the probe's 20-timeout threshold exists to protect. This adds
+    a fast path for the unambiguous death, not a second way to evict a loaded
+    backend.
+
+    Unwraps SideError, which tags the side but keeps the original as `cause`.
+    """
+    inner = getattr(exc, "cause", exc)
+    return (
+        isinstance(inner, ConnectionRefusedError)
+        or getattr(inner, "errno", None) == errno.ECONNREFUSED
+    )
+
+
+def note_refusal(backend, now, window, threshold):
+    """Count a refusal against a backend; drop it once they cluster.
+
+    Thresholded rather than acted on at the first one, because ECONNREFUSED is
+    also what a healthy backend returns when its listen backlog overflows --
+    evicting on a single refusal would turn a load spike into an outage. The
+    gap between the two cases is wide enough that the threshold does not need
+    to be delicate: a real death produced 192 refusals in a minute and 551 in
+    four seconds, while backlog noise is a handful.
+
+    Returns True if this call is what made the backend unhealthy.
+    """
+    cutoff = now - window
+    backend.refusals = [t for t in backend.refusals if t > cutoff]
+    backend.refusals.append(now)
+    if not backend.healthy or len(backend.refusals) < threshold:
+        return False
+    LOG.warning(
+        "backend %s refused %d connections in %.0fs; dropping it without waiting for the probe",
+        backend.job_id,
+        len(backend.refusals),
+        window,
+    )
+    backend.healthy = False
+    backend.healthy_since = 0.0
+    backend.refusals = []
+    return True
+
+
 def apply_probe(backend, result, unhealthy_after):
     if result == "ok":
         backend.timeouts = 0
+        # A backend that answers the probe is serving, whatever the request
+        # stream said a moment ago: the refusals were either transient or
+        # belong to an instance that has since come back.
+        backend.refusals = []
         if not backend.healthy:
             backend.healthy = True
             backend.healthy_since = time.time()
@@ -3698,6 +4814,36 @@ async def slurm_job_status(job_id):
         return "GONE", ""
     state, _, reason = out.splitlines()[0].partition("|")
     return state.strip().upper(), reason.strip()
+
+
+# job id -> the PreemptTime last reported for it, so each notice is logged once.
+_PREEMPTION_NOTED = {}
+
+_SLURM_UNSET = ("None", "Unknown", "N/A", "(null)")
+
+
+async def slurm_preemption_notice(job_id):
+    """When Slurm signalled the job's current run for preemption, or None.
+
+    A preempted job is not killed at once. Slurm sends SIGTERM, which ends the
+    serving attempt, and takes the allocation back when the grace period runs
+    out, so the allocation looks retained and idle in between. PreemptTime is
+    when the signal went out; a notice earlier than the run's StartTime belongs
+    to a run before a requeue, not to this one. None also when the scheduler
+    cannot be asked, which leaves the caller to act as it would without the
+    question.
+    """
+    code, out = await run_slurm_command("scontrol", "show", "job", str(job_id))
+    if code != 0:
+        return None
+    fields = dict(re.findall(r"\b(PreemptTime|StartTime)=(\S+)", out))
+    notice = fields.get("PreemptTime")
+    if not notice or notice in _SLURM_UNSET:
+        return None
+    start = fields.get("StartTime")
+    if start and start not in _SLURM_UNSET and notice < start:
+        return None
+    return notice
 
 
 async def find_untracked_job(fleet):
@@ -4214,6 +5360,7 @@ async def revive_dead_backends(fleet, now):
     """
     if fleet.args.revive_limit <= 0:
         return
+    tag = pool_tag(fleet)
     pending_job = fleet.pending[0] if fleet.pending else None
     for job_id, backend in sorted(fleet.backends.items()):
         if job_id == pending_job:
@@ -4236,17 +5383,35 @@ async def revive_dead_backends(fleet, now):
         tries, last = fleet.revived.get(job_id, (0, 0.0))
         if now - last < fleet.args.revive_cooldown:
             continue
+        # A preemption notice is what ended this attempt, and the scheduler
+        # takes the allocation back when the grace period runs out. Reviving
+        # there admits ten minutes of new requests that are then all cut
+        # mid-stream together; Slurm requeues the job on its own afterwards.
+        notice = await slurm_preemption_notice(job_id)
+        if notice is not None:
+            if _PREEMPTION_NOTED.get(job_id) != notice:
+                _PREEMPTION_NOTED[job_id] = notice
+                LOG.warning(
+                    "%s%s exited after Slurm signalled it for preemption at %s; "
+                    "not restarting an allocation the scheduler is taking back",
+                    tag,
+                    job_id,
+                    notice,
+                )
+            continue
         if tries >= fleet.args.revive_limit:
             if tries == fleet.args.revive_limit:
                 LOG.error(
-                    "%s exited %d times; leaving it alone -- roll or investigate it by hand",
+                    "%s%s exited %d times; leaving it alone -- roll or investigate it by hand",
+                    tag,
                     job_id,
                     tries,
                 )
                 fleet.revived[job_id] = (tries + 1, now)
             continue
         LOG.warning(
-            "%s is not serving (%s); restarting its retained allocation (attempt %d of %d)",
+            "%s%s is not serving (%s); restarting its retained allocation (attempt %d of %d)",
+            tag,
             job_id,
             backend.state,
             tries + 1,
@@ -4255,13 +5420,89 @@ async def revive_dead_backends(fleet, now):
         fleet.revived[job_id] = (tries + 1, now)
         code, out = await run_serve_sh(fleet, "restart", backend.run_dir)
         if code != 0:
-            LOG.error("restart %s failed (rc=%d): %s", job_id, code, out)
+            LOG.error("%srestart %s failed (rc=%d): %s", tag, job_id, code, out)
 
 
 def instance_label(run_dir):
     """serve.sh names a run <user>_<date>_<jobid>_<cfgname>_<label>."""
     base = os.path.basename(os.path.normpath(run_dir or ""))
     return base.rsplit("_", 1)[-1] if "_" in base else ""
+
+
+async def relay_per_instance(fleet, now):
+    """Roll each instance before its own wall clock, independently.
+
+    The single-lineage relay above asks one question -- is `active` about to
+    expire -- and submits one successor. That is right for a deployment with
+    one instance and wrong for this fleet, where several serve at once and each
+    has its own end time; the expiring one is usually not `active`.
+
+    So the question is asked per instance label instead. `fleetctl up --only
+    <label> --force` is what submits, rather than `serve.sh submit --yaml`:
+    fleetctl is the only thing that knows the configured shape of a named
+    instance, and --force is required because the instance still has a job --
+    the overlap is the entire point. Retirement is not done here: marking the
+    predecessor superseded lets the existing drain and reclaim take it, which
+    already waits for the successor to hold up and for in-flight requests to
+    finish.
+
+    Submissions are rate-limited per label rather than tracked to completion. A
+    submitted job takes minutes to register, so "is there a newer sibling yet"
+    stays false for a while and would re-submit on every sweep; the cooldown is
+    what makes this idempotent, and it is keyed per label so one instance
+    rolling cannot block another.
+    """
+    tag = pool_tag(fleet)
+    by_label = {}
+    for job_id, backend in fleet.backends.items():
+        label = instance_label(backend.run_dir)
+        if not label:
+            continue
+        by_label.setdefault(label, []).append((job_id, backend))
+
+    for label, members in sorted(by_label.items()):
+        # Newest by end time is the one that will still be here; anything older
+        # of the same label is what it replaces.
+        members.sort(key=lambda kv: kv[1].end_time)
+        newest_id, newest = members[-1]
+        older = members[:-1]
+
+        if older and newest.healthy:
+            for job_id, _ in older:
+                if job_id in fleet.superseded or job_id in fleet.draining:
+                    continue
+                fleet.superseded.add(job_id)
+                LOG.info(
+                    "%ssuperseded %s; %s is the newer %s and is serving",
+                    tag,
+                    job_id,
+                    newest_id,
+                    label,
+                )
+
+        if newest.end_time <= 0:
+            continue  # no wall clock to relay against; recover_lost_backends still covers it
+        remaining = newest.end_time - now
+        if remaining >= fleet.args.lead_time:
+            continue
+        if len(members) > 1:
+            continue  # a successor for this label already exists
+        last = fleet.relaying.get(label, 0.0)
+        if now - last < fleet.args.min_submit_interval:
+            continue
+        fleet.relaying[label] = now
+        LOG.info(
+            "%s%s (%s) ends in %ds; submitting its successor", tag, label, newest_id, int(remaining)
+        )
+        code, out = await run_fleetctl(fleet, "up", "--only", label, "--force")
+        if code != 0:
+            # `out` as-is, like the recovery path below: an undefined helper
+            # here raised NameError exactly when a successor submit failed,
+            # replacing fleetctl's reason with a traceback and skipping the
+            # rest of that supervise tick.
+            LOG.error(
+                "%srelay submit for %s failed (rc=%s): %s", tag, label, code, out or "(no output)"
+            )
 
 
 async def recover_lost_backends(fleet, now):
@@ -4292,6 +5533,7 @@ async def recover_lost_backends(fleet, now):
         return
     if now - fleet.last_recovery < fleet.args.recover_cooldown:
         return
+    tag = pool_tag(fleet)
     due = [
         (j, rec)
         for j, rec in sorted(fleet.lost.items())
@@ -4311,7 +5553,8 @@ async def recover_lost_backends(fleet, now):
         if tries >= fleet.args.recover_limit:
             if tries == fleet.args.recover_limit:
                 LOG.error(
-                    "%s never came back after %d recovery attempts; leaving it to an operator",
+                    "%s%s never came back after %d recovery attempts; leaving it to an operator",
+                    tag,
                     job_id,
                     tries,
                 )
@@ -4325,7 +5568,8 @@ async def recover_lost_backends(fleet, now):
         {label for label in (instance_label(run_dir) for _, run_dir, _ in orphaned) if label}
     )
     LOG.warning(
-        "scheduler has no record of %s (was %s); reconciling the fleet",
+        "%sscheduler has no record of %s (was %s); reconciling the fleet",
+        tag,
         ", ".join(job_id for job_id, _, _ in orphaned),
         ", ".join(labels) if labels else "unlabelled",
     )
@@ -4338,14 +5582,23 @@ async def recover_lost_backends(fleet, now):
     if code == 0:
         for job_id, _, _ in orphaned:
             fleet.lost.pop(job_id, None)
-        LOG.info("fleetctl up: %s", out or "(no output)")
+        LOG.info("%sfleetctl up: %s", tag, out or "(no output)")
     else:
         # Left in `lost` on purpose: a scheduler that was busy this minute may
         # not be the next, and the attempt counter bounds the retries.
-        LOG.error("fleetctl up failed (rc=%s): %s", code, out)
+        LOG.error("%sfleetctl up failed (rc=%s): %s", tag, code, out)
 
 
 async def check_recovery(fleet):
+    """check_recovery_pool() for each supervised pool, against its own fleet config."""
+    if not getattr(fleet, "pools", None):
+        await check_recovery_pool(fleet)
+        return
+    for view in fleet.supervised_views():
+        await check_recovery_pool(view)
+
+
+async def check_recovery_pool(fleet):
     """Prove at startup that recovery could actually run -- both halves of it.
 
     The failure this catches is quiet and slow: recovery has to reach the
@@ -4368,11 +5621,13 @@ async def check_recovery(fleet):
     """
     if not fleet.args.fleet_config:
         return
+    tag = pool_tag(fleet)
 
     code, out = await run_fleetctl(fleet, "status")
     if code != 0:
         LOG.warning(
-            "preemption recovery is configured but `%s --config %s status` failed (rc=%s): %s",
+            "%spreemption recovery is configured but `%s --config %s status` failed (rc=%s): %s",
+            tag,
             fleet.args.fleetctl,
             fleet.args.fleet_config,
             code,
@@ -4389,8 +5644,9 @@ async def check_recovery(fleet):
     code, out = await run_slurm_command("squeue", "--me", "--noheader", "--format", "%i")
     if code != 0:
         LOG.warning(
-            "preemption recovery can submit but cannot ask whether a job is gone: "
+            "%spreemption recovery can submit but cannot ask whether a job is gone: "
             "squeue failed (rc=%s): %s",
+            tag,
             code,
             (out or "")[-300:],
         )
@@ -4403,7 +5659,8 @@ async def check_recovery(fleet):
         return
 
     LOG.info(
-        "preemption recovery ready: %s %s (scheduler reachable via %s)",
+        "%spreemption recovery ready: %s %s (scheduler reachable via %s)",
+        tag,
         fleet.args.fleetctl,
         fleet.args.fleet_config,
         fleet.args.slurm_wrapper or "local squeue",
@@ -4411,6 +5668,29 @@ async def check_recovery(fleet):
 
 
 async def supervise(fleet):
+    """One lifecycle sweep, pool by pool.
+
+    With no extra pool this is the sweep it always was, over the Fleet itself.
+    With extra pools, each supervised pool is swept through its own PoolView:
+    its own backends, its own fleet config, its own relay labels -- GLM's i00
+    and K3's i00 are two instances, and one sweep over both would have the
+    longer-lived one supersede, drain and quit the other. A pool with no fleet
+    config is never swept at all.
+
+    Each pool's sweep is contained: a failure acting on one fleet's jobs must
+    not cost the other fleets their supervision.
+    """
+    if not getattr(fleet, "pools", None):
+        await _supervise_pool(fleet)
+        return
+    for view in fleet.supervised_views():
+        try:
+            await _supervise_pool(view)
+        except Exception:
+            LOG.exception("%ssupervisor failed", pool_tag(view))
+
+
+async def _supervise_pool(fleet):
     now = time.time()
     await supervise_pending(fleet, now)
     await revive_dead_backends(fleet, now)
@@ -4423,8 +5703,20 @@ async def supervise(fleet):
 
     # Relay: submit the next job early enough that it finishes loading weights
     # before this one hits the wall clock.
+    if fleet.args.relay_per_instance:
+        await relay_per_instance(fleet, now)
+
+    tag = pool_tag(fleet)
+    # The single-lineage relay below resubmits --yaml, a serve.sh deployment
+    # file that only the default pool has.
+    lineage = getattr(fleet, "single_lineage", True)
     backend = fleet.backends.get(fleet.active) if fleet.active else None
-    if backend is not None and not fleet.args.no_relay:
+    if (
+        lineage
+        and backend is not None
+        and not fleet.args.no_relay
+        and not fleet.args.relay_per_instance
+    ):
         remaining = backend.end_time - now
         # A submitted/loading successor is represented by `pending`. An older
         # job that took traffic and then failed remains discoverable so it can
@@ -4441,7 +5733,8 @@ async def supervise(fleet):
             LOG.info("%s ends in %ds; submitting successor", fleet.active, int(remaining))
             await submit_successor(fleet, now, "relay")
     elif (
-        not fleet.args.no_relay
+        lineage
+        and not fleet.args.no_relay
         and fleet.ever_active
         and not fleet.stopped
         and not fleet.backends
@@ -4458,7 +5751,9 @@ async def supervise(fleet):
     # never be reclaimed only takes it out of rotation for nothing -- which is
     # exactly what it did to every instance but the longest-lived one once
     # routing began serving them all at once.
-    if fleet.args.no_relay:
+    # Per-instance relay needs the same authority: it marks predecessors
+    # superseded and relies on the drain below to retire them.
+    if fleet.args.no_relay and not fleet.args.relay_per_instance:
         return
 
     # Promote superseded backends to draining, but only once the successor has
@@ -4474,7 +5769,7 @@ async def supervise(fleet):
             for job_id in sorted(fleet.superseded):
                 fleet.superseded.discard(job_id)
                 if job_id == fleet.active:
-                    LOG.warning("refusing to drain active backend %s", job_id)
+                    LOG.warning("%srefusing to drain active backend %s", tag, job_id)
                     continue
                 backend = fleet.backends.get(job_id)
                 if backend is None:
@@ -4482,7 +5777,8 @@ async def supervise(fleet):
                 deadline = backend.end_time - 60
                 fleet.draining[job_id] = deadline
                 LOG.info(
-                    "draining %s (%s stable %ds, inflight=%d, reclaim by %s)",
+                    "%sdraining %s (%s stable %ds, inflight=%d, reclaim by %s)",
+                    tag,
                     job_id,
                     fleet.active,
                     int(stable_for),
@@ -4494,7 +5790,7 @@ async def supervise(fleet):
     # is worth releasing a little early.
     for job_id, deadline in list(fleet.draining.items()):
         if job_id == fleet.active:
-            LOG.warning("cancelled stale drain of active backend %s", job_id)
+            LOG.warning("%scancelled stale drain of active backend %s", tag, job_id)
             fleet.draining.pop(job_id, None)
             continue
         backend = fleet.backends.get(job_id)
@@ -4509,10 +5805,10 @@ async def supervise(fleet):
         if inflight and (deadline <= 0 or now <= deadline):
             continue
         why = "drained" if not inflight else "deadline"
-        LOG.info("reclaiming %s (%s, inflight=%d)", job_id, why, inflight)
+        LOG.info("%sreclaiming %s (%s, inflight=%d)", tag, job_id, why, inflight)
         code, out = await run_serve_sh(fleet, "quit", backend.run_dir)
         if code != 0:
-            LOG.error("quit %s failed (rc=%d): %s", job_id, code, out)
+            LOG.error("%squit %s failed (rc=%d): %s", tag, job_id, code, out)
         fleet.draining.pop(job_id, None)
 
 
@@ -4525,6 +5821,26 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--fleet-dir", required=True, help="directory the serving jobs register into"
+    )
+    parser.add_argument(
+        "--pool",
+        dest="pools",
+        action="append",
+        default=None,
+        metavar="NAME=FLEET_DIR[,FLEET_CONFIG]",
+        help="add another fleet directory beside --fleet-dir; repeatable. Its backends are "
+        "discovered, probed and routed exactly like the default fleet's -- every "
+        "directory is one routing pool, whatever model a request names -- and "
+        "supervised (revive, recovery, walltime relay, drain) through FLEET_CONFIG, the "
+        "pool's own fleet.yaml. Without one the pool is routed but never supervised",
+    )
+    parser.add_argument(
+        "--pools-file",
+        default=None,
+        help="more --pool specs, one per line, read at startup (default: pools.conf beside "
+        "--users; an empty string disables). A handover successor inherits its "
+        "predecessor's command line, so this file is how a pool is added to a running "
+        "gateway: write it, then POST /_gateway/handover",
     )
     parser.add_argument("--users", required=True, help="allowlist, one username per line")
     parser.add_argument("--yaml", default="", help="deployment YAML the supervisor resubmits")
@@ -4546,10 +5862,21 @@ def parse_args(argv):
         "the restart gap.",
     )
     parser.add_argument(
+        "--relay-per-instance",
+        action="store_true",
+        help="roll each configured instance before its own wall clock, via "
+        "fleetctl. Use instead of the single-lineage relay on a fleet where "
+        "several instances serve at once",
+    )
+    parser.add_argument(
         "--lead-time",
         type=int,
         default=2700,
-        help="seconds before the wall clock to submit the successor (default 45min)",
+        help="seconds before the wall clock to submit the successor (default "
+        "45min). Must exceed the successor's cold start, or the predecessor "
+        "expires before its replacement serves and the relay buys nothing: "
+        "measured 50min for GLM-5.3-FP8 with install_repo (30min of pip, then "
+        "weights and CUDA graphs), so that deployment sets 3300",
     )
     parser.add_argument(
         "--stale-after",
@@ -4660,6 +5987,35 @@ def parse_args(argv):
         "connection is acted on immediately regardless",
     )
     parser.add_argument(
+        "--upstream-connect-timeout",
+        type=float,
+        default=10.0,
+        help="seconds to wait for a backend to accept a connection before treating the "
+        "attempt as failed and retrying elsewhere. A backend that drops packets rather than "
+        "refusing them otherwise holds the request for the kernel's two-minute connect "
+        "timeout, longer than a Codex client waits for its first event (default 10)",
+    )
+    parser.add_argument(
+        "--retry-upstream",
+        type=int,
+        default=1,
+        help="how many other backends to try when one fails before any byte has "
+        "reached the client. 0 restores the old behaviour of returning 502 at once",
+    )
+    parser.add_argument(
+        "--refusals-before-drop",
+        type=int,
+        default=3,
+        help="connection refusals on real requests, within --refusal-window, that "
+        "take a backend out of rotation without waiting for the probe",
+    )
+    parser.add_argument(
+        "--refusal-window",
+        type=float,
+        default=5.0,
+        help="seconds over which --refusals-before-drop is counted",
+    )
+    parser.add_argument(
         "--promote-after",
         type=float,
         default=180.0,
@@ -4730,6 +6086,16 @@ def parse_args(argv):
         # would be cut off partway. Better to start it somewhere it can finish.
         help="stop giving a backend new conversations this many seconds before it ends "
         "(default 1800)",
+    )
+    parser.add_argument(
+        "--pool-affinity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        # Pools are models here (GLM, Kimi-K3). A conversation moved across
+        # them continues on a model that did not write its history.
+        help="re-place a conversation only inside the pool it was first served from; while "
+        "none of that pool's backends is accepting, its requests get no backend. "
+        "--no-pool-affinity lets it move to any pool (default on)",
     )
     parser.add_argument(
         "--route-policy",
@@ -4809,7 +6175,20 @@ def parse_args(argv):
         args.serve_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.sh")
     if not args.fleetctl:
         args.fleetctl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fleetctl")
-    if args.fleet_config:
+    if args.pools_file is None:
+        # Beside the users file, the one path every generation is given that
+        # sits in GW_DIR -- the same derivation as the pid file. A default
+        # rather than an opt-in, because the generation that most needs it is
+        # a handover successor, and that one cannot be given a new flag.
+        args.pools_file = os.path.join(os.path.dirname(os.path.abspath(args.users)), "pools.conf")
+    try:
+        flags = [parse_pool_spec(text) for text in args.pools or ()]
+        from_file = read_pools_file(args.pools_file) if args.pools_file else []
+        args.pools = combine_pools(flags, from_file, args.fleet_dir)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    args.pools_from_file = [spec.name for spec in from_file]
+    if args.fleet_config or any(spec.fleet_config for spec in args.pools):
         # --fleetctl is something this host executes, so it is checked here.
         # --fleet-config deliberately is not: it is passed *to* fleetctl, and
         # fleetctl has to run where the cluster's scheduler is. A gateway that
@@ -4954,6 +6333,14 @@ async def main_async(args):
 
     fleet = Fleet(args)
     os.makedirs(args.fleet_dir, exist_ok=True)
+    for pool in fleet.pools.values():
+        # Not fatal: an extra pool whose directory cannot be made has no
+        # backends, which costs only its own share of the fleet; every other
+        # pool's backends serve as normal.
+        try:
+            os.makedirs(pool.fleet_dir, exist_ok=True)
+        except OSError as exc:
+            LOG.warning("[%s] cannot create fleet dir %s: %s", pool.name, pool.fleet_dir, exc)
     fleet.reload_users()
     if not fleet.users:
         LOG.warning("users file %s is empty; every request will get 401", args.users)
@@ -4978,6 +6365,24 @@ async def main_async(args):
     write_pid_file(args)
     LOG.info("listening on %s:%d", args.host, args.port)
     LOG.info("fleet dir: %s", args.fleet_dir)
+    for pool in fleet.pools.values():
+        LOG.info(
+            "pool %s: fleet dir %s, routed together with every other pool%s",
+            pool.name,
+            pool.fleet_dir,
+            " (from %s)" % args.pools_file if pool.name in args.pools_from_file else "",
+        )
+        if pool.fleet_config:
+            LOG.info("pool %s: supervised against %s", pool.name, pool.fleet_config)
+        else:
+            # Once, here, rather than every supervisor sweep: the pool is
+            # skipped by every sweep, and saying so each time would bury the
+            # log in a message that never changes.
+            LOG.warning(
+                "pool %s has no fleet config: its backends are routed but never revived, "
+                "recovered or relayed",
+                pool.name,
+            )
     LOG.info(
         "relay: %s",
         "off" if args.no_relay else "lead time %ds from %s" % (args.lead_time, args.yaml),

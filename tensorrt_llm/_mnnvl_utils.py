@@ -282,16 +282,12 @@ class MnnvlMemory:
                 try:
                     os.close(exported_fabric_handle)
                 except OSError as e:
-                    logger.warning(
-                        "Failed to close exported shareable handle on error: %s",
-                        e,
-                    )
+                    logger.warning(f"Failed to close exported shareable handle on error: {e}")
             try:
                 _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
             except RuntimeError as e:
                 logger.warning(
-                    "cuMemRelease failed during error cleanup (original error will be raised): %s",
-                    e,
+                    f"cuMemRelease failed during error cleanup (original error will be raised): {e}"
                 )
             for _pidfd in pidfds:
                 try:
@@ -338,14 +334,14 @@ class MnnvlMemory:
                 try:
                     _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
                 except RuntimeError as e:
-                    logger.warning("cuMemUnmap failed during error cleanup: %s", e)
+                    logger.warning(f"cuMemUnmap failed during error cleanup: {e}")
             for mem_handle in mem_handles:
                 if mem_handle is None:
                     continue
                 try:
                     _check_cu_result(cuda.cuMemRelease(mem_handle))
                 except RuntimeError as e:
-                    logger.warning("cuMemRelease failed during error cleanup: %s", e)
+                    logger.warning(f"cuMemRelease failed during error cleanup: {e}")
             if reserved_new_address:
                 try:
                     device_ptr = cuda.CUdeviceptr(cls.current_start_address)
@@ -353,7 +349,7 @@ class MnnvlMemory:
                         cuda.cuMemAddressFree(device_ptr, comm_size * cls.current_rank_stride)
                     )
                 except RuntimeError as e:
-                    logger.warning("cuMemAddressFree failed during error cleanup: %s", e)
+                    logger.warning(f"cuMemAddressFree failed during error cleanup: {e}")
                 else:
                     (
                         cls.current_start_address,

@@ -9493,15 +9493,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                   is_persistent))
                 else:
                     logger.debug(
-                        "CuteDSLNVMlaDecodeBlackwellRunner.can_implement "
-                        "rejected tactic: kernel=%s in_dtype=%s "
-                        "H=%d L=%d R=%d S=%d B=%d page_size=%d "
-                        "mma_qk=%s mma_pv=%s persistent=%s var_seq=%s "
-                        "var_split=%s", self.kernel_class.__name__,
-                        self.in_dtype, h, latent_dim, rope_dim, seq_len_q,
-                        batch_size, self.page_size, mma_qk_tiler_mn,
-                        mma_pv_tiler_mn, is_persistent, self._IS_VAR_SEQ,
-                        self._IS_VAR_SPLIT_KV)
+                        f"CuteDSLNVMlaDecodeBlackwellRunner.can_implement "
+                        f"rejected tactic: kernel={self.kernel_class.__name__} "
+                        f"in_dtype={self.in_dtype} H={h} L={latent_dim} R="
+                        f"{rope_dim} S={seq_len_q} B={batch_size} page_size="
+                        f"{self.page_size} mma_qk={mma_qk_tiler_mn} mma_pv="
+                        f"{mma_pv_tiler_mn} persistent={is_persistent} var_seq="
+                        f"{self._IS_VAR_SEQ} var_split={self._IS_VAR_SPLIT_KV}")
             return valid
 
         def _tuning_inputs_pre_hook(

@@ -77,10 +77,20 @@ def mirror_lines(backend):
         return []
 
 
-def set_mirror(port, job_id, target):
-    status, data, _ = control(
-        port, "POST", "/_gateway/mirror", {"job_id": job_id, "target": target}
-    )
+def set_mirror(port, job_id, target, force=False):
+    """POST /_gateway/mirror.
+
+    `force` skips the endpoint's pre-flight probe of the target. Several tests
+    below deliberately mirror to something that cannot answer -- a port with
+    nothing on it, a target that is about to be stopped -- because what they
+    are testing is what the relay does once a target goes bad. The endpoint
+    refuses that by default now, which is right for a human typing an address
+    and wrong for these, so they say so explicitly.
+    """
+    request = {"job_id": job_id, "target": target}
+    if force:
+        request["force"] = True
+    status, data, _ = control(port, "POST", "/_gateway/mirror", request)
     return status, data
 
 
@@ -108,7 +118,7 @@ def test_mirror_copies_and_the_copy_never_answers_anybody(make_scenario):
 
         status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % target.port)
         assert status == 200, body
-        assert body["mirroring"] == "127.0.0.1:%d" % target.port
+        assert body["mirroring"] == ["127.0.0.1:%d" % target.port]
 
         before = len(stream.served())
         wait_for(
@@ -152,7 +162,10 @@ def test_a_broken_mirror_target_changes_nothing(make_scenario):
         clean_before = len(stream.served())
 
         status, body = set_mirror(
-            scenario.port, scenario.fleet.backends[0].job_id, "127.0.0.1:%d" % dead.port
+            scenario.port,
+            scenario.fleet.backends[0].job_id,
+            "127.0.0.1:%d" % dead.port,
+            force=True,
         )
         assert status == 200, body
 
@@ -228,7 +241,10 @@ def test_a_slow_mirror_target_does_not_slow_the_served_request(make_scenario):
     try:
         without = sample()
         status, body = set_mirror(
-            scenario.port, scenario.fleet.backends[0].job_id, "127.0.0.1:%d" % sink_port
+            scenario.port,
+            scenario.fleet.backends[0].job_id,
+            "127.0.0.1:%d" % sink_port,
+            force=True,
         )
         assert status == 200, body
         with_mirror = sample()
@@ -263,7 +279,7 @@ def test_clearing_the_mirror_stops_the_copies(make_scenario):
 
         status, body = set_mirror(scenario.port, served.job_id, None)
         assert status == 200, body
-        assert body["mirroring"] is None
+        assert body["mirroring"] == []
 
         settled = len(mirror_lines(target))
         before = len(stream.served())
@@ -307,7 +323,9 @@ def test_a_target_that_stays_gone_stops_being_mirrored_to(make_scenario):
 
     stream = RequestStream(scenario.port, workers=4).start()
     try:
-        status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % dead.port)
+        status, body = set_mirror(
+            scenario.port, served.job_id, "127.0.0.1:%d" % dead.port, force=True
+        )
         assert status == 200, body
         assert body["mirroring"] is not None
 
@@ -401,7 +419,7 @@ def test_a_target_that_rejects_every_copy_is_not_counted_as_delivered(make_scena
 
     stream = RequestStream(scenario.port, workers=4).start()
     try:
-        status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % port)
+        status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % port, force=True)
         assert status == 200, body
 
         wait_for(
@@ -469,7 +487,63 @@ def test_a_mirror_survives_a_handover(make_scenario):
     second.wait_serving(timeout=30.0)
 
     _, data, _ = control(second.port, "GET", "/_gateway/fleet")
-    assert data["mirroring"].get(served.job_id) == "127.0.0.1:%d" % target.port, (
+    assert data["mirroring"].get(served.job_id) == ["127.0.0.1:%d" % target.port], (
         "the successor came up without the mirror its predecessor was running: %r"
         % (data["mirroring"],)
     )
+
+
+def test_an_unreachable_target_is_refused_with_the_reason(make_scenario):
+    """A target that answers nothing is refused before the table is written.
+
+    The failure this prevents was paid for in production: a mirror was pointed
+    at a target that 404ed every path, the POST returned 200, and the mistake
+    surfaced only after 50 real requests had been copied into nothing and the
+    auto-disable budget tripped. The budget is a backstop for a target that
+    dies later; it is a poor way to find out that an address was wrong.
+
+    So the refusal has to carry the reason -- `probe: dead` against a port with
+    nothing on it -- because "502" alone sends the reader back to guessing
+    between a typo, a target that has not started, and a firewall.
+    """
+    scenario = make_scenario("mirror-unreachable", backends=2)
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    served = scenario.fleet.backends[0]
+    dead = lease_port(scenario.rng)  # leased so nothing can bind it, never bound
+
+    status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % dead.port)
+    assert status == 502, body
+    assert body["probe"] == "dead", body
+    assert "force" in body.get("hint", ""), body
+
+    # Refused means refused: nothing was written, so nothing is being copied.
+    _, fleet, _ = control(scenario.port, "GET", "/_gateway/fleet")
+    assert fleet["mirroring"] == {}, fleet["mirroring"]
+
+    # ...and the same request with force set does take effect, reporting what
+    # it overrode rather than hiding it behind an indistinguishable 200.
+    status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % dead.port, force=True)
+    assert status == 200, body
+    assert body["forced"] is True, body
+    assert body["target"]["probe"] == "dead", body
+
+
+def test_a_live_target_is_accepted_and_reported(make_scenario):
+    """The happy path asserts the probe actually ran, not just that it passed.
+
+    Without the `target.probe == "ok"` assertion this test would pass just as
+    well if the check were deleted, which is the failure mode a pre-flight
+    check is most likely to develop.
+    """
+    scenario = make_scenario("mirror-live", backends=2)
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    served = scenario.fleet.backends[0]
+    target = mirror_target(scenario, name="live-target")
+
+    status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % target.port)
+    assert status == 200, body
+    assert body["target"]["probe"] == "ok", body
+    assert body["source"]["healthy"] is True, body
+    assert body["forced"] is False, body

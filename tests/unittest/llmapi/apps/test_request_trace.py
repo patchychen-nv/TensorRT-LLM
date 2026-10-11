@@ -15,21 +15,28 @@
 """Unit tests for the request trace writer."""
 
 import asyncio
+import contextlib
+import gc
 import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
 from tensorrt_llm.serve.request_trace import (
     _WRITER_QUEUE_SIZE,
     REQUEST_TRACE_DIR_ENV,
+    WRITER_SIDECAR_DIR,
     RequestTraceWriter,
     _join_frames,
     brief_validation_errors,
+    find_tool_call_markup,
     is_internal_disagg_request,
     request_trace_dir_from_env,
     resolve_session_key,
+    responses_outcome,
     sanitize_session_key,
 )
 
@@ -98,6 +105,14 @@ async def drain(writer):
     await writer.close()
 
 
+async def _until(predicate, timeout=5.0):
+    """Wait on the writer's own progress markers instead of sleeping blind."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        assert asyncio.get_running_loop().time() < deadline, "condition never became true"
+        await asyncio.sleep(0.01)
+
+
 class TestSanitizeSessionKey:
     @pytest.mark.parametrize("value", [None, "", "   "])
     def test_missing_falls_back(self, value):
@@ -156,6 +171,63 @@ class TestResolveSessionKey:
     @pytest.mark.parametrize("body", [None, {}, "not-a-dict", {"client_metadata": 7}])
     def test_no_session(self, body):
         assert resolve_session_key({}, body) == "_no_session"
+
+    def test_conversation_params_beat_a_header_as_they_do_for_the_router(self):
+        """The router reads body ``conversation_params`` before any header.
+
+        The trace used to start at the headers, so a client that sent both had
+        its turns filed under one id while the router pinned them by another.
+        """
+        headers = {"x-session-id": "sess_hdr"}
+        body = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "conversation_params": {"conversation_id": " conv_body "},
+        }
+        routed = resolve_request_conversation_id(ChatCompletionRequest(**body), headers)
+
+        assert routed == "conv_body"
+        assert resolve_session_key(headers, body) == sanitize_session_key(routed)
+
+    @pytest.mark.parametrize(
+        "headers, fields",
+        [
+            ({"x-session-id": "hdr"}, {"conversation_params": {"conversation_id": "params"}}),
+            ({"x-session-id": "hdr"}, {"prompt_cache_key": "pck"}),
+            ({}, {"conversation_params": {"conversation_id": "params"}, "prompt_cache_key": "pck"}),
+            ({}, {"client_metadata": {"session_id": "run", "thread_id": "thread"}}),
+            (
+                {"x-claude-code-session-id": "claude"},
+                {
+                    "conversation_params": {"conversation_id": "params"},
+                    "client_metadata": {"thread_id": "thread"},
+                },
+            ),
+            ({"x-session-id": "  "}, {"prompt_cache_key": "pck"}),
+            ({}, {}),
+        ],
+    )
+    def test_agrees_with_the_router_on_every_source_combination(self, headers, fields):
+        body = {"model": "m", "input": "hi", **fields}
+        routed = resolve_request_conversation_id(ResponsesRequest(**body), headers)
+
+        assert resolve_session_key(headers, body) == sanitize_session_key(routed)
+
+    @pytest.mark.asyncio
+    async def test_request_line_carries_the_routed_id(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(
+            FakeRequest(
+                body={"conversation_params": {"conversation_id": "conv_body"}},
+                headers={"x-session-id": "sess_hdr"},
+            )
+        )
+        await drain(writer)
+
+        assert handle.session == "conv_body"
+        (record,) = read_lines(tmp_path, "conv_body", "requests")
+        assert record["trace_id"] == handle.trace_id
 
 
 class TestBriefValidationErrors:
@@ -431,6 +503,73 @@ class TestRequestRecords:
             ["user-agent", "claude-cli/2.1"],
         ]
 
+    # Credential-bearing names in the case a client might send them. The value
+    # of each is unique so a leak anywhere in the file is caught, not just one
+    # in the header list.
+    CREDENTIALS = {
+        "Authorization": "Bearer sk-live-a1",
+        "Proxy-Authorization": "Basic cHJveHk6YjI=",
+        "X-Api-Key": "sk-ant-c3",
+        "api-key": "azure-d4",
+        "Cookie": "session=e5",
+        "set-cookie": "id=f6",
+        "x-auth-token": "tok-g7",
+        "X-Amz-Security-Token": "tok-h8",
+        "x-client-secret": "sec-i9",
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hook", ["on_request", "on_rejected"])
+    async def test_credentials_are_redacted_but_named(self, tmp_path, hook):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        request = FakeRequest(
+            body={},
+            headers={
+                **self.CREDENTIALS,
+                "x-session-id": "s_creds",
+                "user-agent": "claude-cli/2.1",
+            },
+        )
+        if hook == "on_request":
+            await writer.on_request(request)
+        else:
+            await writer.on_rejected(request, [])
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_creds", "requests")
+        dumped = dict(record["headers"])
+        # Presence stays visible under the name the client used...
+        for name in self.CREDENTIALS:
+            assert dumped[name] == "[redacted]", name
+        # ...while the headers the trace exists to keep are untouched.
+        assert dumped["x-session-id"] == "s_creds"
+        assert dumped["user-agent"] == "claude-cli/2.1"
+        written = "".join(path.read_text() for path in tmp_path.glob("*/requests*.jsonl"))
+        for value in self.CREDENTIALS.values():
+            assert value not in written
+
+    @pytest.mark.asyncio
+    async def test_repeated_credential_headers_are_each_redacted(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+
+        class MultiHeaders(FakeHeaders):
+            def items(self):
+                return [("cookie", "a=1"), ("cookie", "b=2"), ("x-session-id", "s_multi")]
+
+        request = FakeRequest(body={})
+        request.headers = MultiHeaders()
+        await writer.on_request(request)
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_multi", "requests")
+        assert record["headers"] == [
+            ["cookie", "[redacted]"],
+            ["cookie", "[redacted]"],
+            ["x-session-id", "s_multi"],
+        ]
+
     @pytest.mark.asyncio
     async def test_unparseable_body_kept_as_text(self, tmp_path):
         writer = RequestTraceWriter(str(tmp_path))
@@ -642,6 +781,145 @@ class TestStreamingResponse:
         assert _join_frames([b"a", "b", b"c"]) == "abc"
 
 
+@contextlib.contextmanager
+def cyclic_gc_off():
+    """Both servers run with gc.disable(); a record must not wait on a collection."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+class TestStreamNeverStarted:
+    """An accepted streaming request whose body is never iterated.
+
+    An async generator that is never started runs none of its body, so the
+    ``finally`` that writes the response line never runs either. Starlette does
+    exactly that when the client is already gone as the response begins: under
+    ASGI 2.4 ``send`` raises, the response raises ClientDisconnect, and the
+    body iterator is dropped untouched -- an accepted request with no terminal
+    record.
+    """
+
+    @staticmethod
+    async def _accepted(writer, session):
+        return await writer.on_request(FakeRequest(body={}, headers={"x-session-id": session}))
+
+    @staticmethod
+    async def _source():
+        yield "frame-0"
+
+    @pytest.mark.asyncio
+    async def test_dropped_without_being_started(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_dropped")
+
+        with cyclic_gc_off():
+            stream = writer.wrap_stream(self._source(), handle)
+            del stream
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_dropped", "responses")
+        assert record["status"] == "client_disconnected"
+        assert record["termination"]["cause"] == "not_started"
+        assert record["response"]["body"] == ""
+        assert record["trace_id"] == handle.trace_id
+
+    @pytest.mark.asyncio
+    async def test_closed_before_the_first_chunk_is_recorded_once(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_closed")
+
+        with cyclic_gc_off():
+            stream = writer.wrap_stream(self._source(), handle)
+            await stream.aclose()
+            del stream
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_closed", "responses")
+        assert record["status"] == "client_disconnected"
+
+    @pytest.mark.asyncio
+    async def test_starlette_dropping_an_unstarted_body(self, tmp_path):
+        """The real path: a 2.4 server's send raises, the body is never touched."""
+        from starlette.responses import StreamingResponse
+
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_gone")
+        iterated = []
+
+        async def source():
+            iterated.append(True)
+            yield "data: {}\n\n"
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            raise OSError("client already gone")
+
+        async def serve(response):
+            scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}}
+            try:
+                await response(scope, receive, send)
+            except Exception as error:  # noqa: BLE001 - reported, then dropped with its frames
+                return type(error).__name__
+            return None
+
+        with cyclic_gc_off():
+            response = StreamingResponse(
+                writer.wrap_stream(source(), handle), media_type="text/event-stream"
+            )
+            assert await serve(response) == "ClientDisconnect"
+            del response
+        await drain(writer)
+
+        assert not iterated
+        (record,) = read_lines(tmp_path, "s_gone", "responses")
+        assert record["status"] == "client_disconnected"
+        assert record["termination"]["cause"] == "not_started"
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_already_recorded_is_not_overwritten(self, tmp_path):
+        """Exactly once: a server that closed the trace itself keeps its status."""
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_first")
+
+        with cyclic_gc_off():
+            stream = writer.wrap_stream(self._source(), handle)
+            writer.on_response(handle, payload={"error": "boom"}, status="error")
+            del stream
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_first", "responses")
+        assert record["status"] == "error"
+        assert "termination" not in record
+
+    @pytest.mark.asyncio
+    async def test_a_started_stream_records_only_its_own_outcome(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_ran")
+
+        with cyclic_gc_off():
+            stream = writer.wrap_stream(self._source(), handle)
+            assert [chunk async for chunk in stream] == ["frame-0"]
+            del stream
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_ran", "responses")
+        assert record["status"] == "completed"
+        assert record["response"]["body"] == "frame-0"
+        assert "termination" not in record
+
+
 class TestNonStreamingResponse:
     @pytest.mark.asyncio
     async def test_json_payload(self, tmp_path):
@@ -671,6 +949,202 @@ class TestNonStreamingResponse:
         assert len(records) == 1
         assert records[0]["response"]["body"] == {"first": True}
 
+    @pytest.mark.asyncio
+    async def test_an_error_answer_keeps_its_http_status(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "h1"}))
+        writer.on_response(
+            handle, payload={"detail": "engine overloaded"}, status="error", http_status=503
+        )
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "h1", "responses")
+        assert record["http_status"] == 503
+        assert record["response"] == {"kind": "json", "body": {"detail": "engine overloaded"}}
+
+    @pytest.mark.asyncio
+    async def test_a_reply_without_an_http_status_records_none(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "h2"}))
+        writer.on_response(handle, payload={"id": "msg_1"})
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "h2", "responses")
+        assert "http_status" not in record
+
+    @pytest.mark.asyncio
+    async def test_a_plain_text_answer_is_recorded_as_text(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "h3"}))
+        writer.on_response(handle, payload="Internal Server Error", status="error", http_status=500)
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "h3", "responses")
+        assert record["response"] == {"kind": "text", "body": "Internal Server Error"}
+
+
+def _sse(event_type, data):
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+_BLED_EXEC = {
+    "type": "custom_tool_call",
+    "id": "ctc_1",
+    "call_id": "call_1",
+    "name": "exec",
+    "input": '// @exec: {"max_output_tokens</arg_key><arg_value>20000, "yield_time_ms": 30000}',
+}
+_CLEAN_CALL = {
+    "type": "function_call",
+    "id": "fc_2",
+    "call_id": "call_2",
+    "name": "exec",
+    "arguments": '{"input": "ls"}',
+}
+
+
+class TestToolCallMarkup:
+    """Calls whose arguments still hold tool-call markup are flagged, not changed."""
+
+    def test_a_streamed_call_with_markup_is_flagged_once(self):
+        text = "".join(
+            [
+                _sse("response.output_item.done", {"item": _BLED_EXEC}),
+                _sse("response.output_item.done", {"item": _CLEAN_CALL}),
+                _sse("response.completed", {"response": {"output": [_BLED_EXEC, _CLEAN_CALL]}}),
+            ]
+        )
+        assert find_tool_call_markup(text) == [
+            {"call_id": "call_1", "name": "exec", "markers": ["</arg_key>", "<arg_value>"]}
+        ]
+
+    def test_markup_outside_tool_calls_is_not_flagged(self):
+        """A model can write about the format in its reasoning or its answer."""
+        message = {
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Calls look like <arg_key>k</arg_key>."}],
+        }
+        text = _sse("response.completed", {"response": {"output": [message, _CLEAN_CALL]}})
+        assert find_tool_call_markup(text) == []
+
+    def test_a_json_reply_is_checked_too(self):
+        payload = {"output": [_CLEAN_CALL, _BLED_EXEC]}
+        (flagged,) = find_tool_call_markup(None, payload)
+        assert flagged["call_id"] == "call_1"
+
+    @pytest.mark.asyncio
+    async def test_the_response_record_carries_the_flag(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s9"}))
+
+        async def source():
+            yield _sse("response.output_item.done", {"item": _BLED_EXEC})
+            yield _sse("response.completed", {"response": {"output": [_BLED_EXEC]}})
+
+        [chunk async for chunk in writer.wrap_stream(source(), handle)]
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s9", "responses")
+        assert record["tool_call_markup"][0]["call_id"] == "call_1"
+
+    @pytest.mark.asyncio
+    async def test_a_clean_response_record_has_no_flag(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s10"}))
+        writer.on_response(handle, payload={"output": [_CLEAN_CALL]})
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s10", "responses")
+        assert "tool_call_markup" not in record
+
+
+def _responses_object(status, **fields):
+    return {"object": "response", "id": "resp_1", "status": status, "output": [], **fields}
+
+
+class TestResponsesOutcome:
+    """The record says how the generation ended, not just how the transport did."""
+
+    @pytest.mark.asyncio
+    async def test_a_stream_cut_by_the_token_budget_reads_incomplete(self, tmp_path):
+        """The transport completed; the generation did not."""
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "o1"}))
+        incomplete = _responses_object(
+            "incomplete", incomplete_details={"reason": "max_output_tokens"}
+        )
+
+        async def source():
+            yield _sse("response.created", {"response": _responses_object("in_progress")})
+            yield _sse("response.incomplete", {"response": incomplete})
+
+        [chunk async for chunk in writer.wrap_stream(source(), handle)]
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "o1", "responses")
+        assert record["status"] == "completed"
+        assert record["response_status"] == "incomplete"
+        assert record["incomplete_reason"] == "max_output_tokens"
+        assert "error_code" not in record
+
+    def test_a_finished_stream_reads_completed(self):
+        text = _sse("response.created", {"response": _responses_object("in_progress")}) + _sse(
+            "response.completed", {"response": _responses_object("completed")}
+        )
+        assert responses_outcome(text) == {"response_status": "completed"}
+
+    def test_a_failed_stream_carries_its_error_code(self):
+        failed = _responses_object(
+            "failed", error={"code": "context_length_exceeded", "message": "too long"}
+        )
+        text = _sse("error", {"code": "context_length_exceeded"}) + _sse(
+            "response.failed", {"response": failed}
+        )
+        assert responses_outcome(text) == {
+            "response_status": "failed",
+            "error_code": "context_length_exceeded",
+        }
+
+    def test_a_stream_cut_before_its_terminal_event_states_nothing(self):
+        text = _sse("response.created", {"response": _responses_object("in_progress")}) + _sse(
+            "response.output_text.delta", {"delta": "partial"}
+        )
+        assert responses_outcome(text) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_json_responses_reply_is_read_too(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "o2"}))
+        writer.on_response(
+            handle,
+            payload=_responses_object(
+                "incomplete", incomplete_details={"reason": "max_output_tokens"}
+            ),
+        )
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "o2", "responses")
+        assert record["response_status"] == "incomplete"
+        assert record["incomplete_reason"] == "max_output_tokens"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"id": "chatcmpl-1", "object": "chat.completion", "choices": []},
+            {"error": {"code": "context_length_exceeded"}},
+            None,
+        ],
+    )
+    def test_other_replies_state_nothing(self, payload):
+        assert responses_outcome(None, payload) == {}
+
 
 class TestWriterMechanics:
     @pytest.mark.asyncio
@@ -684,7 +1158,9 @@ class TestWriterMechanics:
 
         assert len(read_lines(tmp_path, "s_a", "requests")) == 2
         assert len(read_lines(tmp_path, "s_b", "requests")) == 1
-        assert len([path for path in tmp_path.iterdir() if path.is_dir()]) == 1
+        # The writer's own accounting lives beside the buckets, not in them.
+        buckets = [p for p in tmp_path.iterdir() if p.is_dir() and p.name != WRITER_SIDECAR_DIR]
+        assert len(buckets) == 1
 
     @pytest.mark.asyncio
     async def test_writer_suffix_applied(self, tmp_path):
@@ -730,6 +1206,210 @@ class TestWriterMechanics:
             writer._submit("s", "requests", {"ok": True})
         assert writer.dropped_records == 10
         writer._task = None
+
+
+class TestWriterResilience:
+    """One poisoned record or one failed batch must never kill the drain task.
+
+    The failure mode being guarded: the task dies, ``enabled`` stays True, the
+    counters stay still, and every record from that moment on queues toward a
+    drain that no longer exists -- the trace silently stops. UnicodeEncodeError
+    out of ``file.write`` (a ValueError the write-side clause did not catch)
+    did exactly that once.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unpaired_surrogate_does_not_kill_the_writer(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s_bad"}))
+        # Half a surrogate pair: json.dumps(ensure_ascii=False) emits it
+        # happily, and only the UTF-8 encode inside file.write() objects.
+        writer.on_response(handle, payload={"text": "cut \ud800 here"})
+        # Sanitation happens while the batch is prepared, so this doubles as
+        # "the drain task got past the record that used to kill it".
+        await _until(lambda: writer.sanitized_records == 1)
+        assert not writer._task.done()
+
+        # The definitive proof of survival: a later record still lands.
+        later = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s_good"}))
+        assert later is not None
+        await drain(writer)
+
+        assert writer.sanitized_records == 1
+        assert writer.dropped_records == 0
+        assert writer.last_write_at is not None
+        (bad,) = read_lines(tmp_path, "s_bad", "responses")
+        # Lossless: the record is written with \u escapes, which JSON reads back
+        # as the very code point the client sent.
+        assert bad["response"]["body"]["text"] == "cut \ud800 here"
+        (good,) = read_lines(tmp_path, "s_good", "requests")
+        assert good["status"] == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_healthy_batchmates_survive_a_poisoned_record(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        # No await between submits: both records sit on the queue before the
+        # drain task wakes, so they flush as one batch -- the shape in which a
+        # single poisoned record used to take its healthy batchmates with it.
+        writer._submit("2026-01-01T00", "requests", {"session": "s_ok", "text": "fine"})
+        writer._submit("2026-01-01T00", "requests", {"session": "s_poison", "text": "\udfff"})
+        await drain(writer)
+
+        (ok,) = read_lines(tmp_path, "s_ok", "requests")
+        assert ok["text"] == "fine"
+        (poisoned,) = read_lines(tmp_path, "s_poison", "requests")
+        assert poisoned["text"] == "\udfff"
+        assert writer.sanitized_records == 1
+        assert writer.dropped_records == 0
+
+    @pytest.mark.asyncio
+    async def test_only_the_unencodable_record_is_escaped(self, tmp_path):
+        """Escaping is per record: a batchmate keeps its text as raw UTF-8.
+
+        And nothing is added to the escaped record -- it reads back identical
+        to what was submitted, so no consumer has a second shape to handle.
+        """
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        clean = {"session": "s_clean", "text": "你好"}
+        poisoned = {"session": "s_lone", "text": "你 \ud83d"}
+        writer._submit("2026-01-01T00", "requests", clean)
+        writer._submit("2026-01-01T00", "requests", poisoned)
+        await drain(writer)
+
+        (path,) = tmp_path.glob("2026-01-01T00/requests*.jsonl")
+        clean_line, poisoned_line = path.read_text(encoding="utf-8").splitlines()
+        assert "你好" in clean_line
+        assert poisoned_line.isascii()
+        assert json.loads(clean_line) == clean
+        assert json.loads(poisoned_line) == poisoned
+
+    @pytest.mark.asyncio
+    async def test_unexpected_write_failure_does_not_kill_the_writer(self, tmp_path, monkeypatch):
+        """UnicodeEncodeError was the instance; the guarantee is broader.
+
+        Whatever one batch's write raises, the batch is counted as dropped and
+        the loop keeps draining.
+        """
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        real_write = RequestTraceWriter._write_groups
+        failures = iter([RuntimeError("neither an OSError nor a serialization error")])
+
+        def flaky(groups):
+            error = next(failures, None)
+            if error is not None:
+                raise error
+            real_write(writer, groups)
+
+        monkeypatch.setattr(writer, "_write_groups", flaky)
+
+        await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s_lost"}))
+        await _until(lambda: writer._write_error_count == 1)
+        assert not writer._task.done()
+        assert writer.last_write_at is None  # nothing has landed yet
+
+        await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s_kept"}))
+        await drain(writer)
+
+        assert writer.dropped_records == 1  # the failed batch is accounted for
+        assert writer.last_write_at is not None  # the later flush did land
+        assert read_lines(tmp_path, "s_lost", "requests") == []
+        (kept,) = read_lines(tmp_path, "s_kept", "requests")
+        assert kept["status"] == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_partial_batch_failure_counts_only_the_unwritten_groups(self, tmp_path):
+        """A poisoned second group must not drag the first group into the drop count.
+
+        _write_groups appends one file per (bucket, kind) group. When a later
+        group cannot be written, the groups before it are already durably on
+        disk, so only the unwritten remainder is genuinely lost. The old handler
+        charged the WHOLE batch to dropped_records -- overcounting the loss and
+        contradicting the file sitting on disk.
+        """
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        # Two groups in one batch: distinct hour buckets so _write_groups makes
+        # two separate appends, processed in submit order. Block the SECOND
+        # bucket by planting a file where its directory must go, so its mkdir
+        # raises FileExistsError (an OSError) only AFTER the first group's append
+        # has already returned.
+        good_bucket = "2026-01-01T00"
+        bad_bucket = "2026-01-01T01"
+        (tmp_path / bad_bucket).write_text("a file, not a directory")
+        # No await between submits, so both land in one drained batch -- the
+        # shape a partial failure needs (one write call spanning both groups).
+        writer._submit(good_bucket, "requests", {"session": "s_ok", "text": "landed"})
+        writer._submit(bad_bucket, "requests", {"session": "s_lost", "text": "never"})
+        await drain(writer)
+
+        # The first group is on disk; only the second group's single line is lost.
+        (ok,) = read_lines(tmp_path, "s_ok", "requests")
+        assert ok["text"] == "landed"
+        assert writer.dropped_records == 1
+        assert read_lines(tmp_path, "s_lost", "requests") == []
+        # The failure was still logged/accounted, just not overcounted.
+        assert writer._write_error_count == 1
+
+    @pytest.mark.asyncio
+    async def test_last_write_at_tracks_successful_flushes(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        assert writer.last_write_at is None
+        await writer.on_request(FakeRequest(body={}))
+        await drain(writer)
+
+        # Same ISO form as every recorded_at, so a monitor comparing the two
+        # needs no conversion.
+        assert writer.last_write_at is not None
+        assert writer.last_write_at.endswith("+00:00")
+
+
+class TestHalfWrittenLineRecovery:
+    """An append must not weld a new record onto an orphaned fragment.
+
+    A write cut short (crash, quota) leaves the file ending mid-line; gluing
+    the next record onto it corrupts that record too -- two lost where one
+    already was. ``_write_groups`` is exercised directly so the test does not
+    depend on the wall-clock hour bucket.
+    """
+
+    BUCKET = "2026-01-01T00"
+
+    def _path(self, tmp_path):
+        return tmp_path / self.BUCKET / "requests-w.jsonl"
+
+    def test_append_isolates_a_half_written_line(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path), writer_suffix="-w")
+        path = self._path(tmp_path)
+        path.parent.mkdir()
+        path.write_text('{"cut": "mid')  # what an interrupted write leaves
+        writer._write_groups({(self.BUCKET, "requests"): ['{"ok":1}\n']})
+
+        lines = path.read_text().splitlines()
+        assert lines == ['{"cut": "mid', '{"ok":1}']
+        # The fragment is one bad line a JSONL reader skips; the record after
+        # it parses untouched.
+        assert json.loads(lines[1]) == {"ok": 1}
+
+    @pytest.mark.parametrize("existing", ["", '{"whole":1}\n'])
+    def test_no_spurious_newline_when_none_is_missing(self, tmp_path, existing):
+        writer = RequestTraceWriter(str(tmp_path), writer_suffix="-w")
+        path = self._path(tmp_path)
+        path.parent.mkdir()
+        path.write_text(existing)
+        writer._write_groups({(self.BUCKET, "requests"): ['{"ok":1}\n']})
+
+        assert path.read_text() == existing + '{"ok":1}\n'
+
+    def test_first_write_needs_no_repair(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path), writer_suffix="-w")
+        writer._write_groups({(self.BUCKET, "requests"): ['{"ok":1}\n']})
+
+        assert self._path(tmp_path).read_text() == '{"ok":1}\n'
 
 
 class TestNestedHandlerOwnership:

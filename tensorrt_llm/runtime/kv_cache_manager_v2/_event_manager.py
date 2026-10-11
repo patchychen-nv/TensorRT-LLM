@@ -627,10 +627,9 @@ class KVCacheEventManager:
     def _fallback_v1_hash(self, block_key: bytes) -> int:
         if not self._warned_v1_hash_fallback:
             logger.warning(
-                "V2 KV cache event hash algorithm %s only matches v1 for "
-                "text-token radix blocks. Falling back to truncated V2 block "
-                "hash for unsupported blocks.",
-                KV_CACHE_HASH_ALGO_V1,
+                f"V2 KV cache event hash algorithm {KV_CACHE_HASH_ALGO_V1} only matches v1 for "
+                f"text-token radix blocks. Falling back to truncated V2 block hash for unsupported "
+                f"blocks."
             )
             self._warned_v1_hash_fallback = True
         return truncate_sha256_hash_to_int64(block_key)

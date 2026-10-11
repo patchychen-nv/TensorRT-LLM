@@ -1040,10 +1040,9 @@ class MegaMoECuteDsl(MoEImplBase):
                 )
         if len(self._maxt_buckets) > 1 and self.ep_rank == 0:
             logger.info(
-                "[MegaMoECuteDsl] adaptive max_tokens_per_rank buckets=%s "
-                "(one symmetric provider + kernel per bucket; per-launch bucket "
-                "= smallest >= max(all_rank_num_tokens))",
-                self._maxt_buckets,
+                f"[MegaMoECuteDsl] adaptive max_tokens_per_rank buckets={self._maxt_buckets} (one "
+                f"symmetric provider + kernel per bucket; per-launch bucket = smallest >= "
+                f"max(all_rank_num_tokens))"
             )
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:

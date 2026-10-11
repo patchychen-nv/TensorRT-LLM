@@ -387,13 +387,13 @@ class GenerationResultBase:
                         f"output.length - 1: {output.length - 1}")
                     if len(output.logprobs) < output.length:
                         logger.warning(
-                            "Disaggregated serving: the response contains "
-                            "%d logprob entries instead of %d because "
-                            "logprobs for the first generated token were "
-                            "not transferred from the context server. "
-                            "Enable logprobs on both the prefill and "
-                            "decode servers to receive complete results.",
-                            len(output.logprobs), output.length)
+                            f"Disaggregated serving: the response contains "
+                            f"{len(output.logprobs)} logprob entries instead "
+                            f"of {output.length} because logprobs for the "
+                            f"first generated token were not transferred from "
+                            f"the context server. Enable logprobs on both the "
+                            f"prefill and decode servers to receive complete "
+                            f"results.")
                 else:
                     assert len(output.logprobs) == output.length, (
                         f"logprobs length: {len(output.logprobs)} != "

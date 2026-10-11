@@ -128,8 +128,8 @@ def drop_decoder_context_requests_waiting_for_encoder_output(
     for req in active_requests:
         if is_decoder_context_request_waiting_for_encoder_output(req):
             logger.debug(
-                "Skipping context request %s until encoder output is ready.",
-                getattr(req, "py_request_id", req.request_id),
+                f"Skipping context request {getattr(req, 'py_request_id', req.request_id)} until "
+                f"encoder output is ready."
             )
             continue
 

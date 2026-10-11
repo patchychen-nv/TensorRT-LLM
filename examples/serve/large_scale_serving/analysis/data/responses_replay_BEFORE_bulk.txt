@@ -1,0 +1,79 @@
+WARNING:torchao:Skipping import of cpp extensions due to incompatible torch version 2.12.0a0+5aff3928d8.nv26.05 for torchao version 0.15.0+cu130             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/code/tensorrt_llm/.worktrees/kf-agent-eval/tensorrt_llm/serve/openai_protocol.py:218: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+==============================================================================
+Responses streaming replay - BEFORE (bulk: all 6492 raw records)
+==============================================================================
+responses_utils.py sha256 : 4abb275b3bb8be8896550f8dc1b19bb6e96d4fd1293e023b96b885b04af99da5
+loaded real modules       : 24
+stubbed modules           : 18
+
+--- mode: stream ---
+  records replayed            : 6492
+  replays run                 : 6492
+  output_text.delta events    : 6985
+  output_text.done events     : 2218
+  tool call items surfaced    : 6450
+  records violating invariant : 21
+  done events violating       : 21
+  ... of which leak markup    : 21 (21 records)
+  markup chars leaked (total) : 3107
+  markup chars leaked (max)   : 309
+  unstreamed chars in done    : 3107
+
+--- violation rate by tool calls in the response (mode: stream) ---
+  calls  records  violating    rate   calls recovered
+      0       89          1    1.1%         0/0
+      1     6368          0    0.0%      6367/6368
+      2       22          9   40.9%        42/44
+      3        9          8   88.9%        25/27
+      4        4          3   75.0%        16/16
+
+--- per-record violations ---
+record_id              mode      calls first_k    n  markup   extra  prefixes
+-----------------------------------------------------------------------------
+144115188075855877     stream        2       6    1     180     180  [6]
+144115188075855881     stream        3       6    1     128     128  [6]
+144115188075855893     stream        2       6    1     114     114  [6]
+144115188075855916     stream        3      11    1     146     146  [11]
+144115188075855992#3   stream        0      44    1      12      12  [44]
+144115188075856051#2   stream        2       9    1     193     193  [9]
+144115188075856248     stream        3       8    1     290     290  [8]
+144115188075856256#2   stream        3       7    1     309     309  [7]
+144115188075856266     stream        3       2    1     146     146  [2]
+281                    stream        2      76    1     191     191  [76]
+288230376151711900     stream        2       9    1     175     175  [9]
+288230376151712091     stream        3      12    1     177     177  [12]
+288230376151712560     stream        2       3    1     162     162  [3]
+288230376151712597     stream        3      13    1      23      23  [13]
+288230376151712801     stream        2       5    1      91      91  [5]
+374                    stream        4       2    1      97      97  [2]
+4                      stream        4       4    1     226     226  [4]
+432345564227567618#3   stream        3       8    1     282     282  [8]
+432345564227568586     stream        2      11    1      60      60  [11]
+765                    stream        2      13    1      85      85  [13]
+767                    stream        4      13    1      20      20  [13]
+
+--- 4 records where the calls surfaced differ from the <tool_call> markers in the raw text ---
+  144115188075856164#2   markers=1 surfaced=0
+  144115188075856572     markers=2 surfaced=1
+  288230376151711949     markers=2 surfaced=1
+  812                    markers=3 surfaced=1
+
+--- reference record (spec Verification, point 1) ---
+  output_text.done events                 : 1
+  done payloads containing tool markup    : 1 at prefixes [6] lengths [296]
+  tool calls surfaced                     : 2 ['functions.exec', 'functions.exec']
+  final output_text.done length           : 296
+  spec: no markup in any done payload     : FAIL
+  spec: final text is 116 chars           : FAIL
+  spec: both calls recovered              : PASS
+
+VERDICT: INVARIANT VIOLATED - 21 violating done events
+==============================================================================
+
+==============================================================================
+Violation detail (first 0 of 21)
+==============================================================================
+
+wrote examples/serve/large_scale_serving/analysis/data/responses_replay_BEFORE_bulk.json

@@ -547,8 +547,8 @@ def safe_gather(
 
     # Step 2b: total exceeds int32 — chunked Gatherv.
     logger.info(
-        "safe_gather: total payload %d bytes exceeds int32 limit, "
-        "using chunked Gatherv (size=%d)", total, size)
+        f"safe_gather: total payload {total} bytes exceeds int32 limit, using "
+        f"chunked Gatherv (size={size})")
     max_safe_chunk = int32_max // size
     chunk_size = min(chunk_size, max_safe_chunk)
     max_len = int(lengths.max())
@@ -625,8 +625,8 @@ def safe_allgather(
 
     # Step 2b: total exceeds int32 — chunked Allgatherv.
     logger.info(
-        "safe_allgather: total payload %d bytes exceeds int32 limit, "
-        "using chunked Allgatherv (size=%d)", total, size)
+        f"safe_allgather: total payload {total} bytes exceeds int32 limit, "
+        f"using chunked Allgatherv (size={size})")
     max_safe_chunk = int32_max // size
     chunk_size = min(chunk_size, max_safe_chunk)
     max_len = int(lengths.max())

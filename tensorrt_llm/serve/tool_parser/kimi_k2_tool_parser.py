@@ -66,14 +66,14 @@ class KimiK2ToolParser(BaseToolParser):
             function_call_tuples = self.tool_call_regex.findall(text)
             tool_indices = self._get_tool_indices(tools)
 
-            logger.debug("function_call_tuples: %s", function_call_tuples)
+            logger.debug(f"function_call_tuples: {function_call_tuples}")
 
             tool_calls = []
             for match in function_call_tuples:
                 function_id, function_args = match
                 m = self.tool_call_id_regex.match(function_id)
                 if not m:
-                    logger.warning("Unexpected tool_call_id format: %s", function_id)
+                    logger.warning(f"Unexpected tool_call_id format: {function_id}")
                     continue
                 function_name = m.group("name")
                 function_idx = int(m.group("index"))
@@ -127,7 +127,7 @@ class KimiK2ToolParser(BaseToolParser):
 
                 m = self.tool_call_id_regex.match(function_id)
                 if not m:
-                    logger.warning("Unexpected tool_call_id format: %s", function_id)
+                    logger.warning(f"Unexpected tool_call_id format: {function_id}")
                     return StreamingParseResult(normal_text="", calls=calls)
                 function_name = m.group("name")
 

@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.3-FP8 GENERATION worker for disaggregated serving: 8 GPUs over two
+# 4-GPU GB300 nodes as DEP8, with MTP. Paired with glm5.3_ctx_dep8_mtp.yaml.
+#
+# Derived from glm5.2_gen_dep8_mtp.yaml with the parallelism untouched -- it
+# was already TP8/EP8, which is why only the context worker had to move -- so
+# the ONLY differences from that file are the three keys NVFP4 owned:
+#
+#   moe_config.backend                        CUTEDSL -> TRTLLM
+#   moe_config.use_low_precision_moe_combine  true    -> removed
+#   sparse_attention_config.use_cute_dsl_paged_mqa_logits
+#                                             true    -> removed
+#
+# Each is argued at its site. Nothing was resized. The DEP8/5.2 worker measures
+# 88.74 GiB inside torch plus 64.10 GiB outside it, and that 64.10 is the KV
+# transfer and pool buffers -- driven by cache_transceiver_config
+# (max_tokens_in_buffer 1048576 plus a 5120 MiB bounce buffer) rather than by
+# the checkpoint -- so the 1.626x weight growth from 433 GB of 5.2-NVFP4 to
+# 704 GB of 5.3-FP8 applies to the 88.74 alone. See the note on
+# free_gpu_memory_fraction for the one consequence of that worth watching.
+#
+# `--tool_parser glm47` is passed on the command line by serve.sh and belongs
+# on THIS worker only: the proxy drives the context worker with stream=False
+# and discards its text, so a parser there would only see truncated output.
+
+context_parallel_size: 1
+
+enable_attention_dp: true
+
+# Must match the context worker exactly -- backend and buffer both.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_cache_bounce_size_mb: 5120
+  max_tokens_in_buffer: 1048576
+  kv_transfer_timeout_ms: 600000
+
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256]
+  enable_padding: true
+
+# No disable_overlap_scheduler here, unlike the context worker and unlike the
+# aggregated config: overlap hides host work behind decode steps, and decode is
+# all this worker does.
+disable_overlap_scheduler: false
+
+kv_cache_config:
+  # fp8, carried over unchanged and deliberately so. This types the KV CACHE,
+  # not the weights: it is read straight out of kv_cache_config and has no
+  # dependency on the checkpoint's quantization. The fleet owner's proven
+  # GLM-5.3-FP8 config (datagen-glm53/config/glm53_gen_128k.yaml) carries the
+  # same `dtype: fp8` on this exact checkpoint. It is moe_config.backend below,
+  # not this key, that NVFP4 owned.
+  dtype: fp8
+  enable_block_reuse: false
+  event_buffer_max_size: 0
+  # 0.9, unchanged -- but this is the number to watch on first bring-up, and
+  # the reason is arithmetic rather than a measurement. A fraction self-adjusts
+  # (it splits what is left AFTER the profiled peak, so heavier weights shrink
+  # the pool instead of overcommitting it) and therefore cannot OOM by itself.
+  # What does shrink with it is the 10% it holds back: of 276.62 GiB usable per
+  # GB300 GPU, 88.74 + 64.10 leaves ~123.8 GiB for the split today and 0.9 of
+  # that reserves ~12.4 GiB; at ~144 GiB of 5.3 weights the same split has
+  # ~68.2 GiB and reserves only ~6.8 GiB. The KV pool roughly halves, which is
+  # expected and is the cost of the bigger checkpoint; the thinner reserve is
+  # the part that could bite. If this worker OOMs during warmup, step it to
+  # 0.85 before changing anything else -- it is left at 0.9 here because this
+  # change set is deliberately confined to the quantization-dependent keys.
+  free_gpu_memory_fraction: 0.9
+  tokens_per_block: 64
+
+max_batch_size: 64
+max_seq_len: 1048576
+max_num_tokens: 256
+
+moe_config:
+  # TRTLLM, changed from the 5.2 file's CUTEDSL, and this is not a preference:
+  # CUTEDSL cannot serve this checkpoint at all. GLM-5.3-FP8 declares
+  # quant_method fp8 with weight_block_size [128,128], which TRT-LLM reads as
+  # QuantAlgo.FP8_BLOCK_SCALES. moe_resolution._candidates_for("CUTEDSL")
+  # builds exactly three candidates and every one of them rejects that on
+  # GB300: CuteDslB12xFusedMoE is SM120/121 NVFP4 decode only;
+  # CuteDslFusedMoE rejects FP8_BLOCK_SCALES at fused_moe_cute_dsl.py:433
+  # because its only FP8-block GEMM is an fp32 einsum reference rather than a
+  # kernel; and CutlassFusedMoE, the one fallback the resolver appends, gates
+  # FP8_BLOCK_SCALES to SM in {90, 120} at fused_moe_cutlass.py:116. With no
+  # eligible candidate impl_class_for raises "no MoE implementation can serve
+  # this layer" while the layer is being built, so the worker dies before it
+  # loads a weight -- a hard startup failure, not the quiet per-layer fallback
+  # the 5.2 files warned about.
+  #
+  # TRTLLM is what the fleet owner's proven GLM-5.3-FP8 config selects
+  # (~20 live jobs on this checkpoint). DEEPGEMM is equally eligible and the
+  # source does not rank the two; A/B it if decode throughput disappoints, but
+  # start where the proven config is.
+  backend: TRTLLM
+  # use_low_precision_moe_combine REMOVED (it was true here on 5.2). This one
+  # is unambiguously quantization-scoped: llm_args.py:1463-1467 documents it as
+  # "only for NVFP4 quantization", and the field it feeds is dead weight on an
+  # FP8 block-scale checkpoint. The fleet owner's GLM-5.3-FP8 config drops it
+  # for the same reason and notes that DeepEPLowLatency disables it for FP8
+  # block scales anyway. Leaving it set would state a claim about the
+  # checkpoint that is false.
+moe_expert_parallel_size: 8
+
+num_postprocess_workers: 4
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. The pull endpoint
+# /perf_metrics that these settings used to feed no longer exists; serve.sh
+# appends perf_metrics_output_dir per attempt, since only it knows the path.
+# perf_metrics_max_requests went with the endpoint -- retention is the file now.
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+# GLM closes its reasoning block more than once -- a turn ends the block,
+# writes another stretch of planning, and closes again before the tool
+# call. `deepseek-r1` treats everything past the first close as content
+# and so publishes the later `</think>` as visible text; the `glm`
+# parser drops a close seen outside a block. Same delimiters and the
+# same split point otherwise.
+reasoning_parser: glm
+sparse_attention_config:
+  algorithm: dsa
+  enable_heuristic_topk: true
+  # use_cute_dsl_paged_mqa_logits REMOVED (it was true here on 5.2), and this
+  # one is a judgement call rather than a source-forced change -- flagged so it
+  # can be reversed deliberately.
+  #
+  # What the source says: llm_args.py:926 describes it as "whether to use CuTE
+  # DSL paged MQA logits kernel on SM100 instead of C++ DeepGEMM", and
+  # indexer.py:630 gates it on IS_CUTLASS_DSL_AVAILABLE and nothing else. It
+  # selects a kernel for the DSA indexer, whose precision comes from
+  # indexer_k_dtype -- which neither this file nor the 5.2 one sets, so both
+  # take the "fp8" default. It is therefore NOT quantization-dependent the way
+  # use_low_precision_moe_combine above is; "CuteDSL" in the name does not make
+  # it an NVFP4 flag.
+  #
+  # Why it is dropped anyway: two configs are proven, and they disagree here.
+  # The 5.2 file is proven on GLM-5.2-NVFP4; the fleet owner's config is proven
+  # on GLM-5.3-FP8, this checkpoint, and it omits this key. For a kernel-select
+  # flag whose only cost when absent is falling back to the C++ DeepGEMM
+  # default, the config proven on the TARGET checkpoint wins. Restoring it is
+  # this one line, and it is a clean A/B once the worker is up.
+# 20 rather than the aggregated 10, following the reference recipes.
+stream_interval: 20
+tensor_parallel_size: 8
+trust_remote_code: true
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+num_serve_frontends: 4

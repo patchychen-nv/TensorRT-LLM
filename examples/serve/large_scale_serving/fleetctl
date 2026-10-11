@@ -48,6 +48,15 @@ def load(path):
     for key in ("defaults", "instances"):
         if key not in cfg:
             raise FleetError("%s has no `%s` section" % (path, key))
+    # An instance is taken out of service by commenting it out, because the
+    # gateway's recovery runs `fleetctl up` against this list and would put a
+    # merely-cancelled job straight back. Comment out the last one and YAML
+    # reads the section as None rather than as an empty list, which crashed
+    # every subcommand here -- including the `up` that recovery calls, and the
+    # `status` needed to see what had happened. Parking the whole fleet is a
+    # state this is meant to express, so it reads as "no instances".
+    if cfg["instances"] is None:
+        cfg["instances"] = []
     names = [i.get("name") for i in cfg["instances"]]
     if len(set(names)) != len(names):
         raise FleetError("instance names must be unique: %s" % names)
@@ -256,6 +265,18 @@ def fleet_dir(cfg):
     )
 
 
+def fleet_name(cfg, instance):
+    """serve.sh's name for an instance's jobs: `<cluster_name>_<model.name>`.
+
+    Read the way serve.sh reads the generated file -- the instance's model
+    section over the defaults, and the file's own basename, which render()
+    makes the instance name, when no cluster_name is given.
+    """
+    model = merge(cfg["defaults"].get("model") or {}, instance.get("model") or {})
+    cluster = cfg["defaults"].get("cluster_name") or instance["name"]
+    return "%s_%s" % (cluster, model.get("name"))
+
+
 def registrations(cfg):
     """What the gateway can currently see."""
     found = {}
@@ -352,12 +373,20 @@ def instance_of(job_id, cfg, ledger=None):
     label off the end. A job that has not started yet has no run directory, so
     fall back to the ledger written at submit time -- that is the whole window
     in which duplicates are created.
+
+    The whole `_<jobid>_<cfgname>_<label>` tail has to match, not the label
+    alone. Two fleets -- two models -- share a trace.root and both name their
+    instances i00, i01...; matching the label alone made each fleet claim the
+    other's jobs, so `up` skipped an instance whose namesake in the other
+    model was running. The gateway's preemption recovery runs that same `up`
+    for each model's pool, so the conflation was not cosmetic: a lost
+    instance would never have been brought back.
     """
     root = cfg["defaults"]["trace"]["root"]
     for path in glob.glob(os.path.join(root, "*", "*", "*_%s_*" % job_id)):
         name = os.path.basename(path)
         for instance in cfg["instances"]:
-            if name.endswith("_%s" % instance["name"]):
+            if name.endswith("_%s_%s_%s" % (job_id, fleet_name(cfg, instance), instance["name"])):
                 return instance["name"]
     book = ledger_read(cfg) if ledger is None else ledger
     return book.get(str(job_id))
@@ -390,7 +419,11 @@ def submit(cfg, instance, dry_run=False, dependency=None):
     output = (result.stdout + result.stderr).strip()
     if result.returncode != 0:
         raise FleetError("submit %s failed:\n%s" % (instance["name"], output))
-    match = re.search(r"(\d{4,})", output)
+    # sbatch's own line, not the first long number: serve.sh prints the model
+    # path before it, and a checkpoint directory such as hf-b2428a0_orig
+    # carries one. A wrong id in the ledger leaves a pending job matched to
+    # nothing, and the next `up` submits the instance again.
+    match = re.search(r"Submitted batch job (\d+)", output)
     job_id = match.group(1) if match else "?"
     ledger_record(cfg, job_id, instance["name"])
     print("    submitted job %s" % job_id)

@@ -78,7 +78,7 @@ def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
     try:
         parsed = json.loads(arguments)
     except json.JSONDecodeError:
-        logger.warning("TOTResearch: failed to parse tool arguments: %s", arguments[:200])
+        logger.warning(f"TOTResearch: failed to parse tool arguments: {arguments[:200]}")
         return {}
     if not isinstance(parsed, dict):
         logger.warning("TOTResearch: tool arguments must be a JSON object")
@@ -245,7 +245,7 @@ class TOTResearchController(Controller):
             return None
         message = chat_task.messages[-1]
         if not isinstance(message, AssistantMessage):
-            logger.warning("TOTResearch: expected AssistantMessage, got %s", type(message).__name__)
+            logger.warning(f"TOTResearch: expected AssistantMessage, got {type(message).__name__}")
             return None
 
         content = (message.content or "").strip()

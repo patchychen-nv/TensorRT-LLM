@@ -27,4 +27,11 @@ var/
 # is the point of having a separate fleet at all, since the data-gen traces are
 # training data. Omitting this line left 156 GB of test output showing as
 # untracked, one `git add -A` away from being committed.
-var-test/
+var-*/
+
+# Operational backups taken before editing a deployed file in place
+# (fleet.yaml.bak-before-6p1d, gateway.py.bak-before-retry, ...). They
+# are local undo points, not deployment state; tracking them would make
+# every in-place edit show up as provenance drift.
+*.bak
+*.bak-*

@@ -1,0 +1,294 @@
+# The fleet Kernel Factory is pointed at: several disaggregated deployments
+# behind one gateway, each configured on its own.
+#
+#   ./fleetctl up          bring every instance up
+#   ./fleetctl status      what is running against what is configured
+#   ./fleetctl roll a      replace one instance without dropping traffic
+#   ./fleetctl down a      stop one
+#
+# Instances are independent on purpose. They differ in prefill/decode ratio,
+# and the right ratio is not known yet -- agent turns replay their whole
+# history, so this workload is prefill-heavy in a way ordinary chat is not, and
+# the only way to find the ratio is to run more than one and compare.
+#
+# Every instance registers into the SAME fleet directory. serve.sh names each
+# registration after its job id, so they do not collide, and the gateway
+# discovers the directory rather than any one file -- which is what makes them
+# one pool instead of four unrelated servers.
+
+defaults:
+  # cluster_name and model.name key the fleet directory. Identical across
+  # instances BY DESIGN: serli's file warns that sharing them makes two
+  # deployments register as backends of each other, which is exactly what is
+  # wanted here and the opposite of what it wanted there.
+  cluster_name: kffleet
+  repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM
+
+  model:
+    name: glm5.2
+    # Not the path in serli's file. That one resolves through
+    # /lustre/fsw/portfolios/coreai/users/serli -> coreai_mlperf_inference,
+    # a PPP this account cannot read; every read there fails EACCES. This is
+    # the copy under coreai_kf_dev, same checkpoint, readable.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/models/GLM-5.2-NVFP4
+    tool_parser: glm47
+
+  slurm:
+    account: coreai_kf_dev
+    partition: batch_long
+    # normal, not interactive. interactive has priority 700 but caps at
+    # MaxTRESPU node=4 with DenyOnLimit -- one 8-node instance would be
+    # rejected outright rather than queued. Measured queue waits on this
+    # account are a 1.7 min median at 4 nodes, so the priority is worth less
+    # than the headroom.
+    qos: normal
+    time: "24:00:00"
+    gpus_per_node: 4
+    extra_args: []
+
+  container:
+    # The image `jenkins/current_image_tags.properties` pins for this source
+    # tree, imported under our own sqsh/. Keep these two in step: the compiled
+    # artifacts in tensorrt_llm/libs are built inside this image, so pairing a
+    # different one with them is an untested combination.
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084.sqsh
+    mounts:
+      - /scratch/fsw:/scratch/fsw
+      # /lustre/fsw, where trace.request_root points, is mounted by default on
+      # this cluster and so is deliberately absent here.
+
+  server:
+    install_repo: true
+    numactl: "0,1"
+    capture: true
+    extra_args: []
+    env:
+      TLLM_LOG_LEVEL: INFO
+      # EXPERIMENT: single-rack transport set. Excludes every IB transport, so
+      # UCX never creates a UD QP and the "Cannot allocate memory" failure that
+      # kills NIXL on resource-starved SR-IOV nodes cannot occur. Risk: if the
+      # allocation spans NVL72 racks, cuda_ipc does not apply and KV transfer
+      # falls back to TCP -- slow, not failed, so latency must be measured.
+      UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+      # The cyclic GC must stay on in every process that parses requests: see ENV_DEFAULTS in serve.sh.
+      TRTLLM_SERVER_DISABLE_GC: "0"
+      TRTLLM_DISAGG_SERVER_DISABLE_GC: "0"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      TRTLLM_ENABLE_PDL: "1"
+      TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
+      ENROOT_ALLOW_DEV: "yes"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      TLLM_PROFILE_LOG_RANKS: all
+
+      # KV transfer transport. Slurm allocates the nodes of an instance with no
+      # rack constraint, so an instance is normally spread across several NVL72
+      # racks and the cross-rack settings are the ones that apply. Getting this
+      # wrong does not fail -- it falls back to TCP and shows up only as a KV
+      # transfer that takes seconds.
+      #
+      # UCX_TLS is deliberately absent: the GPU nodes' enroot environ.d injects
+      # UCX_TLS=tcp, and serve.sh unsets it when this file names no value,
+      # which is what lets UCX choose the RDMA transports for itself. Naming a
+      # list here that includes tcp but no IB transport would pin it to TCP.
+      #
+      # UCX_NET_DEVICES has to be named, though. enroot injects eth0 and
+      # serve.sh only overrides it when this file says so -- leaving it would
+      # confine UCX to ethernet with the rdma_vf_rail devices not even
+      # candidates, which is exactly what this fleet was doing before it was
+      # measured.
+      #
+      # For an instance known to be on a single rack the right setting is
+      # instead UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp and none of the four
+      # below.
+      TRTLLM_NIXL_NUM_THREADS: "1"
+
+      # The five settings above are the cross-rack configuration as given; this
+      # sixth one is what makes them survive contact with more than two nodes.
+      #
+      # DEVX off means UCX cannot use the mlx5 transports, so wireup falls to
+      # ud_verbs -- confirmed in the logs, where ud_verbs is the only transport
+      # that ever appears and no mlx5 one does. ud_verbs opens each interface
+      # with a UD QP whose receive queue defaults to 4096 work requests, and
+      # UCX_NET_DEVICES names four rails, and four ranks share a node. The
+      # rails are SR-IOV virtual functions with a small resource pool, so the
+      # twelfth or sixteenth such queue fails:
+      #
+      #   failed to create UD QP TX wr:256 sge:6 inl:64 RX wr:4096 ...
+      #       Cannot allocate memory
+      #   uct_iface_open(ud_verbs/rdma_vf_rail0:1) failed: Input/output error
+      #
+      # NIXL then cannot create its backend, the generation worker never
+      # reaches ready, and the proxy waits for it forever -- which presents as
+      # an instance that starts and simply never serves. Two of the first three
+      # instances died this way; the third was lucky.
+      #
+      # Every parameter in that message is a UCX_UD_VERBS_* default, which is
+      # what identifies the transport. 256 is a sixteenth of the default and is
+      # only the wireup path -- bulk KV transfer does not run over UD.
+      #
+      # The name is checked against `ucx_info -c` rather than remembered: the
+      # container sets UCX_WARN_UNUSED_ENV_VARS=n, so a misspelling here would
+      # do nothing at all and say nothing about it.
+
+      # Measured on aga: a cold start is ~36 min without this and 14.5 min with
+      # it, because ~30 of those minutes are FlashInfer compiling JIT modules
+      # that otherwise land under $HOME inside the container and die with it.
+      # At 30 instances against a 4h05m preemption exemption, paying that again
+      # on every restart is most of the fleet's recovery time.
+      #
+      # Setting it explicitly also disables the per-rank isolation in
+      # mpi_session.py, which is the point: that bootstrap gives each rank its
+      # own `rank-<n>` directory, so thirty 32-rank instances would compile the
+      # same modules hundreds of times over. Concurrent *hits* into one
+      # directory on Lustre are measured safe (three instances, 11 of 14 files
+      # rewritten, no stall); concurrent first-compiles are not, so warm the
+      # cache with a single instance before bringing up the rest.
+      #
+      # Must be writable: a cache hit still rewrites ~31 files.
+      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer
+    disagg:
+      start_timeout: 7200
+
+  gateway:
+    # How a backend announces itself. Unset means the file drop: serve.sh
+    # writes into <trace.root>/_fleet/<cluster>_<model> and the gateway reads
+    # that directory, which works precisely while the two share a filesystem.
+    #
+    # They do not when the gateway runs outside the cluster -- and there is a
+    # good reason to put it there. Everything the gateway does is in service of
+    # one URL that does not move, and inside the scheduler that costs the whole
+    # chain in gateway.sbatch: a successor submitted at every start, pinned to
+    # one node, with a gap at each handover and a thrash guard that will refuse
+    # to continue. A host with no wall clock needs none of it.
+    #
+    # Setting register_url makes each job POST to /_gateway/backend instead.
+    # The gateway probes the address before accepting and writes the same
+    # record itself, so discovery, routing and the analysis all stay as they
+    # are. It repeats every sixty seconds rather than announcing once, because
+    # a gateway that restarts comes up with an empty directory and nothing else
+    # would put this backend back in it.
+    #
+    # Commented out until jhb -> ipp2 HTTP is confirmed to work: the traffic
+    # this needs is outbound from a compute node, which is exactly what fails
+    # for Kernel Factory from there. The reverse direction is known good.
+    #
+    # register_url: http://ipp2-1730.ipp2a1.colossus.nvidia.com:8333
+    # api_key: junyix
+
+  trace:
+    # Everything this deployment writes for itself: run directories, engine
+    # logs, perf metrics, the sbatch logs, and the fleet registration directory
+    # the gateway watches (serve.sh derives all four from this one path). It is
+    # `var/` inside the checkout deliberately -- these files are this
+    # deployment's business and nobody else's, and keeping them beside the
+    # scripts that produce them means one path to set rather than five.
+    # gitignored, because the engine logs alone reach ~150 GB per instance over
+    # the seven days a job may live.
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var
+
+    # The exception, and the only output another team consumes: the per-request
+    # and per-response traces that tensorrt_llm/serve/request_trace.py writes.
+    # Unset keeps them under the attempt directory like everything else.
+    #
+    # TRTLLMxKF holds both services' request traces, so each keeps to a
+    # directory of its own under it -- `trace_data_gen` here, `trace_test`
+    # for the test fleet. That separation is what makes this data usable for
+    # training: a smoke test writing into this directory would be
+    # indistinguishable afterwards from real campaign traffic. serve.sh still exports TRTLLM_REQUEST_TRACE_DIR as
+    # <attempt>/request_trace and symlinks that to
+    # <request_root>/<run>/<attempt>, so the bytes land here while every reader
+    # -- analysis/, the rollup store, the dashboard collectors -- goes on
+    # finding them where it always has.
+    # Written as /scratch/fsw, not the /lustre/fsw symlink that names the same
+    # directory. Only /scratch/fsw is bind-mounted into the workers, so the
+    # symlinked spelling resolves to nothing inside the container: the writes
+    # fail, the directory reads as empty, and nothing says so. serve.sh now
+    # resolves this and warns when the target is outside every mount, but the
+    # config should be right on its own.
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_data_gen
+
+# Ports are the one thing that must differ, and the range is not free to
+# choose. Measured on a jhb GPU node, the system already listens on 8080, 8081,
+# 8900, 9100, 9200 and 9400 -- 9400 is a container registry, which answers
+# /health with 200 and therefore looks exactly like a working backend to the
+# gateway while 404ing every real request. A colliding instance does not fail
+# loudly: its worker dies on "Address already in use" and the gateway elects
+# the squatter in its place.
+#
+# So both fleets live inside 8200-8880, which is clear of all six, and are
+# spaced 20 apart because a disaggregated deployment binds the proxy port plus
+# one per worker frontend -- an 8P1D instance uses port..port+9.
+
+instances:
+  - name: i00
+    port: 8200
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i01
+    port: 8220
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i02
+    port: 8240
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i03
+    port: 8260
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i04
+    port: 8280
+    topology: server_configs/glm5.2_disagg_7p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i05
+    port: 8300
+    topology: server_configs/glm5.2_disagg_7p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i06
+    port: 8320
+    topology: server_configs/glm5.2_disagg_7p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i07
+    port: 8340
+    topology: server_configs/glm5.2_disagg_7p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i08
+    port: 8360
+    topology: server_configs/glm5.2_disagg_8p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i09
+    port: 8380
+    topology: server_configs/glm5.2_disagg_8p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i10
+    port: 8400
+    topology: server_configs/glm5.2_disagg_8p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: i11
+    port: 8420
+    topology: server_configs/glm5.2_disagg_8p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml

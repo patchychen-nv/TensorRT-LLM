@@ -1686,10 +1686,8 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
                 moe.load_clamp_weights_from_fp8_experts()
             except (AttributeError, KeyError, RuntimeError, ValueError) as e:
                 _logger.warning(
-                    "[Step3p7] failed to populate bf16 expert weights for layer %d (%s): %s. "
-                    "Forward will fall back to the FP8 backend without the Python path.",
-                    moe.layer_idx,
-                    getattr(moe, "_python_path_reason", ""),
-                    str(e)[:256],
+                    f"[Step3p7] failed to populate bf16 expert weights for layer {moe.layer_idx} ("
+                    f"{getattr(moe, '_python_path_reason', '')}): {str(e)[:256]}. Forward will "
+                    f"fall back to the FP8 backend without the Python path."
                 )
         return rc

@@ -698,25 +698,16 @@ class AlltoAllWatchdog:
         )
         if poll_timed_out:
             tllm_logger.error(
-                "AlltoAll watchdog could not read completion flags on rank %d "
-                "during %s before timeout %.3fs; expected flag %d, active "
-                "ranks %s, observed flags %s; reporting detection event only",
-                self._ep_rank,
-                watch.phase,
-                elapsed_s,
-                watch.expected_flag,
-                list(self._active_ranks(watch.active_mask)),
-                list(observed_flags),
+                f"AlltoAll watchdog could not read completion flags on rank {self._ep_rank} during "
+                f"{watch.phase} before timeout {elapsed_s:.3f}s; expected flag "
+                f"{watch.expected_flag}, active ranks {list(self._active_ranks(watch.active_mask))}"
+                f", observed flags {list(observed_flags)}; reporting detection event only"
             )
         else:
             tllm_logger.warning(
-                "AlltoAll watchdog timeout on rank %d during %s: expected flag %d, "
-                "missing ranks %s, observed flags %s",
-                self._ep_rank,
-                watch.phase,
-                watch.expected_flag,
-                list(missing_ranks),
-                list(observed_flags),
+                f"AlltoAll watchdog timeout on rank {self._ep_rank} during {watch.phase}: expected "
+                f"flag {watch.expected_flag}, missing ranks {list(missing_ranks)}, observed flags "
+                f"{list(observed_flags)}"
             )
         if self._on_timeout is not None:
             self._on_timeout(event)
@@ -757,7 +748,7 @@ class AlltoAllWatchdog:
                 poll_timed_out = True
             except Exception as exc:  # noqa: BLE001 - keep watchdog failures visible.
                 self._stop_after_error(exc)
-                tllm_logger.error("AlltoAll watchdog stopped after polling error: %s", exc)
+                tllm_logger.error(f"AlltoAll watchdog stopped after polling error: {exc}")
                 return
 
             if self._phase_complete(watch, observed_flags):
@@ -775,7 +766,7 @@ class AlltoAllWatchdog:
                 except Exception as exc:  # noqa: BLE001 - keep watchdog failures visible.
                     self._stop_after_error(exc)
                     tllm_logger.error(
-                        "AlltoAll watchdog stopped after timeout handling error: %s", exc
+                        f"AlltoAll watchdog stopped after timeout handling error: {exc}"
                     )
                     return
                 with self._cv:

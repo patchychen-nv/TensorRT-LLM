@@ -1,0 +1,185 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.3-FP8 on nsc-lhr-slurm-1 (GB300 NVL72, aarch64): the 6P1D layout and
+# engine configs of fleet.yaml on jhb. Per instance six DEP8 context workers
+# and one DEP8 generation worker with MTP, 14 nodes, each 2-node worker inside
+# one rack. Served behind the lhr gateway as its own pool (glm5.3).
+#
+# repo_dir is a checkout of this branch on lhr used by nothing else; it updates
+# with `git pull`, and a running instance picks the update up with
+# `serve.sh restart <run_dir>`.
+#
+# Compared with fleet.yaml (jhb):
+#   - the image is built on lhr from nvcr.io/nvidia/pytorch:26.05-py3 by
+#     running the base and devel stages of this branch's Dockerfile.multi,
+#     since lhr cannot pull the CI image;
+#   - lhr GPU nodes have no eth0: TCP goes over bond0, and KV between racks
+#     moves over the four InfiniBand HCAs, so only each worker has to fit in
+#     one rack (segment 2), not the whole instance;
+#   - the JIT caches (FlashInfer, Triton, HF modules) live on node-local disk;
+#   - racks d028, d015 and d017 are excluded (see below and fleet_kimik3_lhr.yaml);
+#   - cluster_name kflhr, so the fleet directory is _fleet/kflhr_glm5.3.
+
+defaults:
+  cluster_name: kflhr
+  repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM-glm
+  model:
+    name: glm5.3
+    # zai-org/GLM-5.3 at e0b07fd (FP8), the checkpoint fleet.yaml serves on jhb.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/zai-org_glm-5.3/hf/hf-e0b07fd_orig
+    tool_parser: glm47
+  slurm:
+    account: coreai_kf_dev
+    partition: batch_long
+    qos: normal
+    time: "7-00:00:00"
+    gpus_per_node: 4
+    # Each DEP8 worker (2 nodes) inside one NVL72 rack, so its MoE all-to-all
+    # stays inside one NVLink domain; the instance itself may span racks. Not
+    # 14 (whole instance in one rack): lhr nodes are lost to slurm-operator pod
+    # terminations several times an hour, every loss requeues the whole job,
+    # and once the cluster filled up a requeue waiting for 14 free nodes in one
+    # rack was estimated to start 2-4 hours later. Racks whose KV path is known
+    # to fail are excluded below, and every start is probed before it serves.
+    segment: 2
+    extra_args:
+      # Occupied Idle Job Reaper exemption: a start spends 20-50 min with idle
+      # SMs (checkout install, weight load, profiling).
+      - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.7-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
+      # With a K3 context worker on rack d028 or d015, every KV transfer of
+      # the instance failed although ucx_perftest between the same nodes
+      # passes. d017 joined them on 2026-10-10: a context worker there could
+      # not reach a generation worker on rack d051 on any rail (i03 job
+      # 136649), and Slurm handed the same freed nodes straight to the next
+      # pending instance, so the pair kept coming back. Excluding one rack of
+      # the pair is enough. d028 has no T17 and d017 no T17 or T18, and sbatch
+      # rejects an --exclude that names a node Slurm does not have.
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16]
+
+  container:
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/trtllm-devel-pytorch-26.05-sbsa-lhrbuild-glm-f8efc82403.sqsh
+    mounts:
+      - /scratch/fsw:/scratch/fsw
+
+  server:
+    install_repo: true
+    numactl: "0,1"
+    capture: true
+    raw_output: true
+    post_install:
+      # NIXL's UCX plugin with the v1.5.0 endpoint-failure fix, as on jhb (drop
+      # once the image ships NIXL >= 1.5.0).
+      - >-
+        echo "478e574dacb967e082626d00e0a7d06519c60138d5a1991066c0161b3f98d5de  /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.05/libplugin_UCX.so" | sha256sum -c -
+        && cp -f /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.05/libplugin_UCX.so /opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu/plugins/libplugin_UCX.so
+      # Seed this node's FlashInfer cache from the shared copy (see
+      # FLASHINFER_WORKSPACE_BASE below); modules already built there are
+      # reused, missing ones compile locally.
+      - >-
+        mkdir -p /tmp/flashinfer-glm53
+        && { [ -d /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer-glm53/.cache ]
+        && cp -a /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer-glm53/. /tmp/flashinfer-glm53/ || true; }
+    extra_args: []
+    env:
+      TLLM_LOG_LEVEL: INFO
+      # The cyclic GC must stay on in every process that parses requests: see ENV_DEFAULTS in serve.sh.
+      TRTLLM_SERVER_DISABLE_GC: "0"
+      TRTLLM_DISAGG_SERVER_DISABLE_GC: "0"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      # 8 attached frontends on a context worker re-import the package after
+      # the weight load; 300 s is not always enough.
+      TLLM_FRONTEND_READY_TIMEOUT: "1800"
+      TRTLLM_ENABLE_PDL: "1"
+      TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
+      ENROOT_ALLOW_DEV: "yes"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      TLLM_PROFILE_LOG_RANKS: all
+      TRTLLM_RESPONSES_API_DISABLE_STORE: "1"
+      # Traffic between nodes may use the four InfiniBand HCAs (XDR, one per
+      # GPU; GPU memory is registered through dma-buf): KV crossing racks
+      # moves GPU to GPU over RDMA, KV inside a rack over NVLink (cuda_ipc).
+      # bond0 stays listed for TCP.
+      UCX_TLS: "rc,cuda_ipc,cuda_copy,sm,self,tcp"
+      UCX_NET_DEVICES: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,bond0"
+      TRTLLM_NIXL_NUM_THREADS: "1"
+      # JIT caches on node-local storage, not on /scratch (VAST NFS): FlashInfer
+      # takes a blocking file lock even on a cache hit, and a waiter on this
+      # NFS can block indefinitely after the holder has released it. The
+      # container is named per job, so /tmp persists from post_install to the
+      # workers.
+      FLASHINFER_WORKSPACE_BASE: /tmp/flashinfer-glm53
+      TRITON_CACHE_DIR: /tmp/triton-cache
+      XDG_CACHE_HOME: /tmp/xdg-cache
+    disagg:
+      start_timeout: 7200
+
+  gateway:
+
+  # Run directories and fleet registrations go where the lhr gateway reads
+  # them (its GW_VAR, under the first lhr K3 checkout); request traces go to
+  # the same tree as on jhb.
+  trace:
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM-k3/examples/serve/large_scale_serving/var
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace
+
+# Only the instances that should be running belong here: the gateway's
+# recovery runs `fleetctl up` over this whole list. Ports run 8200-8280, then
+# from 8400, clear of the K3 fleet's 8300-8370 on the same gateway.
+instances:
+  - name: i00
+    port: 8200
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i01
+    port: 8220
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i02
+    port: 8240
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i03
+    port: 8260
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i04
+    port: 8280
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i05
+    port: 8400
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i06
+    port: 8420
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i07
+    port: 8440
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i08
+    port: 8460
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i09
+    port: 8480
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i10
+    port: 8500
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml

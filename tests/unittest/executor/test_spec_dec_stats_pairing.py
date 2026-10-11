@@ -192,6 +192,93 @@ class TestSpecSamplerPairing:
         assert request.py_num_draft_tokens_verified == 0
 
 
+class TestUnsupportedReturnFlagsWarning:
+    """The one-model path drops context/generation logits and log-probs and warns.
+
+    The warning used to live in _request_common_handling, which runs once per
+    decode step, so a single long request logged the same line tens of millions
+    of times; and it was emitted with a "... request %s" template while this
+    logger space-joins its arguments rather than %-substituting them, so the id
+    never filled and a literal %s reached the log. The warning now fires once,
+    at admission, from validate_request, with the id formatted in.
+    """
+
+    class _CapturingLogger:
+        """Mimics tensorrt_llm.logger: space-joins args, does NOT %-substitute."""
+
+        def __init__(self):
+            self.messages = []
+
+        def warning(self, *msg):
+            self.messages.append(" ".join(map(str, msg)))
+
+    @staticmethod
+    def _request(*, ctx=False, gen=False, lp=False, rid=42, sampling_config=None):
+        return SimpleNamespace(
+            py_return_context_logits=ctx,
+            py_return_generation_logits=gen,
+            py_return_log_probs=lp,
+            py_request_id=rid,
+            sampling_config=sampling_config,
+        )
+
+    def test_log_probs_warning_fills_id_and_has_no_literal_percent_s(self, monkeypatch):
+        import tensorrt_llm._torch.speculative.spec_sampler_base as mod
+
+        cap = self._CapturingLogger()
+        monkeypatch.setattr(mod, "logger", cap)
+        SpecSampler._warn_unsupported_return_flags(self._request(lp=True, rid=777))
+
+        assert len(cap.messages) == 1
+        (msg,) = cap.messages
+        assert "%s" not in msg  # the format bug: a literal, unfilled placeholder
+        assert "777" in msg
+        assert msg == (
+            "return_log_probs not supported with speculative decoding, skipping for request 777"
+        )
+
+    def test_no_flags_emits_nothing(self, monkeypatch):
+        import tensorrt_llm._torch.speculative.spec_sampler_base as mod
+
+        cap = self._CapturingLogger()
+        monkeypatch.setattr(mod, "logger", cap)
+        SpecSampler._warn_unsupported_return_flags(self._request(rid=1))
+
+        assert cap.messages == []
+
+    def test_all_three_flags_each_warn_once_with_id(self, monkeypatch):
+        import tensorrt_llm._torch.speculative.spec_sampler_base as mod
+
+        cap = self._CapturingLogger()
+        monkeypatch.setattr(mod, "logger", cap)
+        SpecSampler._warn_unsupported_return_flags(
+            self._request(ctx=True, gen=True, lp=True, rid=9)
+        )
+
+        assert len(cap.messages) == 3
+        assert all("%s" not in m and "9" in m for m in cap.messages)
+        assert [m.split()[0] for m in cap.messages] == [
+            "return_context_logits",
+            "return_generation_logits",
+            "return_log_probs",
+        ]
+
+    def test_validate_request_warns_at_admission_once(self, monkeypatch):
+        # The hoist: validate_request (admission, once per request) is where the
+        # warning now fires. sampling_config=None makes it return right after the
+        # warning, so this needs no penalty/logits-processor setup -- it just
+        # proves the flooding per-step site was replaced by an admission-time one.
+        import tensorrt_llm._torch.speculative.spec_sampler_base as mod
+
+        cap = self._CapturingLogger()
+        monkeypatch.setattr(mod, "logger", cap)
+        sampler = SpecSampler.__new__(SpecSampler)
+        sampler.validate_request(self._request(lp=True, rid=555, sampling_config=None))
+
+        assert len(cap.messages) == 1
+        assert "555" in cap.messages[0] and "%s" not in cap.messages[0]
+
+
 class TestDrafterPadRecordsEffectiveLen:
     def test_pre_padding_count_recorded(self):
         from tensorrt_llm._torch.speculative.drafter import Drafter

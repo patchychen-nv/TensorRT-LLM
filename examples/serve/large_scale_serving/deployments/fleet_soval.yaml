@@ -1,0 +1,94 @@
+# One throwaway instance for validating a rebuilt libtensorrt_llm_nixl_wrapper.so
+# before it goes anywhere near the data-gen fleet.
+#
+# The library being tested adds one log line to NixlTransferAgent::loadRemoteAgent.
+# The rebuild is ABI-identical to the deployed copy by exported symbols and
+# NEEDED entries, but its .text is 7.7 KB smaller than the 2026-09-08 build for
+# reasons that are not explained, so it does not get swapped into
+# tensorrt_llm/libs where every running instance would pick it up on its next
+# restart. Instead this deployment bind-mounts the new file over the old path
+# INSIDE ITS OWN CONTAINERS ONLY. The host file is untouched, other instances
+# are in other mount namespaces, and nothing in flight is disturbed.
+#
+#   ./fleetctl --config deployments/fleet_soval.yaml up
+#   ./fleetctl --config deployments/fleet_soval.yaml down s00
+#
+# Delete this file once the library is either promoted or discarded.
+
+defaults:
+  # Deliberately NOT kffleet. A shared cluster_name is what makes instances
+  # register as backends of one another, so reusing it here would put an
+  # experimental binary into the production gateway's rotation and hand it live
+  # campaign traffic -- the exact opposite of the point.
+  cluster_name: kfsoval
+  repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM
+
+  model:
+    name: glm5.2
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/models/GLM-5.2-NVFP4
+    tool_parser: glm47
+
+  slurm:
+    account: coreai_kf_dev
+    partition: batch_long
+    qos: normal
+    # Hours, not a day: this exists to answer one question and then go away.
+    time: "04:00:00"
+    gpus_per_node: 4
+    extra_args: []
+
+  container:
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084.sqsh
+    mounts:
+      - /scratch/fsw:/scratch/fsw
+      # The whole point of this file. Must come AFTER the /scratch/fsw mount
+      # above, because mounts are applied in order and this one has to land on
+      # top of the directory that already covers the same path.
+      #
+      # A file-over-file mount rather than LD_LIBRARY_PATH: the loader would
+      # honour LD_LIBRARY_PATH ahead of the module's RUNPATH, but it would do
+      # so for every library in that directory, and a directory holding one
+      # .so plus a symlinked nixl/ is a larger change to the link than the one
+      # being tested. This replaces exactly one file.
+      - /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_so_validation/libtensorrt_llm_nixl_wrapper.so:/scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/tensorrt_llm/libs/libtensorrt_llm_nixl_wrapper.so
+
+  server:
+    install_repo: true
+    numactl: "0,1"
+    capture: true
+    extra_args: []
+    env:
+      TLLM_LOG_LEVEL: INFO
+      # The cyclic GC must stay on in every process that parses requests: see ENV_DEFAULTS in serve.sh.
+      TRTLLM_SERVER_DISABLE_GC: "0"
+      TRTLLM_DISAGG_SERVER_DISABLE_GC: "0"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      TRTLLM_ENABLE_PDL: "1"
+      TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
+      ENROOT_ALLOW_DEV: "yes"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      TLLM_PROFILE_LOG_RANKS: all
+
+  trace:
+    # Its own tree, so this run's logs never mix with the fleet's.
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var-soval
+
+    # request_root is deliberately unset. Traces stay under the attempt
+    # directory instead of landing in TRTLLMxKF/trace_data_gen: that tree is
+    # training data, and a validation run's traffic in it would afterwards be
+    # indistinguishable from real campaign traffic.
+
+instances:
+  # 1P1D is the smallest shape that still exercises what is being tested --
+  # a context worker handing KV cache to a generation worker is exactly the
+  # path that calls loadRemoteAgent. Two nodes.
+  #
+  # Port 8600 is clear of the data-gen fleet (8200-8420), the test fleet
+  # (8800-8829), and the ports the node already listens on (8080, 8081, 8900,
+  # 9100, 9200, 9400).
+  - name: s00
+    port: 8600
+    topology: server_configs/glm5.2_disagg_1p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml

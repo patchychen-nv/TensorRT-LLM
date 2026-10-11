@@ -527,8 +527,8 @@ class TransformersTokenizer(TokenizerBase):
                         _HF_DECODE_STREAM_INVALID_PREFIX_ERROR):
                     raise
                 logger.warning(
-                    "HF DecodeStream encountered an invalid prefix while decoding token %d. "
-                    "Resetting the decode stream.", tid)
+                    f"HF DecodeStream encountered an invalid prefix while "
+                    f"decoding token {tid}. Resetting the decode stream.")
                 decode_stream = DecodeStream(
                     skip_special_tokens=skip_special_tokens)
                 states['decode_stream'] = decode_stream

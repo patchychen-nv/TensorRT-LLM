@@ -55,7 +55,9 @@ defaults:
     extra_args: []
     env:
       TLLM_LOG_LEVEL: INFO
-      TRTLLM_SERVER_DISABLE_GC: "1"
+      # The cyclic GC must stay on in every process that parses requests: see ENV_DEFAULTS in serve.sh.
+      TRTLLM_SERVER_DISABLE_GC: "0"
+      TRTLLM_DISAGG_SERVER_DISABLE_GC: "0"
       TRTLLM_WORKER_DISABLE_GC: "1"
       TRTLLM_ENABLE_PDL: "1"
       TRTLLM_ANTHROPIC_LCP_TRACKING: "1"

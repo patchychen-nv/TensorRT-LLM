@@ -502,9 +502,8 @@ class FlashInferTrtllmMLAAttention(AttentionDescriptor):
 
         if cache_dtype != torch.bfloat16:
             ad_logger.warning(
-                "flashinfer_trtllm_mla requires BF16 KV cache; overriding %s to %s.",
-                cache_dtype,
-                torch.bfloat16,
+                f"flashinfer_trtllm_mla requires BF16 KV cache; overriding {cache_dtype} to "
+                f"{torch.bfloat16}."
             )
             cache_dtype = torch.bfloat16
 

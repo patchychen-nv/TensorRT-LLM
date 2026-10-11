@@ -23,17 +23,31 @@ an id it has not seen opened.
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
+from openai.types.responses import (
+    Response,
+    ResponseCompletedEvent,
+    ResponseCreatedEvent,
+    ResponseErrorEvent,
+    ResponseFailedEvent,
+    ResponseInProgressEvent,
+)
 
 from tensorrt_llm.executor import EngineDeadError, RequestError
-from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+from tensorrt_llm.executor.utils import context_length_exceeded_message
+from tensorrt_llm.serve.openai_protocol import ResponsesRequest, ResponsesResponse
 from tensorrt_llm.serve.responses_utils import (
+    ConversationHistoryStore,
+    RelayedResponseSnapshot,
     ResponsesStreamingEventsHelper,
     ResponsesStreamingProcessor,
     _generate_streaming_event,
     classify_stream_termination,
+    create_response_non_store,
     guard_responses_stream,
+    responses_done_generator,
     stream_error_event,
 )
 
@@ -237,6 +251,133 @@ def _output_text(text):
 
 
 # ---------------------------------------------------------------------------
+# Every content part that is opened must close, in OpenAI's order
+#
+# A part is opened with response.content_part.added and has to end with
+# response.content_part.done before its item's response.output_item.done.
+# The message close has always done this; the reasoning close yielded
+# reasoning_text.done and output_item.done but never closed the part it had
+# opened - one more content_part.added than content_part.done on every turn
+# with reasoning, ~294k unpaired events a week - so a client tracking part
+# state held a reasoning part that never ended.
+# ---------------------------------------------------------------------------
+
+
+def _event_stream(chunks, request=None, tool_parser_id=None):
+    """All events the real dispatch emits for a sequence of chunks."""
+    helper = ResponsesStreamingEventsHelper()
+    parsers, tool_parsers = {}, {}
+    events, accumulated = [], ""
+    for i, chunk in enumerate(chunks):
+        accumulated += chunk
+        events.extend(
+            _generate_streaming_event(
+                output=_FakeOutput(accumulated, chunk),
+                request=request or _FakeRequest(),
+                finished_generation=(i == len(chunks) - 1),
+                streaming_events_helper=helper,
+                reasoning_parser_id="glm",
+                tool_parser_id=tool_parser_id,
+                reasoning_parser_dict=parsers,
+                tool_parser_dict=tool_parsers,
+            )
+        )
+    return events
+
+
+class _FakeToolRequest:
+    """A request declaring the one tool the GLM call below names."""
+
+    tool_choice = "auto"
+
+    def __init__(self):
+        from openai.types.responses.tool import FunctionTool
+
+        self.tools = [
+            FunctionTool(
+                name="exec",
+                type="function",
+                strict=False,
+                parameters={"type": "object", "properties": {"input": {"type": "string"}}},
+            )
+        ]
+
+
+def _assert_reasoning_part_closes(events, reasoning_text):
+    kinds = [getattr(e, "type", "") for e in events]
+    assert kinds.count("response.content_part.added") == kinds.count(
+        "response.content_part.done"
+    ), "every part opened must close"
+
+    # The reasoning item's own closing sequence, in OpenAI's order:
+    # reasoning_text.done, then content_part.done, then output_item.done.
+    done_index = kinds.index("response.reasoning_text.done")
+    assert kinds[done_index + 1] == "response.content_part.done"
+    assert kinds[done_index + 2] == "response.output_item.done"
+
+    part_done = events[done_index + 1]
+    assert part_done.part.type == "reasoning_text"
+    assert part_done.part.text == reasoning_text
+    # The part closes under the id of the item it was opened in.
+    reasoning_done = events[done_index + 2]
+    assert reasoning_done.item.type == "reasoning"
+    assert part_done.item_id == reasoning_done.item.id
+
+
+def test_a_reasoning_part_closed_by_the_answer_gets_content_part_done():
+    """The transition close (_close_open_item): reasoning ends, text begins."""
+    events = _event_stream(["Plan the fix.", "</think>", "Done."])
+    _assert_reasoning_part_closes(events, "Plan the fix.")
+
+
+def test_a_reasoning_part_closed_by_a_tool_call_gets_content_part_done():
+    """The third close: `</think>` followed directly by a call, no answer text.
+
+    The call's announcement closes the reasoning item through the same
+    `_close_open_item` branch the answer takes; nothing pinned that path
+    before. The reasoning item closes before the call item opens, and no
+    empty message is invented between them.
+    """
+    events = _event_stream(
+        [
+            "Plan the fix.",
+            "</think>",
+            "<tool_call>exec<arg_key>",
+            "input</arg_key><arg_value>ls</arg_value></tool_call>",
+        ],
+        request=_FakeToolRequest(),
+        tool_parser_id="glm47",
+    )
+    _assert_reasoning_part_closes(events, "Plan the fix.")
+
+    kinds = [getattr(e, "type", "") for e in events]
+    added = [e.item.type for e in events if e.type == "response.output_item.added"]
+    assert added == ["reasoning", "function_call"]
+    # Closed by the call's announcement, before generation ended: the
+    # reasoning item's done precedes the call item's added.
+    reasoning_done = kinds.index("response.output_item.done")
+    assert events[reasoning_done].item.type == "reasoning"
+    assert reasoning_done < kinds.index("response.output_item.added", reasoning_done)
+
+
+def test_a_reasoning_part_closed_by_end_of_generation_gets_content_part_done():
+    """The other closing branch: generation ends inside the reasoning item."""
+    events = _event_stream(["All reasoning, no answer."])
+    _assert_reasoning_part_closes(events, "All reasoning, no answer.")
+
+
+def test_message_part_pairing_is_unchanged():
+    """The branch that was always right, pinned against regression."""
+    events = _event_stream(["Plan.", "</think>", "Done."])
+    kinds = [getattr(e, "type", "") for e in events]
+    text_done = kinds.index("response.output_text.done")
+    assert kinds[text_done + 1] == "response.content_part.done"
+    assert kinds[text_done + 2] == "response.output_item.done"
+    assert events[text_done + 1].part.type == "output_text"
+    assert events[text_done + 1].part.text == "Done."
+
+
+# ---------------------------------------------------------------------------
 # Streams that stop before response.completed
 #
 # response.completed is the only event that repeats the full text, so a stream
@@ -400,7 +541,9 @@ async def test_a_broken_reporter_does_not_replace_the_original_fault():
         raise ValueError("the fault worth seeing")
 
     seen, raised = await _drive(source(), broken)
-    assert len(seen) == 1
+    # The broken reporter is replaced by the bare error event rather than by
+    # nothing; see test_a_stream_whose_snapshot_cannot_be_built_still_ends_in_an_error.
+    assert [_event_type(frame) for frame in seen] == ["response.created", "error"]
     assert isinstance(raised, ValueError)
     assert str(raised) == "the fault worth seeing"
 
@@ -468,6 +611,29 @@ def test_the_failed_snapshot_says_failed_and_carries_no_content():
     assert response["id"] == processor.request.request_id
 
 
+def test_an_overflow_fails_the_stream_with_the_code_clients_act_on():
+    """An input the context window cannot hold fails as context_length_exceeded.
+
+    That is the code OpenAI fails such a response with, and the one Codex reads
+    as a full context window (it compacts before the next turn); server_error
+    reads as a transient fault.
+    """
+    processor = _processor()
+    processor.get_initial_responses()
+    detail = f"RequestError: {context_length_exceeded_message(8, 9)}"
+    _, failed = processor.get_stream_failed_events("engine_error", detail)
+
+    assert _event_type(failed) == "response.failed"
+    response = _event_data(failed)["response"]
+    assert response["status"] == "failed"
+    # The SDK model may carry more optional keys (e.g. misalignment); the two
+    # a client acts on are the contract.
+    assert (response["error"]["code"], response["error"]["message"]) == (
+        "context_length_exceeded",
+        detail,
+    )
+
+
 @pytest.mark.asyncio
 async def test_the_relayed_terminal_event_is_numbered_from_the_frames_forwarded():
     """The orchestrator forwards bytes and never sees the events it carries.
@@ -510,6 +676,102 @@ async def test_a_relay_that_never_started_reports_sequence_zero():
     assert _event_data(seen[0])["code"] == "internal_error"
 
 
+@pytest.mark.asyncio
+async def test_a_cut_relay_ends_with_error_then_response_failed():
+    """The relay ends a cut stream the way the worker ends one of its own.
+
+    A worker killed mid-stream (a preempted job, say) leaves the relay with a
+    transport error and no terminal event. The worker's opening
+    `response.created` already carried the snapshot, so the relay sends
+    `error` and then `response.failed` for that response: failed, no
+    content, the cause in `error`.
+    """
+    processor = _processor()
+    created, in_progress = processor.get_initial_responses()
+
+    async def source():
+        yield created.encode("utf-8")
+        yield in_progress.encode("utf-8")
+        yield b"event: response.output_text.delta\ndata: {}\n\n"
+        raise RuntimeError("upstream cut")
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert isinstance(raised, RuntimeError)
+    error, failed = seen[-2:]
+    assert _event_type(error) == "error"
+    assert _event_data(error)["sequence_number"] == 3
+    assert _event_type(failed) == "response.failed"
+    payload = _event_data(failed)
+    assert payload["sequence_number"] == 4
+    response = payload["response"]
+    assert response["id"] == processor.request.request_id
+    assert response["status"] == "failed"
+    assert response["output"] == []
+    assert (response["error"]["code"], response["error"]["message"]) == (
+        "server_error",
+        "RuntimeError: upstream cut",
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_relayed_snapshot_is_found_across_a_split_read():
+    """A transport read can end anywhere inside the opening event."""
+    processor = _processor()
+    created, _ = processor.get_initial_responses()
+    raw = created.encode("utf-8")
+
+    async def source():
+        yield raw[:17]
+        yield raw[17:]
+        raise RuntimeError("upstream cut")
+
+    snapshot = RelayedResponseSnapshot()
+    seen, _ = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert [_event_type(frame) for frame in seen[-2:]] == ["error", "response.failed"]
+    assert _event_data(seen[-1])["response"]["id"] == processor.request.request_id
+
+
+@pytest.mark.asyncio
+async def test_a_relay_without_a_snapshot_still_ends_on_the_bare_error():
+    """Failures that never reached a worker have no snapshot to fail."""
+
+    async def source():
+        raise RuntimeError("no context worker available")
+        yield b""  # pragma: no cover - makes this an async generator
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert isinstance(raised, RuntimeError)
+    assert [_event_type(frame) for frame in seen] == ["error"]
+    assert _event_data(seen[0])["sequence_number"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_completed_relay_is_untouched_by_the_snapshot():
+    """Recording the snapshot must not change a stream that completes."""
+    processor = _processor()
+    created, in_progress = processor.get_initial_responses()
+    frames = [
+        created.encode("utf-8"),
+        in_progress.encode("utf-8"),
+        b"event: response.completed\ndata: {}\n\n",
+    ]
+
+    async def source():
+        for frame in frames:
+            yield frame
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert raised is None
+    assert seen == frames
+
+
 # ---------------------------------------------------------------------------
 # Order of the items in the completed-response snapshot
 #
@@ -549,7 +811,7 @@ def _snapshot_kinds(text, tools=None):
     """
     from tensorrt_llm.serve.responses_utils import _create_output_content
 
-    items, _messages = _create_output_content(
+    items, _messages, _reasoning_texts = _create_output_content(
         _FakeRequestOutput(text),
         reasoning_parser="qwen3",
         tool_parser="qwen3" if tools else None,
@@ -640,9 +902,522 @@ def test_snapshot_order_matches_the_streamed_order():
             if getattr(event, "type", "") == "response.output_item.done":
                 streamed.append(event.item.type)
 
-    snapshot_items, _messages = _create_output_content(
+    snapshot_items, _messages, _reasoning_texts = _create_output_content(
         _FakeRequestOutput(accumulated), reasoning_parser="glm"
     )
 
     assert streamed == ["reasoning", "message"]
     assert [item.type for item in snapshot_items] == streamed
+
+
+def _finished_generation(text):
+    """A result complete enough to assemble a whole final response from.
+
+    `_create_output_content` reads only index and text, which is all
+    `_FakeRequestOutput` carries; building the response around it also reads
+    `finish_reason`, and usage reads `token_ids` and `prompt_token_ids`.
+    """
+    output = SimpleNamespace(
+        index=0,
+        text=text,
+        text_diff=text,
+        finish_reason="stop",
+        token_ids=[1, 2, 3],
+        disaggregated_params=None,
+    )
+    return SimpleNamespace(outputs=[output], prompt_token_ids=[1, 2], cached_tokens=0)
+
+
+def test_final_response_is_assembled_without_touching_a_missing_attribute():
+    """Regression: the final streaming event raised AttributeError.
+
+    `get_final_response_non_store` reached for `self.emitted_tool_call_ids`
+    on the processor. That list lives on the events helper's state tracker,
+    not on the processor, so every streaming Responses request died building
+    its last event. The client never saw a server error -- the chunked body
+    simply stopped, surfacing as `TransferEncodingError: Not enough data to
+    satisfy transfer length header` one hop upstream, which reads like a
+    network fault. Measured on a live instance: 286 of 287 requests.
+
+    `py_compile` passes on that bug, and so does an md5 comparison against the
+    file it came from. Only executing the call catches it, which is what this
+    test does: it asks for the final event and requires a real one back.
+    """
+    processor = _processor()
+    frame = processor.get_final_response_non_store(_finished_generation("hello"))
+
+    assert "response.completed" in frame
+    payload = _event_data(frame)
+    assert payload["type"] == "response.completed"
+    assert payload["response"]["status"] == "completed"
+
+
+def test_final_response_reuses_the_call_ids_the_stream_published():
+    """The ids a client matches its tool outputs against must not be reminted.
+
+    `response.completed` rebuilds `output` from the generation, and
+    `_tool_call_output_item` mints a fresh random id every time it runs, so
+    the snapshot used to disagree with the stream on every call -- 1224 of
+    1224 measured before the fix. A client keying tool results off the
+    streamed `call_id` then matches nothing in the final response.
+    """
+    processor = _processor()
+    helper = processor.streaming_events_helper
+    helper.record_emitted_tool_call(SimpleNamespace(id="fc_fixed", call_id="call_fixed"))
+
+    assert [(r.item_id, r.call_id) for r in helper.emitted_tool_call_ids] == [
+        ("fc_fixed", "call_fixed")
+    ]
+    # And the processor reaches it by the path the final response uses.
+    assert [
+        (r.item_id, r.call_id) for r in processor.streaming_events_helper.emitted_tool_call_ids
+    ] == [("fc_fixed", "call_fixed")]
+
+
+def _processor_with_tools():
+    """A processor that can actually produce a tool call.
+
+    `_processor()` declares no tools and sets no parsers, so nothing it builds
+    ever contains one -- which is the case the next test needs.
+    """
+    request = ResponsesRequest(model="test-model", input="hi", stream=True, tools=_tools())
+    return ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+        reasoning_parser="glm",
+        tool_parser="qwen3",
+    )
+
+
+def test_final_response_reuses_a_streamed_call_id_end_to_end():
+    """The invariant the fix exists for, driven through the real final event.
+
+    This is the test that distinguishes the fix from the obvious-looking wrong
+    one. `AttributeError: no attribute 'emitted_tool_call_ids'` invites adding
+    the attribute to the processor -- the name would resolve and the crash
+    would stop. But `record_emitted_tool_call` appends to the state tracker's
+    list, so a new list on the processor stays empty forever, the final
+    response mints fresh ids, and the call_id mismatch is silently back.
+
+    The crash tests pass in that world. This one does not.
+    """
+    processor = _processor_with_tools()
+    processor.streaming_events_helper.record_emitted_tool_call(
+        SimpleNamespace(id="fc_streamed", call_id="call_streamed")
+    )
+
+    frame = processor.get_final_response_non_store(
+        _finished_generation(f"<think>{_THINK}</think>{_TOOL_CALL}")
+    )
+    calls = [
+        i
+        for i in _event_data(frame)["response"]["output"]
+        if i["type"] in ("function_call", "custom_tool_call")
+    ]
+
+    assert calls, "the final response should carry the tool call"
+    assert calls[0]["call_id"] == "call_streamed"
+    assert calls[0]["id"] == "fc_streamed"
+
+
+def test_nothing_streamed_means_fresh_ids_rather_than_a_crash():
+    """The other half: an empty list is a legal state, not an error.
+
+    A non-streaming request, or a stream cut off before any tool call, has
+    nothing to reuse. That must produce usable fresh ids -- keeping this
+    separate is what makes the test above read as "ids were not reused"
+    instead of "ids were missing".
+    """
+    processor = _processor_with_tools()
+    frame = processor.get_final_response_non_store(
+        _finished_generation(f"<think>{_THINK}</think>{_TOOL_CALL}")
+    )
+    calls = [
+        i
+        for i in _event_data(frame)["response"]["output"]
+        if i["type"] in ("function_call", "custom_tool_call")
+    ]
+
+    assert calls
+    assert calls[0]["call_id"].startswith("call_")
+    assert calls[0]["call_id"] != "call_streamed"
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming rebuild: no phantom {}-argument calls
+# ---------------------------------------------------------------------------
+#
+# The whole-text parse reports arguments `{}` both for a genuine zero-argument
+# call and for a call whose argument markup its pair regex could not read - a
+# GLM-4.7 block that opens <arg_value> and never closes it. The streamed
+# assembly of the same text refuses the second (its arguments assemble to
+# `{"cmd": }`), so a non-streaming request used to deliver a call the model
+# never made while a streaming request of the same text delivered none.
+# _verify_empty_calls_against_streaming reconciles the two when no stream ran.
+
+
+def _glm47_tools():
+    from openai.types.responses.tool import FunctionTool
+
+    return [
+        FunctionTool(
+            name="exec_command",
+            description="Run a command.",
+            parameters={"type": "object", "properties": {"cmd": {"type": "string"}}},
+            strict=False,
+            type="function",
+        ),
+        FunctionTool(
+            name="get_time", description="Now.", parameters=None, strict=False, type="function"
+        ),
+    ]
+
+
+def _glm47_snapshot(text, streamed_tool_call_ids=None):
+    from tensorrt_llm.serve.responses_utils import _create_output_content
+
+    items, _messages, _reasoning_texts = _create_output_content(
+        _FakeRequestOutput(text),
+        reasoning_parser=None,
+        tool_parser="glm47",
+        tools=_glm47_tools(),
+        streamed_tool_call_ids=streamed_tool_call_ids,
+    )
+    calls = [(i.name, i.arguments) for i in items if i.type == "function_call"]
+    texts = [i.content[0].text for i in items if i.type == "message"]
+    return calls, texts
+
+
+_UNREADABLE_ARGS = (
+    "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>ls -la</think></tool_call>"
+)
+
+
+def test_non_streaming_unreadable_arg_markup_is_text_not_an_empty_call():
+    """The auditor's shape: terminated call, <arg_value> never closed.
+
+    The pair regex reads nothing out of the block, so the call used to ship
+    with arguments `{}` - and the client ran the tool with arguments the model
+    never wrote. The streamed view refuses the call; the whole-text view now
+    agrees, and the markup falls back into the message text so nothing the
+    model generated is lost.
+    """
+    calls, texts = _glm47_snapshot("Let me check. " + _UNREADABLE_ARGS)
+    assert calls == []
+    assert texts and "<arg_value>ls -la</think>" in texts[0]
+    assert texts[0].startswith("Let me check.")
+
+
+def test_non_streaming_unterminated_markup_stays_text():
+    """Pin: markup with no closing tag already fell back to text on both views."""
+    unterminated = "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>ls -la"
+    calls, texts = _glm47_snapshot(unterminated)
+    assert calls == []
+    assert texts == [unterminated]
+
+
+def test_non_streaming_zero_argument_call_is_still_delivered():
+    """Pin: `{}` from a genuinely argument-free call is the model's own call."""
+    calls, texts = _glm47_snapshot("<tool_call>get_time</tool_call>")
+    assert calls == [("get_time", "{}")]
+    assert texts == []
+
+
+def test_non_streaming_real_call_survives_a_phantom_neighbor():
+    good = (
+        "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pytest -q</arg_value></tool_call>"
+    )
+    calls, _texts = _glm47_snapshot(good + _UNREADABLE_ARGS)
+    assert calls == [("exec_command", '{"cmd": "pytest -q"}')]
+
+
+def test_a_streamed_rebuild_is_untouched_by_the_reconciler():
+    """A streamed request keeps its entity-pairing semantics.
+
+    When a stream ran, the per-entity id record already settles the drop, and
+    the snapshot must keep describing the stream - which showed neither the
+    call nor its markup.
+    """
+    calls, texts = _glm47_snapshot(_UNREADABLE_ARGS, streamed_tool_call_ids=[None])
+    assert calls == []
+    assert texts == []
+
+
+# ---------------------------------------------------------------------------
+# The response snapshot has to survive the wire
+#
+# Every response.* event embeds a whole snapshot of the response, and the SDK
+# event model re-validates it as the event is built. A snapshot it rejects
+# raises while the stream is already open - after the HTTP 200 went out - and
+# when the opening snapshot is the one rejected, the stream ends having sent
+# nothing at all. Each frame below is therefore checked the way a client's SDK
+# reads it, not only against our own model, which is what was wrong.
+# ---------------------------------------------------------------------------
+
+_SDK_EVENT_TYPES = {
+    "response.created": ResponseCreatedEvent,
+    "response.in_progress": ResponseInProgressEvent,
+    "response.completed": ResponseCompletedEvent,
+    "response.failed": ResponseFailedEvent,
+    "error": ResponseErrorEvent,
+}
+
+
+def _validated(frame):
+    """One SSE frame, validated by the openai SDK model for its event type."""
+    return _SDK_EVENT_TYPES[_event_type(frame)].model_validate(_event_data(frame))
+
+
+def _processor_for(request):
+    return ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+    )
+
+
+def _non_streaming_response(request, text="hello"):
+    """The response the non-streaming path builds for one finished generation."""
+    return create_response_non_store(
+        generation_result=_finished_generation(text),
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+    )
+
+
+# Request fields that accept an explicit JSON null, echoed into response
+# fields that do not.
+_NULLABLE_ECHOED_FIELDS = ("background", "parallel_tool_calls", "top_logprobs", "truncation")
+
+
+def _request_with_nulls(**overrides):
+    """A request sending every one of those fields as an explicit JSON null."""
+    return ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": "hi",
+            **dict.fromkeys(_NULLABLE_ECHOED_FIELDS),
+            **overrides,
+        }
+    )
+
+
+def _echoed(response):
+    return {name: getattr(response, name) for name in _NULLABLE_ECHOED_FIELDS}
+
+
+def test_explicit_nulls_echo_what_omitting_the_fields_would():
+    """Regression: an explicit null passed the request schema, then failed the response.
+
+    The four fields accept null on the request and were copied verbatim into a
+    response model that requires a value, so the request validated, the whole
+    generation ran, and only building the reply failed. Null means "not
+    specified": the echo has to be exactly what omitting the field produces.
+    """
+    with_nulls = _non_streaming_response(_request_with_nulls())
+    omitted = _non_streaming_response(ResponsesRequest(model="test-model", input="hi"))
+
+    assert _echoed(with_nulls) == _echoed(omitted)
+    # The body the server sends must pass the SDK's own model too.
+    Response.model_validate(with_nulls.model_dump(by_alias=True))
+
+
+def test_explicit_values_are_still_echoed_verbatim():
+    """The other half: only a null is defaulted, never a value the client chose."""
+    chosen = {
+        "background": True,
+        "parallel_tool_calls": True,
+        "top_logprobs": 3,
+        "truncation": "auto",
+    }
+    response = _non_streaming_response(ResponsesRequest(model="test-model", input="hi", **chosen))
+    assert _echoed(response) == chosen
+
+
+@pytest.mark.asyncio
+async def test_explicit_nulls_still_open_the_stream():
+    """Regression: the same nulls ended a stream as HTTP 200 with zero events.
+
+    The opening response.created snapshot failed to build, the guard's
+    response.failed snapshot then failed the same way, and the guard sent
+    nothing in its place.
+    """
+    processor = _processor_for(_request_with_nulls(stream=True))
+
+    async def source():
+        # The server's streaming generator opens with exactly this call.
+        for frame in processor.get_initial_responses():
+            yield frame
+
+    seen, raised = await _drive(source(), processor.get_stream_failed_events)
+
+    assert raised is None
+    assert [_event_type(frame) for frame in seen] == ["response.created", "response.in_progress"]
+    omitted = _processor_for(ResponsesRequest(model="test-model", input="hi", stream=True))
+    assert _echoed(_validated(seen[0]).response) == _echoed(
+        _validated(omitted.get_initial_responses()[0]).response
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_stream_whose_snapshot_cannot_be_built_still_ends_in_an_error(monkeypatch):
+    """The guard's last resort: a stream must never end as an empty 200.
+
+    response.failed embeds a snapshot, and when the snapshot is what cannot
+    be built - the very fault that ended the stream, if it was the opening one
+    that failed - the guard logged it and sent nothing: HTTP 200, no events,
+    indistinguishable from a stream still in flight. The flat error event
+    needs no snapshot, so that goes out instead.
+    """
+    processor = _processor()
+
+    def unbuildable(cls, **kwargs):
+        raise ValueError("snapshot rejected")
+
+    monkeypatch.setattr(ResponsesResponse, "from_request", classmethod(unbuildable))
+
+    async def source():
+        for frame in processor.get_initial_responses():
+            yield frame
+
+    seen, raised = await _drive(source(), processor.get_stream_failed_events)
+
+    assert [_event_type(frame) for frame in seen] == ["error"]
+    error = _validated(seen[0])
+    assert error.code == "internal_error"
+    assert error.message == "ValueError: snapshot rejected"
+    assert error.sequence_number == 0
+    # Still re-raised: the trace records an error, not a clean finish.
+    assert isinstance(raised, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_exception_text_no_encoder_accepts_still_reaches_the_client():
+    """The one input the terminal events take from outside is the exception text.
+
+    A lone surrogate in it - bytes decoded with surrogateescape - fails every
+    JSON encoder, so the error event, the failed snapshot and the bare fallback
+    all failed to serialize and the stream ended on nothing again.
+    """
+    processor = _processor()
+
+    async def source():
+        for frame in processor.get_initial_responses():
+            yield frame
+        raise ValueError("cannot read /tmp/\udcff")
+
+    seen, raised = await _drive(source(), processor.get_stream_failed_events)
+
+    assert [_event_type(frame) for frame in seen] == [
+        "response.created",
+        "response.in_progress",
+        "error",
+        "response.failed",
+    ]
+    assert _validated(seen[2]).message == "ValueError: cannot read /tmp/\\udcff"
+    assert isinstance(raised, ValueError)
+
+
+_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {"value": {"type": "integer"}},
+    "required": ["value"],
+}
+
+
+def _json_schema_request(stream=False):
+    return ResponsesRequest(
+        model="test-model",
+        input="hi",
+        stream=stream,
+        text={"format": {"type": "json_schema", "name": "answer", "schema": _JSON_SCHEMA}},
+    )
+
+
+def _assert_wire_schema(response):
+    """`text.format` as a client must receive it: the schema under `schema`.
+
+    pydantic will not let a model have a field called `schema`, so the format
+    keeps it as `schema_` aliased to `schema`; any dump without by_alias emits
+    the internal name, which the SDK rejects and the API does not have.
+    """
+    text_format = response["text"]["format"]
+    assert "schema_" not in text_format
+    assert text_format["schema"] == _JSON_SCHEMA
+
+
+def test_a_json_schema_format_survives_the_opening_events():
+    """Regression: structured output ended the stream before it began.
+
+    The created/in_progress snapshot was dumped without by_alias, the SDK
+    event rejected it for a missing `schema`, and the client got a 200 with
+    no events. Fixing that dump alone is not enough: the SDK event serializes
+    by python name too, so the frame still carried `schema_`.
+    """
+    frames = _processor_for(_json_schema_request(stream=True)).get_initial_responses()
+
+    assert [_event_type(frame) for frame in frames] == ["response.created", "response.in_progress"]
+    for frame in frames:
+        _assert_wire_schema(_event_data(frame)["response"])
+        assert _validated(frame).response.text.format.schema_ == _JSON_SCHEMA
+
+
+def test_a_json_schema_format_survives_the_completed_event():
+    processor = _processor_for(_json_schema_request(stream=True))
+    frame = processor.get_final_response_non_store(_finished_generation('{"value": 42}'))
+
+    assert _event_type(frame) == "response.completed"
+    _assert_wire_schema(_event_data(frame)["response"])
+    assert _validated(frame).response.status == "completed"
+
+
+def test_a_json_schema_format_survives_the_failed_event():
+    processor = _processor_for(_json_schema_request(stream=True))
+    _error, failed = processor.get_stream_failed_events("internal_error", "ValueError: x")
+
+    assert _event_type(failed) == "response.failed"
+    _assert_wire_schema(_event_data(failed)["response"])
+    assert _validated(failed).response.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_response_keeps_its_wire_names():
+    """responses_done_generator re-streams a finished response from the same dump."""
+    response = _non_streaming_response(_json_schema_request(), text='{"value": 42}')
+    frames = [frame async for frame in responses_done_generator(response)]
+
+    assert [_event_type(frame) for frame in frames] == [
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+    ]
+    for frame in frames:
+        _assert_wire_schema(_event_data(frame)["response"])
+        _validated(frame)
+
+
+@pytest.mark.asyncio
+async def test_a_stored_response_is_retrieved_under_its_wire_names():
+    """Regression: GET /v1/responses/{id} returned `schema_`.
+
+    The POST path dumps with by_alias, beside a comment naming exactly this
+    bug; retrieval hands back the same stored object and was missed.
+    """
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    response = _non_streaming_response(_json_schema_request(), text='{"value": 42}')
+    server = object.__new__(OpenAIServer)
+    server.enable_store = True
+    server.conversation_store = ConversationHistoryStore()
+    await server.conversation_store.store_response(resp=response, resp_msgs=[])
+
+    reply = await server.openai_responses_get_response(response.id)
+
+    body = json.loads(reply.body)
+    _assert_wire_schema(body)
+    assert Response.model_validate(body).text.format.schema_ == _JSON_SCHEMA

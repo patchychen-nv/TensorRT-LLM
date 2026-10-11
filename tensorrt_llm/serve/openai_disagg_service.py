@@ -93,7 +93,8 @@ def _ctx_usage_info(response: UCompletionResponse) -> Optional[UsageInfo]:
         completion_tokens=usage.output_tokens,
         total_tokens=usage.total_tokens,
         prompt_tokens_details=PromptTokensDetails(
-            cached_tokens=getattr(cached, "cached_tokens", 0) or 0),
+            cached_tokens=getattr(cached, "cached_tokens", 0) or 0
+        ),
     )
 
 
@@ -275,7 +276,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                 "'store' is ignored on a disaggregated server: response "
                 "storage is per-worker in-process state and this orchestrator "
                 "exposes no route to read a stored response back. The request "
-                "is served normally; nothing is persisted.")
+                "is served normally; nothing is persisted."
+            )
 
         return await self._send_disagg_request(request, hooks)
 
@@ -324,7 +326,16 @@ class OpenAIDisaggregatedService(OpenAIService):
                     if hooks:
                         hooks.on_disagg_request_id(disagg_request_id)
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
-            except Exception:
+            except (asyncio.CancelledError, Exception):
+                # CancelledError is caught alongside Exception because a
+                # downstream client disconnect arrives exactly here: the server
+                # cancels the pipeline while it sits in the ctx send_request
+                # await above (the whole prefill lives in that await). The
+                # reserved generation slot must be released on that exit as
+                # much as on an error, or conditional disagg leaks the
+                # reservation's coordinator-side load. Re-raised either way:
+                # a cancellation must keep unwinding, an error must keep its
+                # meaning.
                 if gen_server:
                     await self._gen_router.finish_request(
                         request, success=False, req_id=gen_reservation_id
@@ -620,7 +631,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                     hooks=hooks,
                     req_id=disagg_request_id,
                 )
-            except Exception:
+            except (asyncio.CancelledError, Exception):
+                # CancelledError included: a client disconnect cancels this
+                # coroutine while it waits on the ctx POST, and the eagerly
+                # started gen consumer would otherwise keep pumping a stream
+                # nobody reads.
                 consume_task.cancel()
                 try:
                     await consume_task

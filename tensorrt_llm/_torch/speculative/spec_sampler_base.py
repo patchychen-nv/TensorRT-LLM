@@ -101,6 +101,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         instead. Raised from validate_request (request admission), so only the
         offending request fails rather than the whole executor step.
         """
+        # Warn once, at admission, about return flags the one-model path drops.
+        # Kept ahead of the sampling_config early-return so it covers the same
+        # requests the old per-step check in _request_common_handling did.
+        self._warn_unsupported_return_flags(request)
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
@@ -183,6 +187,37 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 "speculative decoding."
             )
 
+    @staticmethod
+    def _warn_unsupported_return_flags(request: LlmRequest) -> None:
+        """Warn once per request about return flags the one-model path ignores.
+
+        Context/generation logits and log-probs have no buffer in the one-model
+        sampling kernels, so they are silently dropped -- the request still
+        decodes, which is why this warns rather than raises. It lives in the
+        admission hook (validate_request runs once per request); the identical
+        check used to sit in _request_common_handling, which runs once per
+        decode step, so a single long request logged the same line tens of
+        millions of times (51M+ in one run). The id is formatted into the
+        message with an f-string because this logger space-joins its arguments
+        rather than %-substituting them, so the old "... request %s" template
+        reached the log with a literal, unfilled %s.
+        """
+        if request.py_return_context_logits:
+            logger.warning(
+                "return_context_logits not supported with speculative decoding, "
+                f"skipping for request {request.py_request_id}"
+            )
+        if request.py_return_generation_logits:
+            logger.warning(
+                "return_generation_logits not supported with speculative decoding, "
+                f"skipping for request {request.py_request_id}"
+            )
+        if request.py_return_log_probs:
+            logger.warning(
+                "return_log_probs not supported with speculative decoding, "
+                f"skipping for request {request.py_request_id}"
+            )
+
     @dataclass(kw_only=True)
     class Store:
         """Storage for speculative decoding tensors."""
@@ -263,24 +298,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens: list[list[int]],
         runtime_draft_len: Optional[int],
     ) -> None:
-        """Common handling for both context and generation requests."""
-        if request.py_return_context_logits:
-            logger.warning(
-                "return_context_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_generation_logits:
-            logger.warning(
-                "return_generation_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_log_probs:
-            logger.warning(
-                "return_log_probs not supported with speculative decoding, skipping for request %s",
-                request.py_request_id,
-            )
+        """Common handling for both context and generation requests.
+
+        Runs once per decode step per request and must stay hot. The warnings
+        about unsupported return flags (context/generation logits, log-probs)
+        used to live here and so repeated every step; they now warn once at
+        admission in validate_request via _warn_unsupported_return_flags.
+        """
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 

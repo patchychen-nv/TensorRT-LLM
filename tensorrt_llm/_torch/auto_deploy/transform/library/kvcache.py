@@ -699,32 +699,25 @@ class InsertCachedMLAAttention(_InsertCachedOperator):
         capability = torch.cuda.get_device_capability()
         if capability < (9, 0):
             ad_logger.warning(
-                "Falling back from flashinfer_mla to torch_mla because compute capability %s "
-                "is below Hopper.",
-                capability,
+                f"Falling back from flashinfer_mla to torch_mla because compute capability "
+                f"{capability} is below Hopper."
             )
             return "torch_mla"
 
         if kv_lora_rank != 512 or qk_rope_head_dim != 64:
             if capability >= (10, 0) and kv_lora_rank == 256 and qk_rope_head_dim == 64:
                 ad_logger.warning(
-                    "Switching MLA backend from flashinfer_mla to flashinfer_trtllm_mla for "
-                    "Blackwell rank-256 decode support (kv_lora_rank=%d, qk_rope_head_dim=%d, "
-                    "compute capability=%s).",
-                    kv_lora_rank,
-                    qk_rope_head_dim,
-                    capability,
+                    f"Switching MLA backend from flashinfer_mla to flashinfer_trtllm_mla for "
+                    f"Blackwell rank-256 decode support (kv_lora_rank={kv_lora_rank}, "
+                    f"qk_rope_head_dim={qk_rope_head_dim}, compute capability={capability})."
                 )
                 return "flashinfer_trtllm_mla"
 
             ad_logger.warning(
-                "Falling back from flashinfer_mla to torch_mla for unsupported MLA shape "
-                "(kv_lora_rank=%d, qk_rope_head_dim=%d) on compute capability %s. "
-                "The current AutoDeploy FlashInfer MLA path only supports kv_lora_rank=512 "
-                "and qk_rope_head_dim=64.",
-                kv_lora_rank,
-                qk_rope_head_dim,
-                capability,
+                f"Falling back from flashinfer_mla to torch_mla for unsupported MLA shape "
+                f"(kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}) on compute "
+                f"capability {capability}. The current AutoDeploy FlashInfer MLA path only "
+                f"supports kv_lora_rank=512 and qk_rope_head_dim=64."
             )
             return "torch_mla"
 

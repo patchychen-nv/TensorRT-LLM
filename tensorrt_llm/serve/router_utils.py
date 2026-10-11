@@ -261,10 +261,8 @@ class BlockHashMixin:
                 self._model_types[model_path] = resolve_model_type_from_config(model_path)
             except (OSError, ValueError) as error:
                 logger.warning(
-                    "Unable to resolve model type from checkpoint config at %s: %s. "
-                    "Set use_harmony explicitly if the checkpoint uses Harmony.",
-                    model_path,
-                    error,
+                    f"Unable to resolve model type from checkpoint config at {model_path}: {error}"
+                    f". Set use_harmony explicitly if the checkpoint uses Harmony."
                 )
                 self._model_types[model_path] = None
         return self._model_types[model_path]

@@ -24,26 +24,45 @@ whole feature inert. Two JSONL files per UTC hour::
 """
 
 import asyncio
+import contextlib
+import functools
 import json
 import os
 import re
+import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.conversation_id import (
-    extract_conversation_id_from_body,
-    extract_conversation_id_from_headers,
-)
+from tensorrt_llm.serve.conversation_id import find_conversation_id
 
 REQUEST_TRACE_DIR_ENV = "TRTLLM_REQUEST_TRACE_DIR"
 
 _WRITER_QUEUE_SIZE = 1024
 _WRITER_BATCH_SIZE = 32
 _WRITER_SHUTDOWN_TIMEOUT_SECONDS = 5
+
+# Each writer publishes its own accounting beside the shards it appends to, so
+# a frozen copy of the trace can be reconciled against what the writer claims
+# rather than against what happened to be on disk. See
+# RequestTraceWriter.accounting and verify_writer_shards.
+WRITER_SIDECAR_DIR = "_writer"
+WRITER_SIDECAR_SCHEMA = "trtllm-request-trace-writer/1"
+_WRITER_SIDECAR_INTERVAL_SECONDS = 10.0
+WRITER_DURABILITY = (
+    "a record is persisted once the append holding it, its terminating newline "
+    "included, has been written, flushed and fsync()ed without an error"
+)
+# Why a record never reached its shard. Every submitted record ends in exactly
+# one of: persisted, one of these, unknown, or (until it does) pending.
+_DROP_REASONS = ("queue_full", "unserializable", "write_error", "shutdown")
+# Seconds to wait before each retry of a shard open that fails with EEXIST
+# (see _open_shard_for_append).
+_SHARD_OPEN_RETRY_DELAYS = (0.05, 0.25, 1.0)
 
 _REQUESTS = "requests"
 _RESPONSES = "responses"
@@ -67,6 +86,14 @@ _MAX_SESSION_LEN = 128
 # half. Those are client-facing and must stay traced.
 _INTERNAL_DISAGG_REQUEST_TYPES = frozenset(("context_only", "generation_only"))
 
+# Request headers whose values are credentials, matched case-insensitively: the
+# names below, plus any name containing a fragment, which is what catches
+# x-api-key, api-key and the vendor spellings (x-auth-token,
+# x-amz-security-token, x-client-secret, ...).
+_CREDENTIAL_HEADERS = frozenset(("authorization", "proxy-authorization", "cookie", "set-cookie"))
+_CREDENTIAL_HEADER_FRAGMENTS = ("api-key", "api_key", "apikey", "token", "secret", "password")
+_REDACTED = "[redacted]"
+
 
 def request_trace_dir_from_env() -> Optional[str]:
     """Read the enabling variable.
@@ -86,6 +113,13 @@ def _utc_now() -> str:
 
 def _hour_bucket(recorded_at: str) -> str:
     return recorded_at[:_HOUR_BUCKET_LEN]
+
+
+def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 def _server_arrival_time(raw_request: Any) -> Optional[float]:
@@ -116,15 +150,15 @@ def sanitize_session_key(value: Optional[str]) -> str:
 def resolve_session_key(headers: Optional[Mapping[str, str]], body: Any) -> str:
     """Pick the key a request's trace lines are stamped with.
 
-    Headers first, then the body fields, in exactly the order the sticky-routing
-    path trusts (``conversation_id.py``), so a trace line's session is the id the
-    router keyed on. This is the single piece of normalization the trace does;
-    every other identifier is stored as the client sent it and interpreted offline.
+    The id comes from ``find_conversation_id``, the function sticky routing
+    resolves through, so the precedence is the router's by construction: body
+    ``conversation_params`` first, then the headers, then the client-native body
+    fields. A trace line's session is therefore the id the router keyed on, put
+    through ``sanitize_session_key`` -- the single piece of normalization the
+    trace does; every other identifier is stored as the client sent it and
+    interpreted offline.
     """
-    session = extract_conversation_id_from_headers(headers)
-    if not session:
-        session = extract_conversation_id_from_body(body)
-    return sanitize_session_key(session)
+    return sanitize_session_key(find_conversation_id(body, headers))
 
 
 def is_internal_disagg_request(body: Any) -> bool:
@@ -148,16 +182,30 @@ def is_internal_disagg_request(body: Any) -> bool:
     return params.get("request_type") in _INTERNAL_DISAGG_REQUEST_TYPES
 
 
+def _is_credential_header(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in _CREDENTIAL_HEADERS or any(
+        fragment in lowered for fragment in _CREDENTIAL_HEADER_FRAGMENTS
+    )
+
+
 def _dump_headers(headers: Optional[Mapping[str, str]]) -> List[List[str]]:
-    """Headers as ordered pairs.
+    """Headers as ordered pairs, with credential values redacted.
 
     A dict would lose repeats, and HTTP allows them -- two proxies each append
     their own ``x-forwarded-for``. Starlette's Headers is a multidict whose
     ``items()`` walks the raw list, so both survive here.
+
+    Every header the trace records passes through here, so this is where
+    credentials stop: a credential header keeps its name, which shows the
+    client sent one, and its value becomes ``_REDACTED``.
     """
     if headers is None:
         return []
-    return [[str(name), str(value)] for name, value in headers.items()]
+    return [
+        [str(name), _REDACTED if _is_credential_header(str(name)) else str(value)]
+        for name, value in headers.items()
+    ]
 
 
 def _route_of(raw_request: Any) -> str:
@@ -214,8 +262,139 @@ def brief_validation_errors(errors: Any) -> List[Dict[str, Any]]:
                 }
             )
     except Exception as error:  # noqa: BLE001
-        logger.warning("Failed to summarize validation errors: %s", error)
+        logger.warning(f"Failed to summarize validation errors: {error}")
     return brief
+
+
+@functools.lru_cache(maxsize=None)
+def _tool_call_markup_tokens() -> Tuple[str, ...]:
+    """The markup every registered tool-call format writes around its calls."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
+
+    tokens = set()
+    for parser_class in ToolParserFactory.parsers.values():
+        tokens.update(getattr(parser_class, "markup_tokens", ()))
+    return tuple(sorted(tokens))
+
+
+_TOOL_CALL_ITEM_TYPES = {"function_call": "arguments", "custom_tool_call": "input"}
+
+
+def _responses_tool_call_items(text: Optional[str], payload: Any) -> List[Dict[str, Any]]:
+    """The function and custom tool calls a Responses reply delivered.
+
+    Read from the streamed ``output_item.done`` events and the terminal
+    snapshot alike, so a stream cut before its terminal event still counts.
+    """
+    items: List[Dict[str, Any]] = []
+    if text is None:
+        output = payload.get("output") if isinstance(payload, dict) else None
+        return [item for item in output or [] if isinstance(item, dict)]
+    for frame in text.split("\n\n"):
+        if "_call" not in frame:
+            continue
+        for line in frame.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            try:
+                data = json.loads(line[len("data: ") :])
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if isinstance(data.get("item"), dict):
+                items.append(data["item"])
+            response = data.get("response")
+            if isinstance(response, dict):
+                items.extend(
+                    item for item in response.get("output") or [] if isinstance(item, dict)
+                )
+    return items
+
+
+def find_tool_call_markup(text: Optional[str], payload: Any = None) -> List[Dict[str, Any]]:
+    """Tool calls whose arguments still contain tool-call markup.
+
+    Such a call was not cleanly separated from its format: the model wrote
+    its own structure into a value (``"max_output_tokens</arg_key><arg_value>2000"``
+    inside an exec header), or the parser split the markup wrongly. The call
+    is delivered unchanged; this only lets a consumer of the trace find it.
+    ``text`` is a streamed reply, ``payload`` a JSON one.
+    """
+    tokens = _tool_call_markup_tokens()
+    if not tokens:
+        return []
+    if text is not None and not any(token in text for token in tokens):
+        return []
+    found: Dict[str, Dict[str, Any]] = {}
+    for item in _responses_tool_call_items(text, payload):
+        field_name = _TOOL_CALL_ITEM_TYPES.get(item.get("type"))
+        value = item.get(field_name) if field_name else None
+        if not isinstance(value, str):
+            continue
+        markers = [token for token in tokens if token in value]
+        if markers:
+            key = item.get("call_id") or item.get("id") or str(len(found))
+            found[key] = {
+                "call_id": item.get("call_id"),
+                "name": item.get("name"),
+                "markers": markers,
+            }
+    return list(found.values())
+
+
+_RESPONSES_TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed")
+
+
+def responses_outcome(text: Optional[str], payload: Any = None) -> Dict[str, Any]:
+    """How a Responses reply ended, as the reply itself states it.
+
+    A response record's ``status`` describes the transport: a stream that ran
+    to its last event is ``completed`` whether the generation finished, ran
+    out of token budget, or failed. The Responses object says which in its own
+    ``status`` (completed / incomplete / failed), ``incomplete_details.reason``
+    and ``error.code``; they are copied onto the record as ``response_status``,
+    ``incomplete_reason`` and ``error_code`` so a census can tell a truncated
+    generation from a finished one without parsing the body. Empty for a reply
+    that is not a Responses object and for a stream cut before its terminal
+    event. ``text`` is a streamed reply, ``payload`` a JSON one.
+    """
+    response = None
+    if text is not None:
+        # The terminal event is the last frame of a finished stream (the relay
+        # can follow a cut with ``error`` then ``response.failed``), so only the
+        # tail is read rather than the whole, possibly very long, stream.
+        for frame in reversed(text.rstrip().rsplit("\n\n", 2)):
+            event_type, data = None, None
+            for line in frame.split("\n"):
+                if line.startswith("event: "):
+                    event_type = line[len("event: ") :].strip()
+                elif line.startswith("data: "):
+                    try:
+                        data = json.loads(line[len("data: ") :])
+                    except ValueError:
+                        data = None
+            if not isinstance(data, dict):
+                continue
+            if (event_type or data.get("type")) in _RESPONSES_TERMINAL_EVENTS and isinstance(
+                data.get("response"), dict
+            ):
+                response = data["response"]
+                break
+    elif isinstance(payload, dict) and payload.get("object") == "response":
+        response = payload
+    if response is None:
+        return {}
+    outcome: Dict[str, Any] = {}
+    if isinstance(response.get("status"), str):
+        outcome["response_status"] = response["status"]
+    details = response.get("incomplete_details")
+    if isinstance(details, dict) and isinstance(details.get("reason"), str):
+        outcome["incomplete_reason"] = details["reason"]
+    error = response.get("error")
+    if isinstance(error, dict) and error.get("code") is not None:
+        outcome["error_code"] = error["code"]
+    return outcome
 
 
 def _join_frames(frames) -> str:
@@ -266,6 +445,8 @@ class RequestTraceHandle:
     # itself died, whether an upstream response was cut, or whether the fault
     # was in this process's own code -- the distinction that decides whether
     # the text lost with the stream still existed in memory when it was lost.
+    # A body never iterated has no producer to ask; wrap_stream records
+    # "not_started" for it instead.
     stream_termination: Optional[Dict[str, Any]] = None
     response_written: bool = field(default=False, repr=False)
 
@@ -310,8 +491,52 @@ class RequestTraceWriter:
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=_WRITER_QUEUE_SIZE)
         self._task: Optional[asyncio.Task] = None
         self._known_dirs: set = set()
-        self.dropped_records = 0
+        # One writer generation per process lifetime. The shard file names carry
+        # only the pid, which a restarted container hands out again, so the
+        # generation is what tells two lifetimes appending to one file apart.
+        self.generation = f"{os.getpid()}-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        self.started_at = _utc_now()
+        # The disposition of every record handed to _submit while enabled:
+        #   persisted -- in its shard, newline-terminated, flushed and fsync()ed;
+        #   dropped   -- by reason (_DROP_REASONS), never written;
+        #   unknown   -- some or all of its bytes may have landed, but the write
+        #                or fsync holding it failed, so it is not claimed;
+        #   pending   -- the rest: queued or being written right now.
+        # sanitized_records counts records written with \u escapes; it is an
+        # attribute of persisted (or other) records, not a disposition.
+        self.submitted = 0
+        self.persisted = 0
+        self.dropped: Dict[str, int] = dict.fromkeys(_DROP_REASONS, 0)
+        self.unknown = 0
+        self.sanitized_records = 0
         self._write_error_count = 0
+        self._last_error: Optional[str] = None
+        # Records of the batch handed to the write thread and not yet classified.
+        self._in_flight = 0
+        self._batch_outcomes: List[Dict[str, Any]] = []
+        # Per shard this generation appended to: where its first append started,
+        # where its last durable append ended, and how many records lie between.
+        self._shards: Dict[str, Dict[str, Any]] = {}
+        self._publications = 0
+        self._sidecar_errors = 0
+        self._last_published = float("-inf")
+        self._publishing: Optional[asyncio.Future] = None
+        # The books (see _counts_key) of the last sidecar that landed.
+        self._published_counts: Optional[Tuple[int, int, int, int, int]] = None
+        # Stamped after every batch that persisted in full, in the same ISO form
+        # the records carry, so a monitor can tell an idle writer from one whose
+        # writes have stopped landing -- a distinction ``enabled`` cannot make.
+        self.last_write_at: Optional[str] = None
+
+    @property
+    def dropped_records(self) -> int:
+        """Every record never written, whatever the reason."""
+        return sum(self.dropped.values())
+
+    @property
+    def pending(self) -> int:
+        """Records neither persisted, dropped nor unknown: still on their way."""
+        return self.submitted - self.persisted - self.dropped_records - self.unknown
 
     @property
     def enabled(self) -> bool:
@@ -323,11 +548,14 @@ class RequestTraceWriter:
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as error:
-            logger.error("Disabling request trace output: %s", error)
+            logger.error(f"Disabling request trace output: {error}")
             self._output_dir = None
             return
-        logger.info("Recording request traces to %s", self._output_dir)
+        logger.info(f"Recording request traces to {self._output_dir} (writer {self.generation})")
         self._task = asyncio.create_task(self._run())
+        # Published before the first record so that a writer which dies at once
+        # still leaves a generation behind for the reconciliation to account for.
+        await self._publish(force=True)
 
     async def close(self) -> None:
         if self._task is None:
@@ -345,6 +573,20 @@ class RequestTraceWriter:
             await asyncio.gather(task, return_exceptions=True)
         finally:
             self._task = None
+            # Still queued: never written. Handed to the write thread when the
+            # drain was cancelled: that thread may yet land them, so not claimed.
+            leftover = 0
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if item is not None:
+                    leftover += 1
+            self.dropped["shutdown"] += leftover
+            self.unknown += self._in_flight
+            self._in_flight = 0
+            await self._publish(force=True, closed=True)
 
     # -- hooks ---------------------------------------------------------------
 
@@ -471,8 +713,19 @@ class RequestTraceWriter:
         frames: Optional[List[Any]] = None,
         payload: Any = None,
         status: str = "completed",
+        http_status: Optional[int] = None,
     ) -> None:
-        """Record the response side. Synchronous: safe to call from ``finally``."""
+        """Record the response side. Synchronous: safe to call from ``finally``.
+
+        ``status`` is how the transport ended. For a Responses reply, how the
+        generation ended is added from the reply itself (``responses_outcome``).
+
+        ``payload`` is the body the client receives: a JSON value, or a ``str``
+        for a plain-text answer (recorded with kind ``text``), such as the
+        framework's own 500. ``http_status`` is the answer's HTTP status; the
+        error exits pass it, since a 4xx and every 5xx would otherwise be
+        indistinguishable in the record.
+        """
         if handle is None or self._task is None or handle.response_written:
             return
         handle.response_written = True
@@ -487,13 +740,25 @@ class RequestTraceWriter:
             "disagg_request_id": handle.disagg_request_id,
             "ctx_request_id": handle.ctx_request_id,
         }
+        if http_status is not None:
+            record["http_status"] = http_status
         if handle.stream_termination is not None:
             record["termination"] = handle.stream_termination
         text = _join_frames(frames) if frames is not None else None
         if text is not None:
             record["response"] = {"kind": "sse_text", "body": text}
+        elif isinstance(payload, str):
+            record["response"] = {"kind": "text", "body": payload}
         else:
             record["response"] = {"kind": "json", "body": payload}
+        record.update(responses_outcome(text, payload))
+        markup = find_tool_call_markup(text, payload)
+        if markup:
+            record["tool_call_markup"] = markup
+            logger.warning(
+                f"Trace {handle.trace_id}: {len(markup)} tool call(s) carry "
+                f"tool-call markup in their arguments: {markup}"
+            )
         self._submit(_hour_bucket(finished_at), _RESPONSES, record)
 
     def wrap_stream(
@@ -504,11 +769,26 @@ class RequestTraceWriter:
         Wrapping the outermost generator is what makes one implementation cover
         every route: what gets recorded is the stream the client received, in
         the protocol the client speaks, whatever conversions happened upstream.
+
+        A body that is never iterated runs none of the generator, its
+        ``finally`` included. Starlette drops one that way when the client is
+        already gone as the response begins (under ASGI 2.4 ``send`` raises and
+        the response raises ClientDisconnect), which left an accepted request
+        with no terminal record. A finalizer on the generator covers it: freed
+        unstarted, the stream is recorded as ``client_disconnected`` with cause
+        ``not_started``. Starlette releases a dropped body by reference
+        counting, so this does not wait on the cyclic GC, which both servers
+        disable; ``on_response`` keeps it to one record whichever side gets
+        there first.
         """
         if handle is None or self._task is None:
             return stream
+        started = False
+        loop = _running_loop()
 
         async def _traced() -> AsyncIterator[Any]:
+            nonlocal started
+            started = True
             frames: List[Any] = []
             status = "unknown"
             try:
@@ -541,24 +821,68 @@ class RequestTraceWriter:
             finally:
                 self.on_response(handle, frames=frames, status=status)
 
-        return _traced()
+        def _freed() -> None:
+            if not started:
+                self._close_unstarted_stream(handle, loop)
+
+        traced = _traced()
+        # Not at exit: a stream still alive then was not dropped unstarted.
+        weakref.finalize(traced, _freed).atexit = False
+        return traced
+
+    def _close_unstarted_stream(
+        self, handle: RequestTraceHandle, loop: Optional[asyncio.AbstractEventLoop]
+    ) -> None:
+        """Record a stream freed before its first iteration.
+
+        Runs from the finalizer, in whichever thread dropped the last
+        reference. That is the event loop's own in practice, and the record is
+        made on the spot, ahead of anything queued after it; a cyclic
+        collection on another thread hands it to the loop instead, because the
+        queue is not thread-safe.
+        """
+        if loop is not None and _running_loop() is not loop:
+            with contextlib.suppress(RuntimeError):  # loop closed: nothing to record into
+                loop.call_soon_threadsafe(self._close_unstarted_stream, handle, None)
+            return
+        if handle.response_written:
+            return
+        if handle.stream_termination is None:
+            handle.stream_termination = {
+                "cause": "not_started",
+                "detail": "the response body was never iterated",
+            }
+        self.on_response(handle, frames=[], status="client_disconnected")
 
     # -- writer --------------------------------------------------------------
 
     def _submit(self, bucket: str, kind: str, record: Dict[str, Any]) -> None:
         if self._task is None:
             return
+        self.submitted += 1
         try:
             self._queue.put_nowait((bucket, kind, record))
         except asyncio.QueueFull:
-            self.dropped_records += 1
-            if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
-                logger.warning("Dropped %d request trace records", self.dropped_records)
+            self.dropped["queue_full"] += 1
+            count = self.dropped["queue_full"]
+            if count == 1 or count % 1000 == 0:
+                logger.warning(f"Dropped {count} request trace records: the writer queue is full")
 
     async def _run(self) -> None:
         stop = False
         while not stop:
-            item = await self._queue.get()
+            try:
+                item = await asyncio.wait_for(
+                    self._queue.get(), timeout=_WRITER_SIDECAR_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # Idle. A batch only publishes when the last publication is old
+                # enough, so the records of a final burst could otherwise sit
+                # unpublished until the next request arrives -- for a quiet
+                # writer, indefinitely. Catch the sidecar up now.
+                if self._unpublished():
+                    await self._publish()
+                continue
             if item is None:
                 return
             batch = [item]
@@ -576,35 +900,391 @@ class RequestTraceWriter:
                 try:
                     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
                 except (TypeError, ValueError) as error:
-                    self.dropped_records += 1
-                    if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
-                        logger.warning("Dropped malformed request trace record: %s", error)
+                    self.dropped["unserializable"] += 1
+                    count = self.dropped["unserializable"]
+                    if count == 1 or count % 1000 == 0:
+                        logger.warning(f"Dropped malformed request trace record: {error}")
                     continue
+                # json.dumps checks JSON shape, not encodability: with
+                # ensure_ascii=False an unpaired surrogate in client text rides
+                # through it into a str no UTF-8 file can take. Caught here, that
+                # one record is written with \u escapes instead -- pure ASCII, and
+                # JSON reads the escape back as the code point the client sent,
+                # so nothing is lost and the record's shape is unchanged. Its
+                # batchmates keep raw UTF-8.
+                try:
+                    line.encode("utf-8")
+                except UnicodeEncodeError:
+                    line = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+                    self.sanitized_records += 1
+                    if self.sanitized_records == 1 or self.sanitized_records % 1000 == 0:
+                        logger.warning(
+                            f"Escaped {self.sanitized_records} request trace records carrying "
+                            f"text UTF-8 cannot encode (unpaired surrogates)"
+                        )
                 groups.setdefault((bucket, kind), []).append(line)
             if not groups:
                 continue
+            total = sum(len(lines) for lines in groups.values())
+            self._in_flight = total
+            # Filled in by _write_groups group by group, so a surprise exception
+            # out of it still leaves what was already classified.
+            self._batch_outcomes = []
             try:
                 await asyncio.to_thread(self._write_groups, groups)
-            except OSError as error:
-                self.dropped_records += sum(len(lines) for lines in groups.values())
-                self._write_error_count += 1
-                if self._write_error_count == 1:
-                    logger.warning("Failed to write request trace JSONL: %s", error)
+            except Exception as error:  # noqa: BLE001 - a dead writer loses every future trace
+                # Deliberately broad, and the one place in this file it has to
+                # be: an exception escaping here would kill this task while
+                # ``enabled`` stays True, and every later record would queue
+                # toward a drain that no longer runs. _write_groups classifies
+                # its own failures, so only a surprise lands here; the groups it
+                # had not classified are charged by whether any byte of theirs
+                # was attempted. CancelledError is a BaseException and still
+                # passes, so ``close`` can cancel a stuck task.
+                outcomes = self._batch_outcomes
+                # A group whose bytes were attempted may have landed: unknown.
+                # Every other unclassified line never reached a file: dropped.
+                # What _write_groups did classify is booked below as usual.
+                unclaimed = sum(
+                    o["lines"] - o["persisted"] - o["dropped"] - o["unknown"]
+                    for o in outcomes
+                    if o["attempted"]
+                )
+                classified = sum(o["persisted"] + o["dropped"] + o["unknown"] for o in outcomes)
+                self.unknown += unclaimed
+                self.dropped["write_error"] += total - classified - unclaimed
+                self._note_write_error(f"{type(error).__name__}: {error}")
+            outcomes = self._batch_outcomes
+            failed = False
+            for outcome in outcomes:
+                self._apply_outcome(outcome)
+                if outcome["error"] is not None:
+                    failed = True
+                    self._note_write_error(outcome["error"])
+            self._in_flight = 0
+            if not failed and len(outcomes) == len(groups):
+                self.last_write_at = _utc_now()
+            await self._publish(force=failed)
 
-    def _write_groups(self, groups: Dict[Tuple[str, str], List[str]]) -> None:
-        """Append each group to its file. Runs on a worker thread.
+    def _apply_outcome(self, outcome: Dict[str, Any]) -> None:
+        """Book one group's outcome: its counts and its shard's watermarks."""
+        self.persisted += outcome["persisted"]
+        self.dropped["write_error"] += outcome["dropped"]
+        self.unknown += outcome["unknown"]
+        if outcome.get("size_before") is None:
+            return  # nothing reached the file
+        shard = self._shards.setdefault(
+            outcome["file"],
+            {
+                "file": outcome["file"],
+                # Where this generation's first append to the shard began.
+                "start_offset": outcome["size_before"],
+                "persisted_end": outcome["size_before"],
+                "persisted_records": 0,
+                "fragments_isolated": 0,
+                # Failed appends: where their bytes start, how many landed, and
+                # how many records those bytes touch.
+                "unknown_extents": [],
+            },
+        )
+        if outcome.get("isolated"):
+            shard["fragments_isolated"] += 1
+        if outcome.get("end") is not None:
+            shard["persisted_end"] = outcome["end"]
+            shard["persisted_records"] += outcome["persisted"]
+        if outcome.get("extent") is not None:
+            shard["unknown_extents"].append(outcome["extent"])
 
-        At most one bucket per kind in practice, so a batch is two opens rather
-        than the one-per-session it used to be.
+    def _note_write_error(self, error: str) -> None:
+        self._write_error_count += 1
+        self._last_error = error
+        if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
+            logger.warning(f"Failed to write request trace JSONL: {error}")
+
+    def _write_groups(self, groups: Dict[Tuple[str, str], List[str]]) -> List[Dict[str, Any]]:
+        """Append each group to its file, durably. Runs on a worker thread.
+
+        One group is one shard file and one append: the group's lines are
+        written in one call, flushed and fsync()ed. Only then are they counted
+        as persisted, and the shard's watermark moves to the end of the append.
+        A failure anywhere in the group is classified rather than raised:
+
+        - nothing attempted (the directory or file would not open): every line
+          is dropped as ``write_error``;
+        - bytes may have landed (the write, flush or fsync failed): every line
+          whose bytes reached the file, wholly or partly, is ``unknown`` and the
+          rest are dropped. A line is never counted as persisted on the strength
+          of bytes that were not fsync()ed.
+
+        An append that stops mid-line leaves the file ending in a fragment.
+        The next append to that file first writes a newline, so the fragment
+        becomes one bad line a JSONL reader skips, and the record after it
+        parses untouched -- it is never welded onto the fragment.
+
+        Each group's outcome is appended to ``_batch_outcomes`` as it completes,
+        so a surprise exception still leaves the caller what was classified.
+        The shard watermarks are not touched here: the outcome carries the
+        offsets, and the event loop applies them together with the counts
+        (``_apply_outcome``). A batch abandoned by a cancelled drain -- its
+        records already counted as unknown -- therefore never moves a
+        watermark either, and the counts and the shards always agree.
         """
+        outcomes = self._batch_outcomes
         for (bucket, kind), lines in groups.items():
-            directory = self._output_dir / bucket
-            if bucket not in self._known_dirs:
-                directory.mkdir(parents=True, exist_ok=True)
-                self._known_dirs.add(bucket)
-            path = directory / f"{kind}{self._writer_suffix}.jsonl"
-            with path.open("a", encoding="utf-8") as output:
-                output.write("".join(lines))
+            outcome: Dict[str, Any] = {
+                "file": f"{bucket}/{kind}{self._writer_suffix}.jsonl",
+                "lines": len(lines),
+                "persisted": 0,
+                "dropped": 0,
+                "unknown": 0,
+                "attempted": False,
+                "error": None,
+                # Offsets in the shard: its size before this append, whether a
+                # fragment was isolated first, where the payload began, where
+                # the durable append ended, and what a failed one left behind.
+                "size_before": None,
+                "isolated": False,
+                "end": None,
+                "extent": None,
+            }
+            outcomes.append(outcome)
+            payload = "".join(lines).encode("utf-8")
+            path = None
+            payload_start: Optional[int] = None
+            try:
+                directory = self._output_dir / bucket
+                if bucket not in self._known_dirs:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    self._known_dirs.add(bucket)
+                path = directory / f"{kind}{self._writer_suffix}.jsonl"
+                needs_newline = False
+                try:
+                    size = path.stat().st_size
+                    if size > 0:
+                        with path.open("rb") as tail:
+                            tail.seek(-1, os.SEEK_END)
+                            needs_newline = tail.read(1) != b"\n"
+                except FileNotFoundError:
+                    size = 0
+                outcome["size_before"] = size
+                with self._open_shard_for_append(path) as output:
+                    outcome["attempted"] = True
+                    if needs_newline:
+                        output.write(b"\n")
+                        outcome["isolated"] = True
+                    output.flush()
+                    payload_start = output.tell()
+                    output.write(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    outcome["end"] = output.tell()
+                outcome["persisted"] = len(lines)
+            except Exception as error:  # noqa: BLE001 - classified, never raised
+                outcome["error"] = f"{type(error).__name__}: {error}"
+                landed = self._landed_bytes(path, payload_start, len(payload))
+                if not outcome["attempted"] or payload_start is None:
+                    outcome["dropped"] = len(lines)
+                elif landed is None:
+                    outcome["unknown"] = len(lines)
+                else:
+                    touched = payload[:landed].count(b"\n")
+                    if landed and payload[landed - 1 : landed] != b"\n":
+                        touched += 1  # the line the write stopped inside
+                    outcome["unknown"] = touched
+                    outcome["dropped"] = len(lines) - touched
+                    if landed:
+                        outcome["extent"] = {
+                            "start": payload_start,
+                            "landed": landed,
+                            "records": touched,
+                        }
+        return outcomes
+
+    @staticmethod
+    def _open_shard_for_append(path: Path):
+        """Open a shard for appending, retrying an open that fails with EEXIST.
+
+        An open with O_CREAT and without O_EXCL cannot legitimately fail with
+        EEXIST, but a network filesystem client can still report it while
+        several processes create files in a directory that was just created --
+        which is what every writer of an instance does at once when the hour
+        bucket rolls over. Nothing has been written when the open fails, so it
+        is simply tried again; only an open that keeps failing loses the group.
+        Runs on the writer's worker thread, never on the event loop.
+        """
+        for delay in (*_SHARD_OPEN_RETRY_DELAYS, None):
+            try:
+                return path.open("ab")
+            except FileExistsError:
+                if delay is None:
+                    raise
+                time.sleep(delay)
+
+    @staticmethod
+    def _landed_bytes(path: Optional[Path], start: Optional[int], length: int) -> Optional[int]:
+        """How much of a failed append reached the file, or None if unknowable."""
+        if path is None or start is None:
+            return 0
+        try:
+            return max(0, min(length, path.stat().st_size - start))
+        except OSError:
+            return None
+
+    # -- accounting ----------------------------------------------------------
+
+    def accounting(self, closed: bool = False) -> Dict[str, Any]:
+        """This writer's sidecar document: what it was given and where it went.
+
+        ``submitted == persisted + sum(dropped) + unknown + pending`` holds at
+        every publication. ``shards`` gives, per file this generation appended
+        to, the byte range its durable appends occupy -- from ``start_offset``,
+        where its first append began, to ``persisted_end`` -- and how many
+        records that range holds; a reconciliation reads exactly that range
+        (see ``verify_writer_shards``). A file another lifetime of the same pid
+        also appended to is told apart by these offsets.
+        """
+        return {
+            "schema": WRITER_SIDECAR_SCHEMA,
+            "generation": self.generation,
+            "pid": os.getpid(),
+            "writer_suffix": self._writer_suffix,
+            "started_at": self.started_at,
+            "published_at": _utc_now(),
+            "sequence": self._publications,
+            "closed": closed,
+            "durability": WRITER_DURABILITY,
+            "counts": {
+                "submitted": self.submitted,
+                "persisted": self.persisted,
+                "dropped": dict(self.dropped),
+                "unknown": self.unknown,
+                "pending": self.pending,
+            },
+            "attributes": {"sanitized": self.sanitized_records},
+            "shards": [dict(shard) for shard in self._shards.values()],
+            "errors": {
+                "write_errors": self._write_error_count,
+                "last_error": self._last_error,
+                "sidecar_errors": self._sidecar_errors,
+            },
+        }
+
+    def _counts_key(self) -> Tuple[int, int, int, int, int]:
+        return (
+            self.submitted,
+            self.persisted,
+            self.dropped_records,
+            self.unknown,
+            self._sidecar_errors,
+        )
+
+    def _unpublished(self) -> bool:
+        """True if the books moved since a sidecar last landed."""
+        return self._counts_key() != self._published_counts
+
+    async def _publish(self, force: bool = False, closed: bool = False) -> None:
+        """Atomically replace this generation's sidecar, at most every few seconds.
+
+        Never raises: a sidecar that cannot be written costs the reconciliation
+        its freshest numbers until a later one lands. Only a sidecar that landed
+        marks its books published, so after a failure the idle drain retries
+        even if no record ever arrives again.
+        """
+        if self._output_dir is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_published < _WRITER_SIDECAR_INTERVAL_SECONDS:
+            return
+        if self._publishing is not None and not self._publishing.done():
+            # The previous publication is still stuck in the filesystem; another
+            # thread queued behind it would only pile up. Counted, and retried
+            # at the next opportunity.
+            self._sidecar_errors += 1
+            return
+        self._last_published = now
+        document = self.accounting(closed=closed)
+        books = self._counts_key()
+        self._publications += 1
+        self._publishing = asyncio.ensure_future(asyncio.to_thread(self._write_sidecar, document))
+        # Retrieved here or, after a timeout, whenever the thread finishes.
+        self._publishing.add_done_callback(lambda future: future.cancelled() or future.exception())
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self._publishing),
+                timeout=_WRITER_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        except Exception as error:  # noqa: BLE001 - accounting must not stop the trace
+            self._sidecar_errors += 1
+            if self._sidecar_errors == 1 or self._sidecar_errors % 100 == 0:
+                logger.warning(f"Failed to publish request trace writer accounting: {error}")
+        else:
+            self._published_counts = books
+
+    def _write_sidecar(self, document: Dict[str, Any]) -> None:
+        directory = self._output_dir / WRITER_SIDECAR_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        final = directory / f"{self.generation}.json"
+        partial = directory / f".{self.generation}.json.partial"
+        with partial.open("w", encoding="utf-8") as output:
+            json.dump(document, output, separators=(",", ":"))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(partial, final)
+        with contextlib.suppress(OSError):
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+
+def verify_writer_shards(output_dir: str, sidecar: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Check a writer sidecar against the shards it describes.
+
+    For each shard, reads the byte range the sidecar claims, from
+    ``start_offset`` to ``persisted_end``, and counts the newline-terminated
+    lines that parse as JSON -- leaving out the bytes of failed appends
+    (``unknown_extents``), which are counted on their own. A consistent writer
+    has ``records == persisted_records`` and ``bad_lines == 0``; whatever its
+    failed appends left behind shows up under ``unknown_*``, never as
+    persisted.
+    """
+    results = []
+    for shard in sidecar.get("shards", []):
+        path = Path(output_dir) / shard["file"]
+        result = dict(shard, records=0, bad_lines=0, unknown_lines=0, size=None, short=False)
+        begin, end = shard["start_offset"], shard["persisted_end"]
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                result["size"] = handle.tell()
+                handle.seek(begin)
+                data = bytearray(handle.read(end - begin))
+        except OSError as error:
+            result["error"] = f"{type(error).__name__}: {error}"
+            results.append(result)
+            continue
+        result["short"] = len(data) < end - begin
+        for extent in shard.get("unknown_extents", []):
+            lo = extent["start"] - begin
+            hi = min(len(data), lo + extent["landed"])
+            if lo < 0 or lo >= len(data):
+                continue
+            result["unknown_lines"] += bytes(data[lo:hi]).count(b"\n") + (
+                1 if hi > lo and data[hi - 1 : hi] != b"\n" else 0
+            )
+            data[lo:hi] = b"\n" * (hi - lo)  # neither persisted nor bad
+        for line in bytes(data).split(b"\n"):
+            if not line:
+                continue
+            try:
+                json.loads(line)
+                result["records"] += 1
+            except ValueError:
+                result["bad_lines"] += 1
+        results.append(result)
+    return results
 
 
 def _as_text(chunk: Any) -> str:

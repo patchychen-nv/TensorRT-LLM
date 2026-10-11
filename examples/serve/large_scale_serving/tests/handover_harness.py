@@ -528,11 +528,27 @@ def wait_for(what, predicate, timeout, interval=0.05):
 class Backend:
     """A fake fleet member plus the registration record that advertises it."""
 
-    def __init__(self, root, job_id, lease, healthy=True, state="running", probe_delay=0.0):
+    def __init__(
+        self,
+        root,
+        job_id,
+        lease,
+        healthy=True,
+        state="running",
+        probe_delay=0.0,
+        fleet_dir=None,
+        pool=None,
+    ):
         self.job_id = job_id
         self.lease = lease
         self.port = lease.port
         self.probe_delay = probe_delay
+        # Where the registration goes, when it is not the fleet's own directory:
+        # a member of an extra pool (another model's fleet) registers into that
+        # pool's directory, exactly as serve.sh gives each cluster_name/model.name
+        # pair its own.
+        self.fleet_dir = fleet_dir
+        self.pool = pool
         self.url = "http://127.0.0.1:%d" % lease.port
         self.run_dir = os.path.join(root, "runs", job_id)
         self.mode_file = os.path.join(root, "%s.mode" % job_id)
@@ -649,9 +665,15 @@ print("ok")
 
 
 class Fleet:
-    """A fleet directory, its users file, and the heartbeats that keep it alive."""
+    """A fleet directory, its users file, and the heartbeats that keep it alive.
 
-    def __init__(self, root, rng, backends=2, probe_delay=0.0):
+    `pools` maps an extra pool's name to how many fake backends it gets.
+    Each pool registers into a directory of its own (`pool_dirs[name]`), and its
+    job ids are built from the pool's name -- `kimik3job1` -- so which pool
+    served a request can be read straight off X-Backend-Id.
+    """
+
+    def __init__(self, root, rng, backends=2, probe_delay=0.0, pools=None):
         self.root = root
         self.rng = rng
         self.dir = os.path.join(root, "fleet-%d-%d" % (os.getpid(), rng.randrange(1 << 20)))
@@ -678,14 +700,35 @@ class Fleet:
             self.backends.append(
                 Backend(root, "fakejob%d" % (index + 1), lease_port(rng), probe_delay=probe_delay)
             )
+        self.pool_dirs = {}
+        for name, count in (pools or {}).items():
+            pool_dir = os.path.join(root, "pool-%s-%d" % (name, rng.randrange(1 << 20)))
+            os.makedirs(pool_dir, exist_ok=True)
+            self.pool_dirs[name] = pool_dir
+            stem = re.sub(r"[^A-Za-z0-9]", "", name)
+            for index in range(count):
+                self.backends.append(
+                    Backend(
+                        root,
+                        "%sjob%d" % (stem, index + 1),
+                        lease_port(rng),
+                        probe_delay=probe_delay,
+                        fleet_dir=pool_dir,
+                        pool=name,
+                    )
+                )
         self._stop = threading.Event()
         self._beat = None
+
+    def members(self, pool=None):
+        """The fake backends of one pool; None is the fleet's own directory."""
+        return [backend for backend in self.backends if backend.pool == pool]
 
     # -- registration ----------------------------------------------------
     def write_registrations(self):
         now = time.time()
         for backend in self.backends:
-            path = os.path.join(self.dir, "%s.json" % backend.job_id)
+            path = os.path.join(backend.fleet_dir or self.dir, "%s.json" % backend.job_id)
             if not backend.registered:
                 if os.path.exists(path):
                     os.remove(path)
@@ -1185,11 +1228,15 @@ class Scenario:
     anything whose argv still names this run's directory.
     """
 
-    def __init__(self, name, backends=2, extra_args=(), log_level="INFO", probe_delay=0.0):
+    def __init__(
+        self, name, backends=2, extra_args=(), log_level="INFO", probe_delay=0.0, pools=None
+    ):
         self.name = name
         self.rng = new_rng()
         self.root = make_root("gw-handover-%s-" % name)
-        self.fleet = Fleet(self.root, self.rng, backends=backends, probe_delay=probe_delay)
+        self.fleet = Fleet(
+            self.root, self.rng, backends=backends, probe_delay=probe_delay, pools=pools
+        )
         self.lease = lease_port(self.rng)
         self.port = self.lease.port
         self.gateway = GatewayProc(
@@ -1260,7 +1307,13 @@ class Scenario:
     # -- actions ----------------------------------------------------------
     def start_handover(self, timeout=20.0):
         """POST /_gateway/handover, remembering the successor so teardown can kill it."""
-        status, payload, out = control(self.port, "POST", "/_gateway/handover", {}, timeout=timeout)
+        return self.start_handover_with({}, timeout=timeout)
+
+    def start_handover_with(self, body, timeout=20.0):
+        """start_handover(), with a request body."""
+        status, payload, out = control(
+            self.port, "POST", "/_gateway/handover", body, timeout=timeout
+        )
         require_endpoint(status, "POST", "/_gateway/handover", "HTTP surface (exact)")
         if status is None:
             raise HarnessError(

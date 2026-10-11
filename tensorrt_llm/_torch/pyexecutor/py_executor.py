@@ -240,23 +240,16 @@ def _recv_sleep_wakeup_ack_until(comm,
             if (expected_op_id is not None
                     and ack.get("op_id") != expected_op_id):
                 logger.warning(
-                    "Ignoring stale sleep/wakeup ACK from rank %d for op_id=%s "
-                    "(expected op_id=%s).",
-                    source,
-                    ack.get("op_id"),
-                    expected_op_id,
-                )
+                    f'Ignoring stale sleep/wakeup ACK from rank {source} for '
+                    f'op_id={ack.get("op_id")} (expected op_id={expected_op_id}'
+                    f').')
                 continue
             ack_phase = ack.get("phase")
             if (expected_phase is not None and ack_phase is not None
                     and ack_phase != expected_phase):
                 logger.warning(
-                    "Ignoring stale sleep/wakeup ACK from rank %d for phase=%s "
-                    "(expected phase=%s).",
-                    source,
-                    ack_phase,
-                    expected_phase,
-                )
+                    f"Ignoring stale sleep/wakeup ACK from rank {source} for "
+                    f"phase={ack_phase} (expected phase={expected_phase}).")
                 continue
             return ack
         if time.monotonic() >= deadline:
@@ -1399,9 +1392,8 @@ class PyExecutor:
 
         if self.dist.rank == 0:
             logger.info(
-                "Sending shutdown to %d sleep/wakeup listener thread(s).",
-                self.dist.world_size - 1,
-            )
+                f"Sending shutdown to {self.dist.world_size - 1} sleep/wakeup "
+                f"listener thread(s).")
             shutdown_ack_deadline = (time.monotonic() +
                                      _SLEEP_WAKEUP_ACK_TIMEOUT_S)
             shutdown_errors = []
@@ -1421,8 +1413,8 @@ class PyExecutor:
                     shutdown_errors.append(
                         f"rank {dest} shutdown send failed: {exc}")
                     logger.warning(
-                        "Failed to send sleep/wakeup listener shutdown to "
-                        "rank %d: %s", dest, exc)
+                        f"Failed to send sleep/wakeup listener shutdown to "
+                        f"rank {dest}: {exc}")
             for src in shutdown_ranks:
                 try:
                     ack = _recv_sleep_wakeup_ack_until(self._sleep_wakeup_comm,
@@ -1432,8 +1424,8 @@ class PyExecutor:
                     shutdown_errors.append(
                         f"rank {src} shutdown ACK recv failed: {exc}")
                     logger.warning(
-                        "Failed to receive sleep/wakeup listener shutdown ACK "
-                        "from rank %d: %s", src, exc)
+                        f"Failed to receive sleep/wakeup listener shutdown ACK "
+                        f"from rank {src}: {exc}")
                     continue
                 if ack.get("status") != "ok":
                     shutdown_errors.append(
@@ -1441,18 +1433,16 @@ class PyExecutor:
                         or f"rank {src} returned unknown shutdown ACK")
             if shutdown_errors:
                 logger.warning(
-                    "Sleep/wakeup listener shutdown completed with errors: %s",
-                    "; ".join(shutdown_errors))
+                    f'Sleep/wakeup listener shutdown completed with errors: '
+                    f'{"; ".join(shutdown_errors)}')
         elif self._sleep_wakeup_listener_thread is not None:
             self._sleep_wakeup_listener_thread.join(
                 timeout=_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S)
             if self._sleep_wakeup_listener_thread.is_alive():
                 logger.warning(
-                    "Sleep/wakeup listener thread did not exit within %.1f "
-                    "seconds on rank %d.",
-                    _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S,
-                    self.dist.rank,
-                )
+                    f"Sleep/wakeup listener thread did not exit within "
+                    f"{_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S:.1f} seconds on "
+                    f"rank {self.dist.rank}.")
 
     def _record_sleep_wakeup_abort(self, control_id: str,
                                    error_msg: str) -> None:
@@ -3161,8 +3151,8 @@ class PyExecutor:
                                                    tag=_SleepWakeupTag.ACTION)
                 if msg.get("action") == _SleepWakeupAction.SHUTDOWN:
                     logger.debug(
-                        "Sleep/wakeup listener (rank %d): received shutdown, "
-                        "exiting.", self.dist.rank)
+                        f"Sleep/wakeup listener (rank {self.dist.rank}): "
+                        f"received shutdown, exiting.")
                     self._sleep_wakeup_comm.send(
                         {
                             "status": "ok",
@@ -3210,7 +3200,7 @@ class PyExecutor:
                               or active_control_id != op_id):
                             self._record_sleep_wakeup_abort(op_id, error_msg)
                             release_control_request = False
-                        logger.warning("Sleep/wakeup listener: %s", error_msg)
+                        logger.warning(f"Sleep/wakeup listener: {error_msg}")
                     elif action in (_SleepWakeupAction.PREPARE,
                                     _SleepWakeupAction.COMMIT,
                                     _SleepWakeupAction.SLEEP,
@@ -3223,8 +3213,8 @@ class PyExecutor:
                                 f"stale control message for op_id={op_id}; "
                                 f"active control_id={active_control_id}")
                             release_control_request = False
-                            logger.warning("Sleep/wakeup listener: %s",
-                                           error_msg)
+                            logger.warning(
+                                f"Sleep/wakeup listener: {error_msg}")
                         else:
                             torch.cuda.synchronize()
                             if action == _SleepWakeupAction.PREPARE:
@@ -3243,19 +3233,19 @@ class PyExecutor:
                                 error_msg = (
                                     f"unknown target action '{target_action}'")
                                 logger.warning(
-                                    "Sleep/wakeup listener: %s, ignoring.",
-                                    error_msg)
+                                    f"Sleep/wakeup listener: {error_msg}, "
+                                    f"ignoring.")
                     else:
                         error_msg = f"unknown action '{action}'"
-                        logger.warning("Sleep/wakeup listener: %s, ignoring.",
-                                       error_msg)
+                        logger.warning(
+                            f"Sleep/wakeup listener: {error_msg}, ignoring.")
                 except (KeyError, TypeError, ValueError, RuntimeError,
                         torch.OutOfMemoryError) as exc:
                     error_msg = (f"rank {self.dist.rank} '{action}' failed: "
                                  f"{exc}\n{traceback.format_exc()}")
-                    logger.error("Sleep/wakeup listener: error executing '%s':",
-                                 action,
-                                 exc_info=True)
+                    logger.error(
+                        f"Sleep/wakeup listener: error executing '{action}':",
+                        exc_info=True)
                 finally:
                     # Always ACK so rank-0 does not deadlock; carry error
                     # details so rank-0 can raise after all ranks respond.
@@ -3269,12 +3259,9 @@ class PyExecutor:
                             f"rank {self.dist.rank} '{action}' failed with "
                             f"uncaught {type(exc).__name__}: {exc!r}")
                         logger.error(
-                            "Sleep/wakeup listener: uncaught exception on "
-                            "rank %d during '%s':",
-                            self.dist.rank,
-                            action,
-                            exc_info=True,
-                        )
+                            f"Sleep/wakeup listener: uncaught exception on "
+                            f"rank {self.dist.rank} during '{action}':",
+                            exc_info=True)
                     # Unblock the executor loop that is waiting in
                     # _handle_control_request().  Clear control_request_barrier
                     # first so that it is clean for the next sleep/wakeup cycle
@@ -4628,11 +4615,8 @@ class PyExecutor:
         self._active_control_id = control_id
         pending_abort = self._pop_sleep_wakeup_abort(control_id)
         if pending_abort is not None:
-            logger.warning(
-                "[control_action] skipping aborted control request %s: %s",
-                control_id,
-                pending_abort,
-            )
+            logger.warning(f"[control_action] skipping aborted control request "
+                           f"{control_id}: {pending_abort}")
             self.control_request_barrier.set()
             self.control_request_barrier.clear()
             self._active_control_id = None
@@ -7553,9 +7537,9 @@ class PyExecutor:
         if getattr(disagg_params, 'first_gen_logits', None) is not None:
             if beam_width != 1:
                 logger.warning(
-                    "Skipping first_gen_logits prepend for "
-                    "request %s: beam_width=%s is not supported.",
-                    req.py_request_id, beam_width)
+                    f"Skipping first_gen_logits prepend for request "
+                    f"{req.py_request_id}: beam_width={beam_width} is not "
+                    f"supported.")
             else:
                 device = torch.device('cuda', self.device_id)
                 for logits_tensor in disagg_params.first_gen_logits:

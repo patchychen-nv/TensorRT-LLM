@@ -510,7 +510,7 @@ class BaseLLM:
                 telemetry_config=telemetry_config,
             )
         except Exception as exc:
-            logger.debug("Usage telemetry setup failed: %s", exc)
+            logger.debug(f"Usage telemetry setup failed: {exc}")
 
         try:
             if self.args.otlp_traces_endpoint:
@@ -1874,10 +1874,11 @@ class _TorchLLM(BaseLLM):
             if architectures and not ModelConfig.is_generation_model(
                     architectures):
                 logger.info(
-                    "Detected encoder-only model architecture (%s). Consider "
-                    "using LLM(model=..., encode_only=True) with "
-                    "llm.encode() for optimized batch-forward inference that "
-                    "bypasses the decoder scheduler.", architectures[0])
+                    f"Detected encoder-only model architecture ("
+                    f"{architectures[0]}). Consider using LLM(model=..., "
+                    f"encode_only=True) with llm.encode() for optimized "
+                    f"batch-forward inference that bypasses the decoder "
+                    f"scheduler.")
 
         # Create the standard executor for generate()/generate_async()
         # TODO: revisit gather_context_logits

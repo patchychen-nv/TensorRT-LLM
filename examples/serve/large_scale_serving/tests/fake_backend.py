@@ -38,7 +38,8 @@ gateway asks of a backend and nothing else:
    reply carries `X-Backend-Id`, which survives the relay untouched, so a
    client can tell which backend served it. `X-Test-Delay: <seconds>` makes a
    request stay in flight for a controlled length of time, which is how the
-   drain window is exercised.
+   drain window is exercised. `X-Test-Reset-After: <bytes>` cuts the reply off
+   mid-body with a connection reset.
 
 Run standalone:
 
@@ -50,6 +51,7 @@ import errno
 import json
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -62,6 +64,16 @@ PROBE_PATH = "/v1/models"
 
 # Not in `gateway.STRIP_REQUEST_HEADERS`, so it reaches the backend verbatim.
 DELAY_HEADER = "x-test-delay"
+
+# Also forwarded verbatim. `X-Test-Reset-After: <n>` sends the response head and
+# the first n body bytes, then resets the connection: a backend that dies after
+# the gateway has already started relaying its answer.
+RESET_HEADER = "x-test-reset-after"
+
+# How long the half-sent response sits before the reset, so the gateway has
+# relayed the head by the time it lands -- the failure under test is the one
+# that comes after the head, not before.
+RESET_GRACE_SECONDS = 0.3
 
 # gateway.DEFAULT_KEY_SOURCES[0] (gateway.py:1019).
 CONVERSATION_HEADER = "x-conversation-id"
@@ -187,7 +199,33 @@ class Handler(BaseHTTPRequestHandler):
             }
         ).encode()
         self.server.served += 1
+        try:
+            reset_after = int(self.headers.get(RESET_HEADER) or -1)
+        except ValueError:
+            reset_after = -1
+        if reset_after >= 0:
+            self._reply_then_reset(payload, reset_after)
+            return
         self._reply(200, payload, extra=[("X-Backend-Id", self.server.job_id)])
+
+    def _reply_then_reset(self, payload, sent):
+        """Promise the whole payload, deliver `sent` bytes of it, then reset."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("X-Backend-Id", self.server.job_id)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload[:sent])
+        time.sleep(RESET_GRACE_SECONDS)
+        # An RST, not a FIN: SO_LINGER 0 makes close() abort the connection, so
+        # the gateway's next read raises instead of reading a clean end of body.
+        # rfile holds a reference to the socket, and close() only reaches the
+        # kernel once the last one is released.
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        self.rfile.close()
+        self.connection.close()
+        self.close_connection = True
 
     def _record(self, kind, method, seq, delay):
         self.server.record(

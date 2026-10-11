@@ -71,10 +71,10 @@ class NixlTransferStatus(TransferStatus):
         while status in (TransferState.PENDING, TransferState.PROCESSING):
             status = TransferState(self.agent.check_xfer_state(self.handle))
             if status == TransferState.ERROR:
-                logger.error("NIXL transfer entered ERROR state (agent=%s).", self.agent.name)
+                logger.error(f"NIXL transfer entered ERROR state (agent={self.agent.name}).")
                 return False
             if timeout is not None and (time.time() - start_time > timeout):
-                logger.warning("NIXL transfer wait timed out after %s ms.", timeout_ms)
+                logger.warning(f"NIXL transfer wait timed out after {timeout_ms} ms.")
                 return False
             time.sleep(sleep_time)
             sleep_time = min(sleep_time * 2, max_sleep_time)

@@ -526,10 +526,9 @@ class PiecewiseCapturedGraph(nn.Module):
         # batches (monolithic CG still handles decode).
         if not self.split_info.static_submod_indices:
             ad_logger.warning(
-                "PiecewiseCapturedGraph: no static partitions after splitting "
-                "(%d dynamic). Piecewise CUDA graphs disabled — prefill/mixed "
-                "batches will run eagerly.",
-                len(self.split_info.dynamic_submod_indices),
+                f"PiecewiseCapturedGraph: no static partitions after splitting ("
+                f"{len(self.split_info.dynamic_submod_indices)} dynamic). Piecewise CUDA graphs "
+                f"disabled — prefill/mixed batches will run eagerly."
             )
             self._is_prepared = True
             return
@@ -558,9 +557,8 @@ class PiecewiseCapturedGraph(nn.Module):
         ):
             trailing_idx = static_indices.pop()
             ad_logger.info(
-                "PiecewiseCapturedGraph: excluding trailing static submod_%d "
-                "(lm_head) from capture — will run eagerly",
-                trailing_idx,
+                f"PiecewiseCapturedGraph: excluding trailing static submod_{trailing_idx} "
+                f"(lm_head) from capture — will run eagerly"
             )
 
         runner_by_idx: Dict[int, ADPiecewiseRunner] = {}
@@ -572,8 +570,8 @@ class PiecewiseCapturedGraph(nn.Module):
 
             if not submod_has_cuda_ops(original_submod):
                 ad_logger.info(
-                    "PiecewiseCapturedGraph: skipping %s (no CUDA ops, will run eagerly)",
-                    submod_name,
+                    f"PiecewiseCapturedGraph: skipping {submod_name} (no CUDA ops, will run "
+                    f"eagerly)"
                 )
                 num_skipped_static += 1
                 continue
@@ -617,9 +615,8 @@ class PiecewiseCapturedGraph(nn.Module):
                         setattr(self.split_gm, submod_name, wrapper)
                         num_metadata_wrapped += 1
                         ad_logger.info(
-                            "PiecewiseCapturedGraph: wrapped %s in "
-                            "MetadataWrapper (stable output addresses)",
-                            submod_name,
+                            f"PiecewiseCapturedGraph: wrapped {submod_name} in MetadataWrapper "
+                            f"(stable output addresses)"
                         )
                     continue
 
@@ -630,10 +627,8 @@ class PiecewiseCapturedGraph(nn.Module):
                 )
                 if current_static_runner is None:
                     ad_logger.info(
-                        "PiecewiseCapturedGraph: %s has no preceding static "
-                        "runner, using fallback runner (submod_%d)",
-                        submod_name,
-                        min(runner_by_idx),
+                        f"PiecewiseCapturedGraph: {submod_name} has no preceding static runner, "
+                        f"using fallback runner (submod_{min(runner_by_idx)})"
                     )
 
                 _inject_out_param(submod)
@@ -672,10 +667,8 @@ class PiecewiseCapturedGraph(nn.Module):
                     )
                 else:
                     ad_logger.warning(
-                        "Dynamic submod_%d returned %s (expected torch.Tensor), "
-                        "cannot pre-allocate output buffer",
-                        dynamic_idx,
-                        type(output).__name__,
+                        f"Dynamic submod_{dynamic_idx} returned {type(output).__name__} (expected "
+                        f"torch.Tensor), cannot pre-allocate output buffer"
                     )
 
             return hook
@@ -765,16 +758,17 @@ class PiecewiseCapturedGraph(nn.Module):
                     self._static_input_buffers[key] = (torch.empty_like(v1), dyn_dim)
                 else:
                     ad_logger.warning(
-                        "PiecewiseCapturedGraph: kwarg '%s' has unstable address but "
-                        "no dynamic dim found; leaving it unbuffered",
-                        key,
+                        f"PiecewiseCapturedGraph: kwarg '{key}' has unstable address but no "
+                        f"dynamic dim found; leaving it unbuffered"
                     )
 
         if self._static_input_buffers:
+            buffers = {
+                k: (v[0].shape, f"dyn_dim={v[1]}") for k, v in self._static_input_buffers.items()
+            }
             ad_logger.info(
-                "PiecewiseCapturedGraph: allocated %d static input buffer(s): %s",
-                len(self._static_input_buffers),
-                {k: (v[0].shape, f"dyn_dim={v[1]}") for k, v in self._static_input_buffers.items()},
+                f"PiecewiseCapturedGraph: allocated {len(self._static_input_buffers)} "
+                f"static input buffer(s): {buffers}"
             )
 
     def _copy_to_static_buffers(self, kwargs: Dict[str, Any]) -> None:
@@ -871,9 +865,8 @@ class PiecewiseCapturedGraph(nn.Module):
             return self._out_spec.unflatten(list(result))
         except Exception as e:
             ad_logger.warning(
-                "PiecewiseCapturedGraph._reconstruct_output: failed to unflatten output "
-                "(%s); returning raw tuple",
-                e,
+                f"PiecewiseCapturedGraph._reconstruct_output: failed to unflatten output ({e}); "
+                f"returning raw tuple"
             )
             return result
 
@@ -1016,11 +1009,8 @@ class DualModeCapturedGraph(nn.Module):
                 return v
             if len(matching_dims) > 1:
                 ad_logger.warning(
-                    "DualModeCapturedGraph._truncate_output: ambiguous token dim for shape %s, "
-                    "bucket=%d; falling back to dim %d",
-                    tuple(v.shape),
-                    bucket,
-                    matching_dims[0],
+                    f"DualModeCapturedGraph._truncate_output: ambiguous token dim for shape "
+                    f"{tuple(v.shape)}, bucket={bucket}; falling back to dim {matching_dims[0]}"
                 )
             return v.narrow(matching_dims[0], 0, num_tokens)
 

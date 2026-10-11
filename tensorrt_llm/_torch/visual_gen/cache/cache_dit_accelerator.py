@@ -36,7 +36,7 @@ class CacheDiTAccelerator(CacheAccelerator):
         try:
             self._result.disable()
         except Exception as exc:
-            logger.warning("Cache-DiT: disable_cache failed: %s", exc)
+            logger.warning(f"Cache-DiT: disable_cache failed: {exc}")
         self._result = None
 
     def refresh(self, num_inference_steps: int, separate_cfg: bool | None = None) -> None:

@@ -966,9 +966,8 @@ class FlashInferMLAAttention(AttentionDescriptor):
         # FlashInfer MLA kernels currently require BF16 cache dtype.
         if cache_dtype != torch.bfloat16:
             ad_logger.warning(
-                "FlashInfer MLA requires BF16 KV cache; overriding %s to %s.",
-                cache_dtype,
-                torch.bfloat16,
+                f"FlashInfer MLA requires BF16 KV cache; overriding {cache_dtype} to "
+                f"{torch.bfloat16}."
             )
             cache_dtype = torch.bfloat16
 

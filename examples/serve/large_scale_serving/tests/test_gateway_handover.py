@@ -707,23 +707,29 @@ def test_drain_deadline_expiry_abandons_and_exits(make_scenario):
     assert pid_alive(successor_pid), "the successor is not running after the drain expired"
 
 
-def test_drain_waits_for_a_handler_whose_client_disconnected(make_scenario):
-    """A client RST must not be mistaken for a finished request.
+def test_drain_is_not_held_by_a_handler_whose_client_disconnected(make_scenario):
+    """A dead client's handler must not hold the drain hostage.
 
-    `Server.wait_closed()` is keyed on `Server._active_count`, which is
-    transport-scoped: it drops the moment the client's socket dies, not when
-    the handler returns. Measured by item B and re-verified by the integrator on
-    3.12.3, it returns in 0.000s after a mid-request RST with the handler still
-    running. Clients disconnecting mid-stream is the normal case for this
-    gateway, so a drain built on `wait_closed()` alone would routinely declare
-    the process idle while it was still relaying -- silently reintroducing the
-    dropped requests the handover exists to prevent.
+    This test used to assert the opposite -- that after a client RST the
+    predecessor stays alive until the backend finishes -- because the handler
+    was blind to the client's death and drain-by-inflight-counter was the only
+    honest signal. The abandonment watcher removed the blindness: a buffered
+    request whose client hangs up is now detected at the disconnect, the
+    upstream is closed (arming the serving stack's own abort chain), and the
+    handler returns. Keeping the old assertion would pin the gateway to
+    serving corpses.
 
-    So: reset a client mid-request while the backend is still working, then hand
-    over, and require the predecessor to stay alive until that handler finishes.
+    What this must still guarantee, and asserts:
+
+    * the abandoned handler ends promptly, so the drain -- and with it the
+      handover -- finishes long before the backend's stall would have, and
+    * the predecessor still exits 0 without tripping its drain deadline.
+
+    The live-client half of the drain contract -- no request whose client is
+    still there may be dropped -- is `test_handover_serves_every_request`.
     """
     require_cli("--handover-drain-deadline", "--handover-ready-timeout", "--router-only")
-    hold_s = 6.0
+    hold_s = 12.0
     scenario = make_scenario(
         "drain-rst",
         backends=2,
@@ -757,27 +763,20 @@ def test_drain_waits_for_a_handler_whose_client_disconnected(make_scenario):
     status, payload = scenario.start_handover()
     assert status == 202, (status, payload)
     assert time.time() < expected_finish - 1.0, (
-        "the handover started after the reset handler had already finished; nothing was in "
-        "flight to drain"
+        "the handover started after the stalled backend had already replied; nothing "
+        "abandoned was in flight to (not) wait for"
     )
 
     rc, t_exit = scenario.gateway.wait_exit(timeout=hold_s + 90.0)
     assert rc is not None, "the predecessor never exited.\n%s" % scenario.diagnostics()
-    assert t_exit >= expected_finish - 0.5, (
-        "the predecessor exited %.2fs BEFORE the handler it was still running had finished "
-        "(reset at +%.2fs, backend replies at +%.2fs). This is the `wait_closed()`-only "
-        "drain: the client's transport died, `Server._active_count` dropped to zero, and the "
-        "process declared itself idle while `Gateway.handle` was still relaying. CONTRACT "
-        "item B CORRECTION: the drain must be `wait_closed()` PLUS a process-level in-flight "
-        "counter under one shared deadline.\n%s"
-        % (expected_finish - t_exit, t_reset - t_arrived, hold_s, scenario.diagnostics())
+    assert t_exit < expected_finish - 1.0, (
+        "the predecessor exited %.2fs AFTER the stalled backend replied: the abandoned "
+        "handler sat out the full %.0fs stall, so the client's disconnect was never "
+        "noticed and the drain waited for a request nobody can receive.\n%s"
+        % (t_exit - expected_finish, hold_s, scenario.diagnostics())
     )
-    assert t_exit < expected_finish + 20.0, (
-        "the predecessor took %.1fs longer than the in-flight handler needed"
-        % (t_exit - expected_finish)
-    )
-    assert rc == 0, "CONTRACT step 8: A 'then exits 0'; it exited %s" % rc
+    assert rc == 0, "the predecessor should exit 0; it exited %s" % rc
     assert not DRAIN_EXPIRY.search(scenario.gateway.log_text()), (
-        "the drain hit its deadline, but the deadline (30s) was far longer than the %.0fs the "
-        "in-flight handler needed:\n%s" % (hold_s, scenario.gateway.log_tail(60))
+        "the drain hit its deadline over a handler whose client was already gone:\n%s"
+        % scenario.gateway.log_tail(60)
     )

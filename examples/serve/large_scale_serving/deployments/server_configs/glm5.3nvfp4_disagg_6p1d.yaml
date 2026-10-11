@@ -1,0 +1,8 @@
+backend: pytorch
+num_workers: 8
+context_servers:
+  num_instances: 6
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1

@@ -306,6 +306,6 @@ def split_web_search_calls(output_items: Sequence[Any]) -> Tuple[List[Any], List
 
 def log_search(outcome: SearchOutcome) -> None:
     if outcome.ok:
-        logger.info("web search %r -> %d results", outcome.query, len(outcome.results))
+        logger.info(f"web search {outcome.query!r} -> {len(outcome.results)} results")
     else:
-        logger.warning("web search %r failed: %s", outcome.query, outcome.error)
+        logger.warning(f"web search {outcome.query!r} failed: {outcome.error}")

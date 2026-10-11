@@ -19,8 +19,9 @@ import os
 import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import (
-    MODEL_TYPE_TO_REASONING_PARSER, NemotronV3ReasoningParser,
-    ReasoningParserFactory, resolve_auto_reasoning_parser)
+    MODEL_TYPE_TO_REASONING_PARSER, GlmReasoningParser,
+    NemotronV3ReasoningParser, ReasoningParserFactory, ReasoningParserResult,
+    resolve_auto_reasoning_parser)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1264,10 +1265,9 @@ class TestGlmReasoningParser:
     under its own key so no other model's output is rewritten.
     """
 
-    CAMPAIGN_OUTPUT = (
-        "...environment recovered.</think>"
-        "Let me retry exec after waiting.</think>"
-        "<tool_call>collaboration.followup_task")
+    CAMPAIGN_OUTPUT = ("...environment recovered.</think>"
+                       "Let me retry exec after waiting.</think>"
+                       "<tool_call>collaboration.followup_task")
 
     @staticmethod
     def _parser():
@@ -1294,9 +1294,8 @@ class TestGlmReasoningParser:
 
         assert result.reasoning_content == "...environment recovered."
         assert "</think>" not in result.content
-        assert result.content == (
-            "Let me retry exec after waiting."
-            "<tool_call>collaboration.followup_task")
+        assert result.content == ("Let me retry exec after waiting."
+                                  "<tool_call>collaboration.followup_task")
 
     @pytest.mark.parametrize("chunk", [1, 3, 8, 1000])
     def test_a_closing_tag_split_across_deltas_is_not_leaked(self, chunk):
@@ -1306,8 +1305,8 @@ class TestGlmReasoningParser:
         piece at a time; chunk sizes 3 and 8 both hit that, so the partial
         fragment has to be withheld rather than emitted.
         """
-        content, reasoning = self._stream(
-            self._parser(), self.CAMPAIGN_OUTPUT, chunk)
+        content, reasoning = self._stream(self._parser(), self.CAMPAIGN_OUTPUT,
+                                          chunk)
 
         assert "</think>" not in content
         assert reasoning == "...environment recovered."
@@ -1315,8 +1314,8 @@ class TestGlmReasoningParser:
     @pytest.mark.parametrize("chunk", [1, 3, 8, 1000])
     def test_streaming_agrees_with_parsing_the_whole_text(self, chunk):
         whole = self._parser().parse(self.CAMPAIGN_OUTPUT)
-        content, reasoning = self._stream(
-            self._parser(), self.CAMPAIGN_OUTPUT, chunk)
+        content, reasoning = self._stream(self._parser(), self.CAMPAIGN_OUTPUT,
+                                          chunk)
 
         assert content == whole.content
         assert reasoning == whole.reasoning_content
@@ -1339,3 +1338,595 @@ class TestGlmReasoningParser:
             "deepseek-r1").parse(self.CAMPAIGN_OUTPUT)
 
         assert "</think>" in result.content
+
+
+# The recorded failure, reduced to the shape the parser can react to.
+#
+# Live on 2026-09-18, instance 477479,
+# `disagg_request_id=10897237976417924`: 26,055 characters delivered in 169
+# frames, zero `<think>` and zero `</think>` anywhere, and one well-formed
+# tool call at offset 25,392 -- arriving whole, inside frame 165. The prose
+# between the markers cannot change any decision the parser makes, so only
+# the load-bearing structure is kept: the 169 frame lengths, the offset and
+# text of every `<` in the generation, and the call itself.
+# `test_the_fixture_matches_the_recorded_generation` asserts each of those
+# properties back, so a fixture that drifts from the capture fails loudly
+# rather than passing quietly.
+_RECORDED_LENGTH = 26055
+_RECORDED_TOOL_CALL_OFFSET = 25392
+_RECORDED_FRAME_LENS = (1, 153, 116, 185, 182, 172, 154, 134, 141, 149, 117,
+                        160, 170, 263, 130, 126, 123, 123, 144, 170, 158, 114,
+                        116, 141, 139, 153, 138, 119, 123, 188, 112, 134, 131,
+                        132, 83, 119, 134, 171, 169, 160, 129, 167, 141, 163,
+                        160, 129, 161, 174, 151, 190, 155, 104, 195, 159, 119,
+                        106, 188, 181, 143, 158, 123, 175, 413, 179, 129, 127,
+                        138, 121, 148, 165, 131, 153, 163, 174, 192, 147, 137,
+                        143, 131, 139, 158, 120, 166, 183, 160, 157, 179, 175,
+                        164, 137, 139, 130, 173, 140, 140, 164, 141, 156, 225,
+                        121, 145, 173, 164, 156, 127, 150, 121, 125, 176, 158,
+                        155, 166, 194, 177, 171, 141, 169, 148, 191, 124, 150,
+                        153, 133, 167, 182, 146, 159, 159, 125, 146, 135, 156,
+                        150, 161, 157, 154, 151, 153, 160, 137, 148, 135, 134,
+                        123, 142, 195, 167, 171, 151, 156, 167, 191, 166, 194,
+                        161, 142, 166, 158, 151, 118, 163, 200, 163, 186, 219,
+                        224, 180, 150, 193)
+# Every `<` the generation contains before the tool call. They are what the
+# partial-marker holdbacks have to survive, so they keep their real offsets.
+_RECORDED_ANGLE_BRACKETS = (
+    (1843, "<float>()"),
+    (1871, "<float>()"),
+    (1914, "<float>()"),
+    (1958, "<float>()"),
+    (9407, "< total)"),
+    (21388, "< 0.01 ULP"),
+)
+_RECORDED_TOOL_CALL = (
+    "<tool_call>collaboration.send_message<arg_key>message</arg_key>"
+    "<arg_value>"
+    "Key finding: The Nemotron-3 chain is extremely sensitive to "
+    "accumulation-order differences between cuBLAS gemm (beta=0, no bias) "
+    "+ manual kernel-add-bias, versus PyTorch's `at::linear`/addmm (which "
+    "fuses bias into the cuBLAS reduction). Difference is only ~1-2 ULP per "
+    "step, but amplifies by ~sqrt(K) per GEMM through the 13-step chain, so "
+    "the final error reaches 4.3e13 (rel 0.48). Fix: use cuBLASLt with "
+    "CUBLASLT_EPILOGUE_BIAS to match `at::linear` numerically and remove "
+    "bias-add from the element-wise kernels."
+    "</arg_value><arg_key>target</arg_key><arg_value>root</arg_value>"
+    "</tool_call>")
+
+
+def _recorded_generation() -> tuple[str, list[str]]:
+    """Rebuild the captured generation and its 169 frames."""
+    filler = ("The maxdiff grows through the chain, so the bias-add kernels "
+              "come out slightly off from at::linear. ")
+    chars = list(
+        (filler * (_RECORDED_LENGTH // len(filler) + 1))[:_RECORDED_LENGTH])
+    for offset, snippet in _RECORDED_ANGLE_BRACKETS:
+        chars[offset:offset + len(snippet)] = snippet
+    chars[_RECORDED_TOOL_CALL_OFFSET:] = _RECORDED_TOOL_CALL
+    text = "".join(chars)
+    frames, at = [], 0
+    for size in _RECORDED_FRAME_LENS:
+        frames.append(text[at:at + size])
+        at += size
+    return text, frames
+
+
+class TestGlmToolCallEndsReasoning:
+    """A tool call opened without `</think>` must not stay in reasoning.
+
+    GLM's chat template prefills `<think>`, so the parser starts inside the
+    block. When the model reaches a tool call without ever closing it, the
+    whole call -- markup included -- was classified as `reasoning_content`;
+    the tool parser only ever sees the content half, so the call reached the
+    client as reasoning text and never as a call.
+
+    `TestGlmReasoningParser` above owns the opposite shape (GLM closing the
+    block twice) and its tests double as the regression guard for it: this
+    change must leave those outputs byte for byte identical.
+    """
+
+    TOOL_CALL = "<tool_call>"
+    # Short enough to re-chunk exhaustively, and the same shape as the
+    # recorded call: reasoning, then the marker, then `<arg_key>` markup
+    # that a naive "split on the first `<`" would also have to survive.
+    SPLIT_CASE = ("Planning the next step."
+                  "<tool_call>collab.send<arg_key>m</arg_key></tool_call>")
+    # The (content, reasoning) split `SPLIT_CASE` has to produce, no matter
+    # how it is chunked. The sweeps below compare against this rather than
+    # against a whole-marker run of the same parser: a parser that leaks the
+    # call is self-consistent under every chunking, so agreement alone would
+    # pass on the unfixed code.
+    SPLIT_CASE_RESULT = (
+        "<tool_call>collab.send<arg_key>m</arg_key></tool_call>",
+        "Planning the next step.")
+
+    @staticmethod
+    def _parser(**kwargs):
+        if kwargs:
+            return GlmReasoningParser(**kwargs)
+        return ReasoningParserFactory.create_reasoning_parser("glm")
+
+    @classmethod
+    def _stream(cls, deltas, **kwargs) -> tuple[str, str]:
+        """Feed `deltas` to a fresh parser; return (content, reasoning)."""
+        parser = cls._parser(**kwargs)
+        content, reasoning = [], []
+        for delta in deltas:
+            result = parser.parse_delta(delta)
+            content.append(result.content)
+            reasoning.append(result.reasoning_content)
+        result = parser.finish()
+        content.append(result.content)
+        reasoning.append(result.reasoning_content)
+        return "".join(content), "".join(reasoning)
+
+    @staticmethod
+    def _chunks(text: str, size: int) -> list[str]:
+        return [text[i:i + size] for i in range(0, len(text), size)]
+
+    # -- case 1 / case 9: the live defect, streaming and not ---------------
+
+    def test_a_tool_call_without_a_closing_tag_reaches_content(self):
+        result = self._parser().parse(self.SPLIT_CASE)
+
+        assert result.reasoning_content == "Planning the next step."
+        assert result.content == (
+            "<tool_call>collab.send<arg_key>m</arg_key></tool_call>")
+
+    def test_the_marker_arriving_whole_reaches_content(self):
+        assert self._stream([self.SPLIT_CASE]) == self.SPLIT_CASE_RESULT
+
+    # -- the recorded 169-frame generation ---------------------------------
+
+    def test_the_fixture_matches_the_recorded_generation(self):
+        """Guards the reduction, not the parser.
+
+        The fixture is the capture with its prose replaced; if any property
+        the parser can observe drifts, the replay below stops testing what
+        was recorded.
+        """
+        text, frames = _recorded_generation()
+
+        assert len(text) == _RECORDED_LENGTH
+        assert len(frames) == 169 and "".join(frames) == text
+        assert "<think>" not in text and "</think>" not in text
+        assert text.count(self.TOOL_CALL) == 1
+        assert text.index(self.TOOL_CALL) == _RECORDED_TOOL_CALL_OFFSET
+        # The call arrives whole, inside one frame -- which is why the
+        # capture alone never exercised the split-marker path.
+        assert sum(self.TOOL_CALL in frame for frame in frames) == 1
+        assert frames[165].count(self.TOOL_CALL) == 1
+
+    def test_the_recorded_generation_puts_the_call_in_content(self):
+        text, frames = _recorded_generation()
+
+        content, reasoning = self._stream(frames)
+
+        assert self.TOOL_CALL not in reasoning
+        assert content.startswith(_RECORDED_TOOL_CALL)
+        assert reasoning == text[:_RECORDED_TOOL_CALL_OFFSET]
+        assert reasoning + content == text
+
+    def test_the_recorded_generation_streams_as_it_parses(self):
+        text, frames = _recorded_generation()
+        whole = self._parser().parse(text)
+
+        assert whole.reasoning_content == text[:_RECORDED_TOOL_CALL_OFFSET]
+        assert self._stream(frames) == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 7, 12, 25, 40])
+    def test_the_recorded_generation_survives_re_chunking(self, size):
+        """The recorded framing alone never splits the marker.
+
+        It arrives whole inside frame 165, so the frames replay only the
+        first half of the defect. Re-chunked, sizes 1, 7, 25 and 40 all land
+        a boundary inside the marker; 12 does not, and is here so the sweep
+        covers both.
+        """
+        text, _ = _recorded_generation()
+
+        content, reasoning = self._stream(self._chunks(text, size))
+
+        assert reasoning == text[:_RECORDED_TOOL_CALL_OFFSET]
+        assert content == text[_RECORDED_TOOL_CALL_OFFSET:]
+
+    # -- case 2 / case 3: the marker split across deltas --------------------
+
+    @pytest.mark.parametrize("size", range(1, len(SPLIT_CASE) + 2))
+    def test_every_uniform_chunk_size_agrees_with_the_whole_marker(self, size):
+        """Re-chunking must not change the split.
+
+        One character per delta is included: the marker is then spread over
+        eleven deltas and is complete in none of them.
+        """
+        assert self._stream(self._chunks(self.SPLIT_CASE,
+                                         size)) == self.SPLIT_CASE_RESULT
+
+    def test_every_two_way_split_point_agrees_with_the_whole_marker(self):
+        """A sweep, not a case: any boundary inside the marker is the bug.
+
+        Splitting on complete matches alone survives 69 of these 78
+        boundaries -- and one of the nine it fails is saved by accident,
+        because a delta ending in a bare `<` is already withheld as a
+        possible `</think>`. A single hand-picked split proves nothing.
+        """
+        text = self.SPLIT_CASE
+        end = len(text) + 1
+        got = {self._stream([text[:i], text[i:]]) for i in range(end)}
+
+        assert got == {self.SPLIT_CASE_RESULT}
+
+    def test_every_three_way_split_point_agrees_with_the_whole_marker(self):
+        """Case 3: the marker spread over three deltas, at every offset."""
+        text = self.SPLIT_CASE
+        end = len(text) + 1
+        got = {
+            self._stream([text[:i], text[i:j], text[j:]])
+            for i in range(end)
+            for j in range(i, end)
+        }
+
+        assert got == {self.SPLIT_CASE_RESULT}
+
+    # -- the invariant ------------------------------------------------------
+
+    CONSERVATION_CASES = (
+        SPLIT_CASE,
+        # No markup at all.
+        "just some ordinary reasoning",
+        # The guard fires with markup on both sides of it.
+        "plan<tool_call>f</think>after",
+        # A closing tag first, so the guard must stay out of the way.
+        "plan</think>visible<tool_call>f",
+        # GLM's repeated close, then a call.
+        "a</think>b</think><tool_call>f",
+        # A `<` that is a prefix of both markers, then neither.
+        "a<b<tool_call>c",
+        # A `</think>` fragment that never completes, then the marker.
+        "x</t<tool_call>y",
+        # Text that only looks like the start of the marker.
+        "Planning <tools are useful, but",
+        # Truncated mid-marker, and mid-closing-tag.
+        "trailing<tool_c",
+        "trailing</thi",  # codespell:ignore thi
+        # Degenerate: nothing but the marker, and nothing but a `<`.
+        "<tool_call>",
+        "<",
+    )
+
+    @pytest.mark.parametrize("text", CONSERVATION_CASES)
+    @pytest.mark.parametrize("size", [1, 2, 3, 5, 7, 8, 11, 1000])
+    def test_nothing_is_dropped_or_duplicated(self, text, size):
+        """Reasoning plus content reconstructs the input.
+
+        `</think>` is the one exception, and by design: the base consumes the
+        first one as the block's delimiter, and a later one is dropped only
+        where it is a delimiter too -- the close a tool call preempted, or a
+        redundant close standing directly before `<tool_call>` -- which
+        covers every complete `</think>` these cases contain. Everything
+        else -- including fragments that never grew into a marker -- has to
+        come out somewhere, exactly once. (A quoted `</think>` in plain
+        visible text is preserved; `TestGlmReasoningReEntry` owns that
+        shape.)
+        """
+        expected = text.replace("</think>", "")
+        content, reasoning = self._stream(self._chunks(text, size))
+
+        assert self.TOOL_CALL not in reasoning
+        assert reasoning + content == expected
+
+    @pytest.mark.parametrize("text", CONSERVATION_CASES)
+    def test_nothing_is_dropped_or_duplicated_without_streaming(self, text):
+        expected = text.replace("</think>", "")
+        result = self._parser().parse(text)
+
+        assert self.TOOL_CALL not in result.reasoning_content
+        assert result.reasoning_content + result.content == expected
+
+    # -- the remaining edge cases -------------------------------------------
+
+    def test_a_closing_tag_in_the_same_delta_still_ends_the_block(self):
+        """Case 5: `</think>` first, so the block ends there.
+
+        Splitting at the marker instead would leave the closing tag stranded
+        at the end of `reasoning_content`.
+        """
+        text = "plan</think>say<tool_call>f"
+        expected = ("say<tool_call>f", "plan")
+
+        assert self._parser().parse(text).reasoning_content == "plan"
+        assert self._stream([text]) == expected
+        assert self._stream(self._chunks(text, 1)) == expected
+
+    def test_text_that_only_looks_like_the_marker_is_released(self):
+        """Case 6: nothing may be withheld forever."""
+        got = self._stream(["Planning <tool", "s are useful"])
+
+        assert got == ("", "Planning <tools are useful")
+
+    def test_a_stream_ending_mid_marker_flushes_the_fragment(self):
+        """Case 7: an incomplete tag is ordinary text, not markup.
+
+        It stays on the reasoning side because that is the block it was
+        withheld in -- the rule `finish()` already applies to a partial
+        `</think>`.
+        """
+        parser = self._parser()
+
+        assert parser.parse_delta("done<tool_c").reasoning_content == "done"
+        assert parser.finish().reasoning_content == "<tool_c"
+
+    @pytest.mark.parametrize("size", [1, 3, 1000])
+    def test_the_guard_is_silent_when_reasoning_is_disabled(self, size):
+        """Case 10: with no block open there is nothing to end."""
+        text = "hello<tool_call>f"
+        off = self._parser(reasoning_at_start=False)
+
+        assert off.parse(text) == ReasoningParserResult(content=text)
+        assert self._stream(self._chunks(text, size),
+                            reasoning_at_start=False) == (text, "")
+
+    def test_nemotron_is_left_alone(self):
+        """The same hole exists there, and is a separate change.
+
+        Asserted so that closing it is a deliberate edit to this test rather
+        than a silent side effect of touching the shared helpers.
+        """
+        parser = ReasoningParserFactory.create_reasoning_parser("nemotron-v3")
+        content, reasoning = "", ""
+        for delta in ["Planning<tool_", "call>exec"]:
+            result = parser.parse_delta(delta)
+            content += result.content
+            reasoning += result.reasoning_content
+
+        assert content == "" and self.TOOL_CALL in reasoning
+
+
+# The recorded re-entry failure, abridged: the model closed `</think>`,
+# wrote visible text, then emitted `<think>` again mid-message, and the
+# generation ends on a dangling `</`. Frame boundaries are the ones
+# delivered; the elisions cut prose the parser cannot react to.
+_REENTRY_FRAMES = (
+    "Still",
+    " maybe. Use 30 more.</think>## NCU run still in queue - polling once "
+    "more, then reporting palette results and the algorithmic findings "
+    "while we wait. Profiling takes long on jade\n\n```\n\n"
+    "{Comment, palette, print}\nGive. Engineers. Kind",
+    ". Color. One. Nice. Tune. Not.<think>It appears the trailing "
+    "commentary text became garbled - possibly due to token corruption. "
+    "Let me just say I'm waiting on the NCU run",
+    ", one GPU request at a time.\n\nCan I proceed. Yes - poll NCU once "
+    "more.\n</",
+)
+_REENTRY_TEXT = "".join(_REENTRY_FRAMES)
+
+
+class TestGlmReasoningReEntry:
+    """The model closes the block, writes text, then opens `<think>` again.
+
+    Measured on the recorded frames above: the streamed view dropped the 30
+    visible characters standing before the re-entry marker (the base class
+    discards text ahead of a `<think>` it hunts down) and classified the
+    second block as reasoning, while the whole-text parse kept both as
+    content - stream and final described different documents, with
+    characters existing in neither.
+
+    The rule, on both paths: the first close wins. Once `</think>` has
+    closed the block, a later `<think>` does not re-enter it - it is
+    visible text, preserved verbatim, marker included - which is what the
+    whole-text parse (one partition on the first close) always did. And a
+    later `</think>` is dropped only in the delimiter shapes
+    `TestGlmReasoningParser` pins; quoted in plain visible text it is
+    preserved, where it used to be stripped out of tool output the model
+    was echoing.
+    """
+
+    @staticmethod
+    def _parser():
+        return ReasoningParserFactory.create_reasoning_parser("glm")
+
+    @classmethod
+    def _stream(cls, deltas) -> tuple[str, str]:
+        parser = cls._parser()
+        content, reasoning = [], []
+        for delta in deltas:
+            result = parser.parse_delta(delta)
+            content.append(result.content)
+            reasoning.append(result.reasoning_content)
+        result = parser.finish()
+        content.append(result.content)
+        reasoning.append(result.reasoning_content)
+        return "".join(content), "".join(reasoning)
+
+    @staticmethod
+    def _chunks(text: str, size: int) -> list[str]:
+        return [text[i:i + size] for i in range(0, len(text), size)]
+
+    def test_the_whole_parse_reads_everything_after_the_close_as_content(self):
+        result = self._parser().parse(_REENTRY_TEXT)
+
+        assert result.reasoning_content == "Still maybe. Use 30 more."
+        assert result.content == _REENTRY_TEXT.split("</think>", 1)[1]
+        # Zero characters lost: the input is the split plus its delimiter.
+        assert (result.reasoning_content + "</think>" +
+                result.content == _REENTRY_TEXT)
+
+    def test_the_recorded_frames_stream_as_they_parse(self):
+        whole = self._parser().parse(_REENTRY_TEXT)
+
+        content, reasoning = self._stream(_REENTRY_FRAMES)
+
+        assert (content, reasoning) == (whole.content, whole.reasoning_content)
+
+    def test_the_dropped_thirty_characters_are_streamed(self):
+        """The measured loss, asserted back directly."""
+        content, _ = self._stream(_REENTRY_FRAMES)
+
+        assert ". Color. One. Nice. Tune. Not." in content
+        assert "<think>It appears" in content
+        assert content.endswith("\n</")
+
+    @pytest.mark.parametrize("size", [1, 3, 7, 8, 11, 40, 1000])
+    def test_every_uniform_chunk_size_agrees_with_the_whole_parse(self, size):
+        whole = self._parser().parse(_REENTRY_TEXT)
+
+        got = self._stream(self._chunks(_REENTRY_TEXT, size))
+
+        assert got == (whole.content, whole.reasoning_content)
+
+    def test_every_two_way_split_point_agrees_with_the_whole_parse(self):
+        whole = self._parser().parse(_REENTRY_TEXT)
+        expected = (whole.content, whole.reasoning_content)
+        text = _REENTRY_TEXT
+
+        got = {self._stream([text[:i], text[i:]]) for i in range(len(text) + 1)}
+
+        assert got == {expected}
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_later_think_is_visible_text_not_a_re_entry(self, size):
+        text = "reasoned</think>answer<think>afterthought"
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == "answer<think>afterthought"
+        assert whole.reasoning_content == "reasoned"
+        assert streamed == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_quoted_close_in_visible_text_is_preserved(self, size):
+        """`_without_stray_end` must not strip quoted markers.
+
+        The other half of the fix: marker-like text inside content it merely
+        passes through - tool output quoting the tag, source code printing
+        it - stays. Only the delimiter shapes (`</think><tool_call>`, and
+        the close a tool call preempted) are dropped.
+        """
+        text = ("plan</think>The tool printed a literal </think> marker "
+                "inside its output text.")
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == ("The tool printed a literal </think> "
+                                 "marker inside its output text.")
+        assert whole.reasoning_content == "plan"
+        assert streamed == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_re_entered_block_may_still_carry_a_tool_call(self, size):
+        """A call in the visible text keeps working after a re-entry."""
+        text = ("think one</think>visible<think>more thoughts"
+                "<tool_call>exec</tool_call>tail")
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == ("visible<think>more thoughts"
+                                 "<tool_call>exec</tool_call>tail")
+        assert streamed == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_close_ending_the_stream_is_preserved(self, size):
+        """A trailing close marker is text.
+
+        At end of stream nothing follows the marker, so it cannot be the
+        delimiter shape; both paths keep it as text.
+        """
+        text = "r</think>text</think>"
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == "text</think>"
+        assert streamed == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_think_marker_ending_the_stream_stays_visible(self, size):
+        text = "r</think>c<think>"
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == "c<think>"
+        assert streamed == (whole.content, whole.reasoning_content)
+
+
+class TestGlmDoubleCloseResidue:
+    """The model closes its block twice in a row before plain text.
+
+    Recorded 2026-09-30 (one frame, verbatim shape): `...Let's
+    do.</think></think>I'm going to try the CUDA WMMA path...`. The
+    partition consumes the first close; the second stood at the very head
+    of the content and, after the quoting-preservation narrowing, nothing
+    dropped it any more - 32-35% of assistant turns shipped a literal
+    `</think>` prefix to the client. A close before the first content
+    character cannot be a quote (a quote needs text to carry it), so every
+    consecutive leading close is delimiter residue, dropped on both views;
+    a close after real content keeps the narrowed quoting rule.
+    """
+
+    TEXT = ("Search cutlass for wmma. Let's do."
+            "</think></think>I'm going to try the CUDA WMMA path next.")
+
+    @staticmethod
+    def _parser():
+        return ReasoningParserFactory.create_reasoning_parser("glm")
+
+    @classmethod
+    def _stream(cls, deltas) -> tuple[str, str]:
+        parser = cls._parser()
+        content, reasoning = [], []
+        for delta in deltas:
+            result = parser.parse_delta(delta)
+            content.append(result.content)
+            reasoning.append(result.reasoning_content)
+        result = parser.finish()
+        content.append(result.content)
+        reasoning.append(result.reasoning_content)
+        return "".join(content), "".join(reasoning)
+
+    @staticmethod
+    def _chunks(text: str, size: int) -> list[str]:
+        return [text[i:i + size] for i in range(0, len(text), size)]
+
+    def test_the_whole_parse_drops_the_leading_residue(self):
+        result = self._parser().parse(self.TEXT)
+
+        assert result.reasoning_content == ("Search cutlass for wmma. "
+                                            "Let's do.")
+        assert result.content == "I'm going to try the CUDA WMMA path next."
+
+    @pytest.mark.parametrize("size", [1, 2, 3, 5, 7, 11, 16, 40, 200])
+    def test_the_stream_agrees_on_every_chunking(self, size):
+        whole = self._parser().parse(self.TEXT)
+
+        content, reasoning = self._stream(self._chunks(self.TEXT, size))
+
+        assert (content, reasoning) == (whole.content, whole.reasoning_content)
+
+    def test_a_triple_close_is_still_residue(self):
+        text = "plan</think></think></think>done"
+        whole = self._parser().parse(text)
+        assert whole.content == "done"
+
+        content, _ = self._stream(self._chunks(text, 3))
+        assert content == "done"
+
+    def test_a_double_close_at_end_of_stream_leaves_no_content(self):
+        text = "plan</think></think>"
+        whole = self._parser().parse(text)
+        assert whole.content == ""
+
+        content, _ = self._stream(self._chunks(text, 4))
+        assert content == ""
+
+    def test_a_quoted_close_after_real_content_is_still_preserved(self):
+        text = "plan</think>The tool printed </think> in its output."
+        whole = self._parser().parse(text)
+        assert whole.content == "The tool printed </think> in its output."
+
+        content, _ = self._stream(self._chunks(text, 6))
+        assert content == whole.content

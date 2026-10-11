@@ -685,8 +685,8 @@ class KvCacheCreator:
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
                 logger.warning(
-                    "KVCacheManagerV2 is not supported with %s. "
-                    "Falling back to KVCacheManager.", incompat_str)
+                    f"KVCacheManagerV2 is not supported with {incompat_str}. "
+                    f"Falling back to KVCacheManager.")
                 return KVCacheManager
         return kv_cache_manager_cls
 
@@ -1446,9 +1446,9 @@ class KvCacheCreator:
                 and getattr(sparse_cfg, "algorithm", None) == "deepseek_v4"
                 and self._mapping.pp_size > 1):
             logger.info(
-                "DeepSeek-V4 separate draft KV cache is only supported for PP=1; "
-                "folding draft layers into the unified manager for pp_size=%d.",
-                self._mapping.pp_size)
+                f"DeepSeek-V4 separate draft KV cache is only supported for "
+                f"PP=1; folding draft layers into the unified manager for "
+                f"pp_size={self._mapping.pp_size}.")
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
@@ -2801,10 +2801,8 @@ def create_kv_cache_compression_manager(
         )
 
     logger.warning(
-        "KV-cache compression algorithm '%s' is not registered; running without "
-        "a compression manager.",
-        config.algorithm,
-    )
+        f"KV-cache compression algorithm '{config.algorithm}' is not "
+        f"registered; running without a compression manager.")
     return None
 
 

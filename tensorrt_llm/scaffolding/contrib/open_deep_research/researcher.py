@@ -160,9 +160,8 @@ class ResearchChatWithMCPController(ChatWithMCPController):
             response_message = chat_task.messages[-1]
             if not isinstance(response_message, AssistantMessage):
                 logger.warning(
-                    "Stopping ChatWithMCP tool loop: expected AssistantMessage "
-                    "after generation, got %s",
-                    type(response_message).__name__,
+                    f"Stopping ChatWithMCP tool loop: expected AssistantMessage after generation, "
+                    f"got {type(response_message).__name__}"
                 )
                 break
             if response_message.tool_calls:

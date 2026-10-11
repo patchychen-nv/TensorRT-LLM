@@ -751,7 +751,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     ) -> "BaseMediaIO[_MediaT]":
         """Merge per-modality kwargs and return a configured instance."""
         merged = cls.merge_kwargs(default_kwargs, runtime_kwargs)
-        logger.debug("effective %s kwargs keys: %s", cls.__name__, sorted(merged))
+        logger.debug(f"effective {cls.__name__} kwargs keys: {sorted(merged)}")
         return cls(**merged)
 
     @classmethod
@@ -862,9 +862,8 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
         # are present (e.g. via --media_io_kwargs or the per-request API).
         if kwargs:
             logger.warning(
-                "AudioMediaIO received unexpected kwargs %s — audio loading "
-                "has no configurable parameters; kwargs will be ignored.",
-                sorted(kwargs),
+                f"AudioMediaIO received unexpected kwargs {sorted(kwargs)} — audio loading has no "
+                f"configurable parameters; kwargs will be ignored."
             )
 
     def load_bytes(self, data: bytes) -> Tuple[np.ndarray, int]:

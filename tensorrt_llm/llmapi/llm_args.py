@@ -6234,16 +6234,16 @@ class TorchLlmArgs(BaseLlmArgs):
             env_url = os.environ.get("MODEL_EXPRESS_URL")
             if env_url:
                 logger.info(
-                    "mx_config.server_url not set; using MODEL_EXPRESS_URL=%s "
-                    "from environment.", env_url)
+                    f"mx_config.server_url not set; using MODEL_EXPRESS_URL="
+                    f"{env_url} from environment.")
                 self.mx_config.server_url = env_url
 
         if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
             logger.warning(
-                "mx_config.server_url is set but checkpoint_format is '%s', not "
-                "'MX'. The MX config will be ignored. Set "
-                "checkpoint_format='MX' to enable MX P2P weight transfer.",
-                self.checkpoint_format)
+                f"mx_config.server_url is set but checkpoint_format is '"
+                f"{self.checkpoint_format}', not 'MX'. The MX config will be "
+                f"ignored. Set checkpoint_format='MX' to enable MX P2P weight "
+                f"transfer.")
         return self
 
     @model_validator(mode="after")
@@ -6273,9 +6273,9 @@ class TorchLlmArgs(BaseLlmArgs):
                                      or self.gms_config.tag != "weights")
         if gms_config_is_non_default and self.load_format != LoadFormat.GMS:
             logger.warning(
-                "gms_config is set but load_format is '%s', not 'GMS'. "
-                "The GMS config will be ignored. Set load_format='GMS' to "
-                "enable GPU Memory Service.", self.load_format.name)
+                f"gms_config is set but load_format is '{self.load_format.name}"
+                f"', not 'GMS'. The GMS config will be ignored. Set "
+                f"load_format='GMS' to enable GPU Memory Service.")
         return self
 
     @model_validator(mode="after")

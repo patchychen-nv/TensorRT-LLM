@@ -90,7 +90,7 @@ def _set_pretrained_config_attr(model_config,
                f"{type(model_config).__name__}")
     if required:
         raise AttributeError(message)
-    logger.warning("%s; keeping the target checkpoint's value.", message)
+    logger.warning(f"{message}; keeping the target checkpoint's value.")
     return False
 
 

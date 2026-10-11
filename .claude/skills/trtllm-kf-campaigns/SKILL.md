@@ -57,6 +57,41 @@ drain, a bounded cost per campaign is worth more than the best result from any
 one of them. Do not raise it, and do not propose lowering `--effort` to "make
 the budget meaningful", unless the user reopens it.
 
+`--max-duration` is a **wall clock**, not a spend cap — "Server-side wall-clock
+safety net for the whole campaign", bare values in seconds, `s`/`m`/`h`
+suffixes, 168h maximum. The spend cap is the separate `--max-cost-usd`, which
+nothing here sets and which lands at its 10000.0 default. Reading the two out
+of `kf campaign init --help` with one grep puts the USD sentence directly under
+the `--max-duration` heading and invites exactly the wrong conclusion; read
+each flag's own block.
+
+## The Kernel-Trace set differs
+
+`--problems Kernel-Trace` (1241 problems, mirrored from
+`dl/flashinfer/kernel-trace` `traces/nemotron-cuda`) runs a different shape,
+by standing decision for that set only:
+
+    --agents-per-round 1        one agent per round, not six
+    every problem run 6 times   six separate campaigns, not six rounds
+
+`max_rounds` stays unset, so the effort tier's 10 applies within each campaign.
+
+The repeat is `kfrun --runs-per-problem 6`. The queue itself cannot express it
+(`kfq`'s lists are mutually exclusive by construction), so kfrun holds the
+claim across runs: each finished campaign is counted in
+`state.meta["runs"][problem]` keyed by **campaign id** — a bare counter would
+double-count whenever a refused kfq report makes reconcile re-see the same
+terminal campaign — and the next run is started from the same prepared
+workspace via the recycle mechanism (`kf campaign start --from` on an
+already-started workspace makes a fresh campaign from the same baseline, so a
+repeat costs a start, not a prepare). Runs are sequential per problem, which is
+deliberate: KF caps one user at 500 active campaigns, and six concurrent runs
+of one problem would spend that budget without adding throughput. The problem
+reports to kfq once, after its last run: `success` if any run succeeded.
+Infra-killed no-speedup campaigns do not consume a run slot when
+`--recycle-prepared` is on — recycle intercepts them first, bounded by
+`--start-attempts`.
+
 ## Ask for these before starting
 
 Only three things vary. Propose the default rather than interrogating:

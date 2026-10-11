@@ -790,11 +790,9 @@ class MultimodalParams:
                 if isinstance(current, dict) and target_key in current:
                     if target_key in _CPU_ONLY_MULTIMODAL_DATA_KEYS:
                         logger.warning_once(
-                            "to_device('%s') skipped: key is CPU-only "
-                            "multimodal metadata.",
-                            keyword_path,
-                            key="mm_cpu_only_skip",
-                        )
+                            f"to_device('{keyword_path}') skipped: key is "
+                            f"CPU-only multimodal metadata.",
+                            key="mm_cpu_only_skip")
                         continue
                     current[target_key] = self._apply_tensor_operation(
                         current[target_key],
@@ -1151,13 +1149,11 @@ def check_mm_embed_cumsum_if_needed(
             f"resolves).")
 
     logger.warning_once(
-        "multimodal_embed_mask_cumsum missing on multimodal request (keys=%s); "
-        "running without mask-aware accounting. This is fine for full-prefill "
-        "iterations but will fail if this request is later chunked or reuses "
-        "KV cache.",
-        mm_keys,
-        key="mm_embed_cumsum_missing_non_partial",
-    )
+        f"multimodal_embed_mask_cumsum missing on multimodal request (keys="
+        f"{mm_keys}); running without mask-aware accounting. This is fine for "
+        f"full-prefill iterations but will fail if this request is later "
+        f"chunked or reuses KV cache.",
+        key="mm_embed_cumsum_missing_non_partial")
 
 
 def _as_cpu_tensor(

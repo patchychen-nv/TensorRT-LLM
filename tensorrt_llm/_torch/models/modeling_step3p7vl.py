@@ -1076,10 +1076,8 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
             unk_id = getattr(hf_tok, "unk_token_id", None)
             if tok_id is None or (unk_id is not None and tok_id == unk_id):
                 logger.warning(
-                    "[Step3p7VL] Could not resolve structural token %r; "
-                    "multimodal hashing will fall back to the vocab-size "
-                    "discriminator only.",
-                    tok,
+                    f"[Step3p7VL] Could not resolve structural token {tok!r}; multimodal hashing "
+                    f"will fall back to the vocab-size discriminator only."
                 )
                 special_token_ids = []
                 break

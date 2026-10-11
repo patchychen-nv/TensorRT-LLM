@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# 2P1D: two context workers and one generation worker.
+#
+# The shape for a test deployment. It is deliberately not a smaller *kind* of
+# deployment -- it reuses the same ctx and gen worker configs the production
+# fleet runs (now DEP8 context, DEP8+MTP generation), so the only thing that
+# differs from a 6P1D instance is how many context workers sit in front of the
+# same generation worker. A smoke test that passed here and failed there would
+# then be telling you something about the prefill/decode ratio rather than
+# about a config the test fleet does not share.
+#
+# Identical to glm5.2_disagg_2p1d.yaml apart from this header. num_workers is
+# the one value that looked like it should move with the context worker's
+# DEP4 -> DEP8 change, and it does not -- see below.
+backend: pytorch
+# NOT a node count, and NOT tied to the context workers' rank count, despite
+# what the 5.2 files beside this one assert. This was read out of the code
+# rather than inferred:
+#
+#   * DisaggServerConfig.num_workers (llmapi/disagg_utils.py:155-158) is
+#     documented as "number of uvicorn disagg-server worker processes to fork
+#     on the public port", the explicit-config replacement for WEB_CONCURRENCY.
+#     commands/serve.py:2045-2060 forks exactly that many SO_REUSEPORT fleet
+#     workers on the PROXY node, behind one coordinator, and range-checks it
+#     against disagg_process_id_space() -- never against ranks or nodes.
+#   * serve.sh never reads the key at all. It derives the allocation from the
+#     engine configs alone: ranks_of(ctx_config) * ctx_instances +
+#     ranks_of(gen_config) * gen_instances, divided by slurm.gpus_per_node
+#     (serve.sh:144-241). The value here is copied verbatim into the
+#     per-attempt disagg_config.yaml and consumed only by
+#     `trtllm-serve disaggregated`.
+#
+# So the node count moves by itself -- 2 ctx x 8 ranks + 1 gen x 8 ranks = 24
+# ranks / 4 GPUs per node = 6 nodes, up from 4 -- while this number describes
+# the proxy's HTTP concurrency and is unaffected. 4 is what the 5.2 instances
+# run today, on the same proxy node, in front of the same one generation
+# worker, so it is left alone.
+num_workers: 4
+context_servers:
+  num_instances: 2
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1

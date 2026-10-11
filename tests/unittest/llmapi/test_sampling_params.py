@@ -170,6 +170,27 @@ def test_absent_generation_config_value_preserves_existing_defaults():
     assert serve_params.temperature == 1.0
 
 
+@pytest.mark.parametrize(
+    ("request_fields", "expected_logprobs"),
+    [
+        ({}, None),
+        ({"top_logprobs": 3}, None),
+        ({"include": ["reasoning.encrypted_content"]}, None),
+        ({"include": ["message.output_text.logprobs"]}, 0),
+        ({"include": ["message.output_text.logprobs"], "top_logprobs": 3}, 3),
+    ],
+)
+def test_responses_request_asks_for_logprobs_only_when_included(request_fields, expected_logprobs):
+    """Responses asks for logprobs only when `include` names them.
+
+    top_logprobs defaults to 0, and any non-None logprobs value turns their
+    computation on, which one-model speculative decoding rejects outright.
+    """
+    params = ResponsesRequest(model="test", input="hi", **request_fields).to_sampling_params()
+
+    assert params.logprobs == expected_logprobs
+
+
 @pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs", "top_logprobs"])
 def test_check_logprobs_limit(field):
     check_logprobs_limit(field, None)

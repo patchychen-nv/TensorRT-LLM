@@ -828,9 +828,9 @@ class ModelConfig(Generic[TConfig]):
                 f"model.layers.{layer_idx}.mlp.experts"] = experts_quant_config
 
         logger.info(
-            "Detected DeepSeek-V4 routed MoE %s checkpoint layout; using "
-            "%s for routed experts.", layout.upper(),
-            experts_quant_config.quant_algo)
+            f"Detected DeepSeek-V4 routed MoE {layout.upper()} checkpoint "
+            f"layout; using {experts_quant_config.quant_algo} for routed "
+            f"experts.")
         return layer_quant_config
 
     @staticmethod

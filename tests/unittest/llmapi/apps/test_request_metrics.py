@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
+import types
 
 import pytest
 
+from tensorrt_llm.serve import perf_metrics as perf_metrics_module
 from tensorrt_llm.serve.perf_metrics import (
     CTX_CHUNK_METRICS_HEADER,
     RETURN_METRICS_HEADER,
@@ -398,3 +401,153 @@ async def test_jsonl_writer_drops_only_malformed_record(tmp_path):
     records = [json.loads(line) for line in output_file.read_text().splitlines()]
     assert writer.dropped_records == 1
     assert records[0]["request_id"] == 42
+
+
+async def _until(predicate, timeout=5.0):
+    """Wait on the writer's own progress markers instead of sleeping blind."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        assert asyncio.get_running_loop().time() < deadline, "condition never became true"
+        await asyncio.sleep(0.01)
+
+
+def _written_records(tmp_path):
+    output_file = next(tmp_path.glob("perf_metrics-test-*.jsonl"))
+    return [json.loads(line) for line in output_file.read_text().splitlines()]
+
+
+class TestWriterResilience:
+    """One poisoned record or one failed batch must never kill the drain task.
+
+    The failure mode being guarded: the task dies, submit() keeps queueing
+    toward a drain that no longer runs, the queue fills, and the metrics file
+    silently freezes. The sibling trace writer died exactly this way when a
+    UnicodeEncodeError (a ValueError, invisible to an OSError-only handler)
+    escaped its loop from inside file.write().
+    """
+
+    @pytest.mark.asyncio
+    async def test_unencodable_record_is_sanitized_not_fatal(self, tmp_path, monkeypatch):
+        """The encodability probe guards an invariant, not today's serializer.
+
+        With this module's ensure_ascii default json.dumps escapes everything
+        non-ASCII, so a lone surrogate cannot reach the file through the
+        public path -- the shim below serializes with ensure_ascii=False, the
+        setting the sibling trace writer already runs with, which is exactly
+        the change that would otherwise re-arm the silent writer death.
+        """
+        monkeypatch.setattr(
+            perf_metrics_module,
+            "json",
+            types.SimpleNamespace(
+                dumps=lambda obj, **kwargs: json.dumps(obj, **{**kwargs, "ensure_ascii": False})
+            ),
+        )
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        poisoned = _record()
+        poisoned["request_id"] = "req \ud800 cut"  # half a surrogate pair
+        writer.submit(poisoned)
+        # Sanitation happens while the batch is prepared, so this doubles as
+        # "the drain task got past the record that used to kill its sibling".
+        await _until(lambda: writer.sanitized_records == 1)
+        assert not writer._task.done()
+
+        # The definitive proof of survival: a later record still lands.
+        writer.submit(_record())
+        await writer.close()
+
+        assert writer.sanitized_records == 1
+        assert writer.dropped_records == 0
+        assert writer.last_write_at is not None
+        first, second = _written_records(tmp_path)
+        assert first["request_id"] == "req ? cut"
+        assert second["request_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_unexpected_write_failure_does_not_kill_the_writer(self, tmp_path, monkeypatch):
+        """UnicodeEncodeError was the sibling's instance; the guarantee is broader.
+
+        Whatever one batch's write raises, the batch is counted as dropped and
+        the loop keeps draining.
+        """
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        real_write = PerfMetricsJsonlWriter._write
+        failures = iter([RuntimeError("neither an OSError nor a serialization error")])
+
+        def flaky(data):
+            error = next(failures, None)
+            if error is not None:
+                raise error
+            real_write(writer, data)
+
+        monkeypatch.setattr(writer, "_write", flaky)
+
+        writer.submit(_record())
+        await _until(lambda: writer._write_error_count == 1)
+        assert not writer._task.done()
+        assert writer.last_write_at is None  # nothing has landed yet
+
+        survivor = _record()
+        survivor["request_id"] = "43"
+        writer.submit(survivor)
+        await writer.close()
+
+        assert writer.dropped_records == 1  # the failed batch is accounted for
+        assert writer.last_write_at is not None  # the later flush did land
+        assert [record["request_id"] for record in _written_records(tmp_path)] == [43]
+
+    @pytest.mark.asyncio
+    async def test_last_write_at_tracks_successful_flushes(self, tmp_path):
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        assert writer.last_write_at is None
+        writer.submit(_record())
+        await writer.close()
+
+        # ISO-8601 UTC, so a monitor can compare it against wall time directly.
+        assert writer.last_write_at is not None
+        assert writer.last_write_at.endswith("+00:00")
+
+
+class TestHalfWrittenLineRecovery:
+    """An append must not weld a new record onto an orphaned fragment.
+
+    A write cut short (quota, ENOSPC) leaves the file ending mid-line, and the
+    loop now survives that error -- so a later batch would be appended straight
+    onto the fragment, corrupting that record too: two lost where one already
+    was. ``_write`` is exercised directly with a fixed path because ``start()``
+    mints the real one from pid and start time.
+    """
+
+    @staticmethod
+    def _writer(tmp_path):
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        writer._path = tmp_path / "perf_metrics-test.jsonl"
+        return writer
+
+    def test_append_isolates_a_half_written_line(self, tmp_path):
+        writer = self._writer(tmp_path)
+        writer._path.write_text('{"cut": "mid')  # what an interrupted write leaves
+        writer._write('{"ok":1}\n')
+
+        lines = writer._path.read_text().splitlines()
+        assert lines == ['{"cut": "mid', '{"ok":1}']
+        # The fragment is one bad line a JSONL reader skips; the record after
+        # it parses untouched.
+        assert json.loads(lines[1]) == {"ok": 1}
+
+    @pytest.mark.parametrize("existing", ["", '{"whole":1}\n'])
+    def test_no_spurious_newline_when_none_is_missing(self, tmp_path, existing):
+        writer = self._writer(tmp_path)
+        writer._path.write_text(existing)
+        writer._write('{"ok":1}\n')
+
+        assert writer._path.read_text() == existing + '{"ok":1}\n'
+
+    def test_first_write_needs_no_repair(self, tmp_path):
+        writer = self._writer(tmp_path)
+        writer._write('{"ok":1}\n')
+
+        assert writer._path.read_text() == '{"ok":1}\n'

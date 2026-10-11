@@ -195,6 +195,47 @@ because the events bracket the whole loop it is the GPU-timeline span of the ite
 equals the hour). `engine_iters.realign_device_step` shifts the device value back one iteration, so `device_step_ms`
 on a row is the GPU-timeline span of that same iteration and the two columns are comparable row by row; a rank's last
 row has no successor and keeps None.
+## responses_replay.py
+
+Separate from the report above: an offline replay of `/v1/responses` streaming over recorded
+generations, used to verify the tool-call markup leak fix. It loads the real
+`tensorrt_llm/serve/responses_utils.py`, `tool_parser/` and `reasoning_parser.py` with the rest of
+TRT-LLM stubbed, so it runs in a checkout with no compiled bindings; feeds a record's frames through
+`_generate_streaming_event` one chunk at a time; and checks that every `output_text.done` payload is
+exactly the concatenation of the `output_text.delta` payloads streamed for that item.
+
+```
+PY=.venv-3.12/bin/python3    # needs pytest + openai + transformers; system python has none
+$PY analysis/responses_replay.py --records analysis/data/responses_replay_multicall.jsonl
+$PY -m pytest analysis/test_responses_replay.py -v
+```
+
+Exit code 1 on any violation, so the same command is the before/after gate. `--responses-utils`
+pins the module under test to a snapshot (`data/responses_utils_BEFORE.py`); `--compare` diffs a
+previous `--out-json`, including whether the change dropped any tool calls. The module docstring
+lists exactly which code is real and which is substituted.
+
+| `data/` file | what it is |
+|---|---|
+| `responses_replay_frames.json` | the reference record: `raw-2779107.jsonl` line 5, 8 frames, 2 calls |
+| `responses_replay_multicall.jsonl` | the 35 recorded responses with two or more calls |
+| `responses_utils_BEFORE.py` | `responses_utils.py` as of the commit the fix branched from |
+| `responses_replay_BEFORE[_bulk].{txt,json}` | the pre-fix baseline, multi-call set and whole corpus |
+
+The whole corpus (6,492 records) is too large to keep here. Re-fetch it with:
+
+```
+ssh <cluster> 'bash -s' <<'EOS' > /tmp/all_records.jsonl.gz
+find <.../var-test> -path '*/raw_output/*/raw-*.jsonl' -print0 \
+  | xargs -0 cat | python3 -c 'import sys,json
+seen=set()
+for l in sys.stdin:
+    r=json.loads(l)
+    k=(r.get("request_id"), r.get("text"))
+    if k in seen or not r.get("frames"): continue
+    seen.add(k); print(json.dumps(r, ensure_ascii=False))' | gzip -9
+EOS
+```
 
 ## requests.csv
 

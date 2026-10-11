@@ -58,7 +58,7 @@ def _parse_tool_arguments(arguments: Any) -> Dict[str, Any]:
     try:
         parsed = json.loads(arguments)
     except json.JSONDecodeError:
-        logger.warning("IterResearch: failed to parse native tool arguments: %s", arguments[:200])
+        logger.warning(f"IterResearch: failed to parse native tool arguments: {arguments[:200]}")
         return {}
 
     if not isinstance(parsed, dict):

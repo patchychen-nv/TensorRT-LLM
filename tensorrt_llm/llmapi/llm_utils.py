@@ -656,19 +656,19 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
         runtime = transceiver_config.transceiver_runtime
         if effective_backend != "NIXL" or runtime != "PYTHON":
             logger.info(
-                "KV cache manager V2 is the model preference, but disaggregated "
-                "serving uses transceiver_runtime=%r with backend=%r; "
-                "falling back to V1.", runtime, effective_backend)
+                f"KV cache manager V2 is the model preference, but "
+                f"disaggregated serving uses transceiver_runtime={runtime!r} "
+                f"with backend={effective_backend!r}; falling back to V1.")
             use_v2 = False
 
     if use_v2:
         decoding_type = _two_model_spec_dec_decoding_type(llm_args)
         if decoding_type is not None:
             logger.info(
-                "KV cache manager V2 is the model preference, but %s runs the "
-                "draft model in a separate engine and V2 sizes both KV cache "
-                "managers from the full max_gpu_total_bytes budget; falling "
-                "back to V1.", decoding_type)
+                f"KV cache manager V2 is the model preference, but "
+                f"{decoding_type} runs the draft model in a separate engine "
+                f"and V2 sizes both KV cache managers from the full "
+                f"max_gpu_total_bytes budget; falling back to V1.")
             use_v2 = False
 
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2

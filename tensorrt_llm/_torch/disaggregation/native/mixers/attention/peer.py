@@ -499,7 +499,7 @@ class AttentionPolicy:
             return False
         details = ", ".join(f"{k}={v!r}" for k, v in kv.items())
         msg = f"AttentionPolicy: incompatible: {reason}" + (f"; {details}" if details else "")
-        logger.warning("%s", msg)
+        logger.warning(msg)
         return True
 
     def _mismatch(self, field: str, local, peer) -> bool:
@@ -524,25 +524,20 @@ class AttentionPolicy:
             return False
         if self._uses_exact_tpb_mapper(self._ri) or self._uses_exact_tpb_mapper(peer_ri):
             logger.warning(
-                "AttentionPolicy: incompatible: tokens_per_block mismatch for "
-                "NHD/replicated pools; local=%d peer=%d",
-                local,
-                peer,
+                f"AttentionPolicy: incompatible: tokens_per_block mismatch for NHD/replicated "
+                f"pools; local={local} peer={peer}"
             )
             return True
         larger, smaller = max(local, peer), min(local, peer)
         if larger % smaller != 0:
             logger.warning(
-                "AttentionPolicy: incompatible: tokens_per_block not divisible; local=%d peer=%d",
-                local,
-                peer,
+                f"AttentionPolicy: incompatible: tokens_per_block not divisible; local={local} "
+                f"peer={peer}"
             )
             return True
         logger.warning(
-            "AttentionPolicy: tokens_per_block mismatch (local=%d, peer=%d); "
-            "KV transfer proceeds — ensure block boundaries align during transfer.",
-            local,
-            peer,
+            f"AttentionPolicy: tokens_per_block mismatch (local={local}, peer={peer}); KV transfer "
+            f"proceeds — ensure block boundaries align during transfer."
         )
         return False
 

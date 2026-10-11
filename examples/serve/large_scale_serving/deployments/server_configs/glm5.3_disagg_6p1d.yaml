@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.3-FP8 disaggregated topology: six DEP8 context workers feeding one
+# DEP8 generation worker. Derived from glm5.3_disagg_4p1d.yaml on 2026-10-01
+# by raising num_instances 4 -> 6, nothing else: the per-worker ctx/gen
+# configs (glm5.3_{ctx,gen}_dep8_mtp.yaml) are unchanged, including the
+# kv-cache-aware routing and fair-share settings added for TTFT. The extra
+# prefill capacity is the latency lever for the 2026-10 Kernel-Trace pass:
+# the measured bottleneck was large-prefill aggregate throughput (~4.9K
+# tok/s across 4 ctx workers), and decode was healthy, so the imbalance
+# moves toward prefill. One instance is (6+1) x 8 GPUs = 14 nodes.
+backend: pytorch
+num_workers: 8
+context_servers:
+  num_instances: 6
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1

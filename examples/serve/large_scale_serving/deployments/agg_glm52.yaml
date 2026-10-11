@@ -1,0 +1,79 @@
+# One aggregated GLM-5.2 server on one node, for ad-hoc work: API probing,
+# length-control experiments, reproducing something without borrowing a fleet
+# instance.
+#
+#   ./serve.sh submit --yaml deployments/agg_glm52.yaml --label scratch
+#
+# Aggregated, not disaggregated: `server.disagg` is simply absent, and serve.sh
+# says of that path that it is byte-for-byte the aggregated one. fleetctl cannot
+# launch this -- it requires topology/ctx/gen on every instance and is
+# disagg-only -- so submit it through serve.sh directly.
+#
+# Roughly 35-40 minutes from submit to serving; most of that is weight load and
+# FlashInfer warmup, not queue time. Find the address with:
+#
+#   cat var-agg/_fleet/*/<jobid>.json     # {"url": "http://10.x.x.x:8640", ...}
+#
+# and check it is up with `curl $URL/v1/models`.
+
+cluster_name: kfagg
+repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM
+
+model:
+  name: glm5.2
+  path: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/models/GLM-5.2-NVFP4
+  tool_parser: glm47
+
+slurm:
+  account: coreai_kf_dev
+  partition: batch_long
+  qos: normal
+  # Short by default. Scratch servers that outlive their question are how a
+  # cluster fills up with nodes nobody remembers allocating.
+  time: "03:00:00"
+  gpus_per_node: 4
+  extra_args: []
+  # TP4 x PP1 = 4 ranks, which is exactly one node at 4 GPUs.
+  nodes: 1
+
+container:
+  image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084.sqsh
+  mounts:
+    - /scratch/fsw:/scratch/fsw
+
+server:
+  install_repo: true
+  numactl: "0,1"
+  capture: true
+  extra_args: []
+  env:
+    TLLM_LOG_LEVEL: INFO
+    # The cyclic GC must stay on in every process that parses requests: see ENV_DEFAULTS in serve.sh.
+    TRTLLM_SERVER_DISABLE_GC: "0"
+    TRTLLM_DISAGG_SERVER_DISABLE_GC: "0"
+    TRTLLM_WORKER_DISABLE_GC: "1"
+    TRTLLM_ENABLE_PDL: "1"
+    ENROOT_ALLOW_DEV: "yes"
+    NCCL_GRAPH_MIXING_SUPPORT: "0"
+    MIMALLOC_PURGE_DELAY: "0"
+    # Uncomment to get per-iteration engine stats out of GET /metrics.
+    # Off by default in llm_args.py (enable_iter_perf_stats, prototype), and
+    # collecting them costs work on every step, so leave it off unless the
+    # numbers are the point.
+    # TLLM_ITER_PERF_STATS: "1"
+
+  # Clear of the data-gen fleet (8200-8420), the test fleet (8800-8829) and the
+  # ports a GPU node already listens on (8080, 8081, 8900, 9100, 9200, 9400 --
+  # 9400 is a container registry that answers /health with 200 and so looks
+  # exactly like a working backend).
+  port: 8640
+
+  # `server.config` rather than `server.disagg`: one aggregated server reading
+  # one engine YAML. tep4 is the single-node shape.
+  config: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/deployments/server_configs/glm5.2_gen_tep4.yaml
+
+trace:
+  # Its own tree. Deliberately not TRTLLMxKF/trace_data_gen: that is training
+  # data, and scratch traffic in it would afterwards be indistinguishable from
+  # real campaign traffic.
+  root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var-agg

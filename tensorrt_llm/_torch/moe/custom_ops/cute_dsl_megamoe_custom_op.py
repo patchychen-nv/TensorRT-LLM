@@ -506,11 +506,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"{type(_megamoe_import_err).__name__}: {_megamoe_import_err}"
         )
         logger.info(
-            "MegaMoE CuteDSL op skipped: %s. Backend ``MegaMoECuteDsl`` "
-            "stays uninstalled; ``torch.ops.trtllm."
-            "cute_dsl_megamoe_nvfp4_blackwell`` is not registered. The "
-            "factory falls back to CutlassFusedMoE.",
-            _megamoe_import_err,
+            f"MegaMoE CuteDSL op skipped: {_megamoe_import_err}. Backend ``MegaMoECuteDsl`` stays "
+            f"uninstalled; ``torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell`` is not "
+            f"registered. The factory falls back to CutlassFusedMoE."
         )
         IS_MEGAMOE_OP_AVAILABLE = False
 
@@ -768,17 +766,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 self.peer_offsets.append(peer_ptr - local_base)
 
             logger.debug(
-                "[MegaMoeSymmMemProvider] group=%s rank=%d/%d total_bytes=%d "
-                "(activation=%d sf=%d topk_weights=%d combine=%d shared=%d)",
-                self.group_name,
-                self.rank,
-                self.world_size,
-                total_bytes,
-                act_region,
-                sf_region,
-                topkw_region,
-                combine_region,
-                shared_region,
+                f"[MegaMoeSymmMemProvider] group={self.group_name} rank={self.rank}/"
+                f"{self.world_size} total_bytes={total_bytes} (activation={act_region} sf="
+                f"{sf_region} topk_weights={topkw_region} combine={combine_region} shared="
+                f"{shared_region})"
             )
 
         def _region_view(

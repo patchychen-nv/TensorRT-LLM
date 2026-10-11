@@ -141,7 +141,7 @@ def _env_float(suffix: str, default: float) -> float:
     try:
         return float(raw)
     except ValueError:
-        logger.warning("web search %s=%r is not a number; using %s", suffix, raw, default)
+        logger.warning(f"web search {suffix}={raw!r} is not a number; using {default}")
         return default
 
 
@@ -152,7 +152,7 @@ def _env_int(suffix: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning("web search %s=%r is not an integer; using %s", suffix, raw, default)
+        logger.warning(f"web search {suffix}={raw!r} is not an integer; using {default}")
         return default
 
 
@@ -417,10 +417,7 @@ async def run_web_search(query: str, config: WebSearchConfig) -> List[WebSearchR
         except (TimeoutError, asyncio.TimeoutError) as e:
             last_error = e
         logger.warning(
-            "web search attempt %d/%d failed: %s",
-            attempt + 1,
-            config.retries + 1,
-            last_error,
+            f"web search attempt {attempt + 1}/{config.retries + 1} failed: {last_error}"
         )
     else:
         raise WebSearchError(
@@ -561,6 +558,6 @@ class WebSearchSession:
         try:
             results = await run_web_search(query, self.config)
         except WebSearchError as exc:
-            logger.warning("web search for %r failed: %s", query, exc)
+            logger.warning(f"web search for {query!r} failed: {exc}")
             return SearchOutcome(query=query, error=str(exc))
         return SearchOutcome(query=query, results=list(results))

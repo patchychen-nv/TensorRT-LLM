@@ -4093,12 +4093,10 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
-                "No free IndexMapper slots for request %s "
-                "(%d/%d slots in use, likely held by DISAGG_GENERATION_TRANS_IN_PROGRESS requests). "
-                "Skipping KV cache creation; request will retry next iteration.",
-                request_id,
-                self.index_mapper.size(),
-                self.index_mapper.size(),
+                f"No free IndexMapper slots for request {request_id} ({self.index_mapper.size()}/"
+                f"{self.index_mapper.size()} slots in use, likely held by "
+                f"DISAGG_GENERATION_TRANS_IN_PROGRESS requests). Skipping KV cache creation; "
+                f"request will retry next iteration."
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
@@ -4171,7 +4169,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Prefetch to the first tier below GPU (host if present, otherwise
             # disk). prefetch() is a best-effort hint either way.
             if not kv_cache.prefetch(CACHE_LEVEL1):
-                logger.warning("prefetch failed for request %s", req.py_request_id)
+                logger.warning(f"prefetch failed for request {req.py_request_id}")
                 success = False
             kv_cache.close()
         return success

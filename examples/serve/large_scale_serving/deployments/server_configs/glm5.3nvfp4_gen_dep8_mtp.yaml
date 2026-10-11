@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.3-NVFP4 GENERATION worker, byte-for-byte the GLM-5.2-NVFP4 GENERATION config
+# below the header. That is a decision, not laziness: the engine config holds
+# shapes and knobs, never the checkpoint path (fleet.yaml model.path owns
+# that), and the 5.2->5.3 config.json diff was already audited for the FP8
+# port (glm5.3_ctx_dep8_mtp.yaml header) -- identical architecture keys,
+# num_hidden_layers 78, same indexer geometry, same num_nextn_predict_layers.
+# NVFP4 keeps what FP8 had to abandon: DEP4 context workers fit again (433 GB
+# on disk, the 5.2 arithmetic transfers unchanged) and CUTEDSL is back in its
+# validated regime (the FP8 file's rejection was FP8_BLOCK_SCALES-specific).
+#
+# One caveat the 5.2 precedent does not cover: this checkpoint quantizes via
+# modelopt MIXED_PRECISION where 5.2-NVFP4 used compressed-tensors group-16.
+# CUTEDSL eligibility is resolved per layer at build time, and the failure
+# mode is either a loud "no MoE implementation can serve this layer" at
+# startup or a QUIET per-layer fallback -- so on first bring-up, grep the
+# worker log for a fallback line before trusting any latency number.
+# GLM-5.2-NVFP4 GENERATION worker for 1P1D disaggregated serving: 4 GPUs as
+# DEP4. Paired with glm5.2_ctx_tep4.yaml.
+#
+# This is glm5.2_agg_tep4.yaml plus the cache transceiver, the perf-metrics
+# collection, and the two decode settings the reference recipes turn on
+# (use_low_precision_moe_combine, stream_interval 20). Everything else --
+# tokens_per_block 64, index_topk 2048, CUTEDSL, the attention-DP block, the
+# CUDA-graph ladder -- is unchanged from what the aggregated deployment runs.
+#
+# `--tool_parser glm47` is passed on the command line by serve.sh and belongs
+# on THIS worker only: the proxy drives the context worker with stream=False
+# and discards its text, so a parser there would only see truncated output.
+
+context_parallel_size: 1
+
+enable_attention_dp: true
+
+# Must match the context worker exactly -- backend and buffer both.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_cache_bounce_size_mb: 5120
+  max_tokens_in_buffer: 1048576
+  kv_transfer_timeout_ms: 600000
+
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256]
+  enable_padding: true
+
+# No disable_overlap_scheduler here, unlike the context worker and unlike the
+# aggregated config: overlap hides host work behind decode steps, and decode is
+# all this worker does.
+disable_overlap_scheduler: false
+
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  event_buffer_max_size: 0
+  free_gpu_memory_fraction: 0.9
+  tokens_per_block: 64
+
+max_batch_size: 64
+max_seq_len: 1048576
+max_num_tokens: 256
+
+moe_config:
+  # TRTLLM, matching the context worker and the Pro deployment -- see the longer
+  # note in glm5.2_ctx_tep4.yaml. CUTEDSL should suit an nvfp4 checkpoint, but it
+  # is unproven on this model and its failure mode is a silent per-layer
+  # fallback, so it is an experiment to run deliberately rather than a default.
+  backend: CUTEDSL
+  # Added from the reference recipes, which set it on every decode worker.
+  use_low_precision_moe_combine: true
+moe_expert_parallel_size: 8
+
+num_postprocess_workers: 4
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. The pull endpoint
+# /perf_metrics that these settings used to feed no longer exists; serve.sh
+# appends perf_metrics_output_dir per attempt, since only it knows the path.
+# perf_metrics_max_requests went with the endpoint -- retention is the file now.
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+# GLM closes its reasoning block more than once -- a turn ends the block,
+# writes another stretch of planning, and closes again before the tool
+# call. `deepseek-r1` treats everything past the first close as content
+# and so publishes the later `</think>` as visible text; the `glm`
+# parser drops a close seen outside a block. Same delimiters and the
+# same split point otherwise.
+reasoning_parser: glm
+sparse_attention_config:
+  algorithm: dsa
+  enable_heuristic_topk: true
+  use_cute_dsl_paged_mqa_logits: true
+# 20 rather than the aggregated 10, following the reference recipes.
+stream_interval: 20
+tensor_parallel_size: 8
+trust_remote_code: true
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+num_serve_frontends: 4

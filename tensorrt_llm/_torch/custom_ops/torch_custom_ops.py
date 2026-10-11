@@ -2188,8 +2188,8 @@ class AllReduceRunner(TunableRunner):
             cls._prealloc_done.add(cache_key)
 
         logger.debug(
-            "[tunable_allreduce] Pre-allocating NCCL window buffers: "
-            "tokens=%d group=%s", num_tokens, list(group))
+            f"[tunable_allreduce] Pre-allocating NCCL window buffers: tokens="
+            f"{num_tokens} group={list(group)}")
         torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
                                                         2)
 

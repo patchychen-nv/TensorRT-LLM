@@ -99,10 +99,9 @@ def maybe_create_recorder(max_draft_len: int, rank: int) -> Optional["DFlashAcce
     if not stats_dir:
         return None
     logger.warning(
-        "DFlash acceptance-stats recording is EXPERIMENTAL and specific to "
-        "the DFlash/DSpark drafter: enabling %s with other speculative "
-        "decoding methods records nothing and is unsupported.",
-        ENV_STATS_DIR,
+        f"DFlash acceptance-stats recording is EXPERIMENTAL and specific to the DFlash/DSpark "
+        f"drafter: enabling {ENV_STATS_DIR} with other speculative decoding methods records "
+        f"nothing and is unsupported."
     )
     flush_every = int(os.environ.get(ENV_FLUSH_EVERY, "50"))
     return DFlashAcceptStatsRecorder(

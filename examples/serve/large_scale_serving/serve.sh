@@ -20,6 +20,11 @@ set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
+# The import path --post_processor_hook resolves, paired with
+# TRTLLM_RAW_OUTPUT_DIR below. Named here because both the aggregated and the
+# disaggregated launch pass it and a rename has to reach them together.
+RAW_OUTPUT_HOOK="tensorrt_llm.executor.raw_output_hook.RawOutputDump"
+
 die() {
     echo "serve.sh: $*" >&2
     exit 1
@@ -70,12 +75,28 @@ scenario_dir = os.path.dirname(scenario_path)
 # model.name is constrained so a typo cannot silently produce a new container
 # name, job name and trace directory that look almost right.
 KNOWN_MODELS = ("glm5.2", "glm5.3", "deepseek_v4", "deepseek_v4_flash",
-                "deepseek_v4_pro")
+                "deepseek_v4_pro", "kimi-k3")
 
 # Always-on audit capture is layered on top of these in launch().
+#
+# The cyclic GC stays ON in every process that parses client requests: the
+# trtllm-serve HTTP servers (TRTLLM_SERVER_DISABLE_GC) and the disaggregated
+# frontend's fleet workers (TRTLLM_DISAGG_SERVER_DISABLE_GC, which the code
+# defaults to "1"). Validating a Responses `input` leaves reference cycles
+# behind -- pydantic turns the `Iterable[...]` fields of the item types
+# (content, output, summary, annotations) into ValidatorIterators that point
+# back at the dict holding them, once per union member it tries -- and only the
+# cyclic GC frees them. With it off, every request leaked its parsed input:
+# ~3.4 MB per request in a replay of production traffic, 10-30 GiB/h per
+# frontend and 7-21 GiB/h per ctx/gen HTTP server in production on 10-09,
+# enough to run a ctx head node out of memory within a day. With it on, the
+# frontend's RSS levels off and its longest pause is a ~0.25 s full collection.
+# The executor ranks (TRTLLM_WORKER_DISABLE_GC) never see a request body and
+# keep the GC off.
 ENV_DEFAULTS = {
     "TLLM_LOG_LEVEL": "INFO",
-    "TRTLLM_SERVER_DISABLE_GC": "1",
+    "TRTLLM_SERVER_DISABLE_GC": "0",
+    "TRTLLM_DISAGG_SERVER_DISABLE_GC": "0",
     "TRTLLM_WORKER_DISABLE_GC": "1",
     "TRTLLM_ENABLE_PDL": "1",
     "TRTLLM_ANTHROPIC_LCP_TRACKING": "1",
@@ -314,6 +335,16 @@ emit("CFG_MOUNTS", ",".join(str(m) for m in mounts))
 
 emit("CFG_PORT", server.get("port") or 8333)
 emit("CFG_INSTALL_REPO", "1" if server.get("install_repo", True) else "0")
+# Shell commands every node runs in the job's container after the repo install
+# (or in its place, with install_repo off) and before any worker starts. After,
+# not before: `pip install -e .` reinstalls the pinned dependency set on every
+# attempt, so a package installed ahead of it -- a FlashInfer fork, say -- is
+# silently replaced by the pinned one.
+post_install = server.get("post_install") or []
+if not isinstance(post_install, list) or not all(
+        isinstance(command, str) and command.strip() for command in post_install):
+    die("server.post_install must be a list of shell commands, one string each")
+emit_array("CFG_POST_INSTALL", post_install)
 emit("CFG_NUMACTL", server.get("numactl") or "")
 emit_array("CFG_SERVE_EXTRA_ARGS", server.get("extra_args") or [])
 # srun --export is a comma-separated list, so a value containing a comma
@@ -332,6 +363,12 @@ emit("CFG_ENV", ",".join("%s=%s" % kv for kv in sorted(_plain.items())))
 emit_array("CFG_ENV_MULTI", ["%s=%s" % kv for kv in sorted(_multi.items())])
 
 emit("CFG_CAPTURE", "1" if server.get("capture", True) else "0")
+# Its own switch, defaulting off, rather than riding on `capture`. Both would
+# have been on everywhere: `capture` is true in every deployment here and true
+# by default, so folding this into it would have turned the raw dump on for the
+# data-gen fleet, which asked for none of it and is the one under load. A
+# deployment debugging a parser says so.
+emit("CFG_RAW_OUTPUT", "1" if server.get("raw_output", False) else "0")
 
 trace_root = require(trace.get("root"), "trace.root")
 emit("CFG_TRACE_ROOT", trace_root)
@@ -359,6 +396,12 @@ emit("CFG_FLEET_DIR", os.path.join(trace_root, "_fleet", name))
 emit("CFG_GATEWAY_REGISTER_URL", (gateway.get("register_url") or "").rstrip("/"))
 # The gateway's users file is the allowlist and the username is the key.
 emit("CFG_GATEWAY_API_KEY", gateway.get("api_key") or os.environ.get("USER", ""))
+# Which of the gateway's pools (fleet directories) an HTTP registration lands
+# in, and so which fleet config supervises this job; routing treats every pool
+# alike. A file drop needs no such field -- the directory it lands in is the
+# pool -- but a registration over HTTP names one, or it joins the default
+# pool. Empty sends exactly the request this always sent.
+emit("CFG_GATEWAY_POOL", gateway.get("pool") or "")
 
 # sbatch runs a spool copy of serve.sh, so its own directory says nothing about
 # where gateway.py lives. Resolve it against the deployment YAML instead, the
@@ -407,6 +450,135 @@ topology_summary() {
         echo "${CFG_CTX_INSTANCES}xctx${CFG_CTX_RANKS} + ${CFG_GEN_INSTANCES}xgen${CFG_GEN_RANKS}"
     else
         echo "TP${CFG_TP} x PP${CFG_PP}"
+    fi
+}
+
+# provenance REPO_DIR MODEL_PATH: key=value lines naming the code and chat
+# template a launch serves. `commit=` alone could not: production has run
+# uncommitted edits, and every attempt reinstalls whatever the tree holds then.
+# Best-effort by contract -- each value it cannot read is "unknown", a collector
+# that dies or hangs costs a note rather than the launch, and it takes seconds.
+#
+# py_manifest_sha256 covers every tensorrt_llm/**/*.py on disk, untracked
+# files included, and can be recomputed by hand in REPO_DIR with:
+#   find tensorrt_llm -name '*.py' -type f -print0 | LC_ALL=C sort -z \
+#       | xargs -0 sha256sum | sha256sum
+provenance() {
+    local status=0
+    timeout 120 python3 - "$1" "$2" <<'PY' || status=$?
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+repo, model = sys.argv[1:3]
+UNKNOWN = "unknown"
+# Errors that mean "this value cannot be read here", as opposed to a bug.
+UNREADABLE = (OSError, ValueError, subprocess.SubprocessError)
+
+
+def report(keys, compute):
+    try:
+        values = compute()
+    except UNREADABLE as error:
+        sys.stderr.write("serve.sh: provenance: %s: %s\n" % (keys[0], error))
+        values = [UNKNOWN] * len(keys)
+    for key, value in zip(keys, values):
+        print("%s=%s" % (key, value), flush=True)
+
+
+def git(*args):
+    # GIT_OPTIONAL_LOCKS=0 keeps `status` from refreshing the index: every
+    # instance launches from one shared checkout, and holding index.lock would
+    # fail whatever git command its owner happened to be running.
+    return subprocess.run(
+        ["git", "-C", repo] + list(args), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, timeout=60, check=True,
+        env=dict(os.environ, GIT_OPTIONAL_LOCKS="0")).stdout
+
+
+def git_text(*args):
+    return [git(*args).decode("utf-8", "replace").strip()]
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def worktree_status():
+    # Untracked files count: a new module is imported as surely as an edit.
+    entries = git("status", "--porcelain", "--untracked-files=normal").splitlines()
+    return ["yes" if entries else "no", len(entries)]
+
+
+def tracked_diff():
+    diff = git("diff", "--binary", "--no-color", "--no-ext-diff", "HEAD")
+    return [hashlib.sha256(diff).hexdigest()]
+
+
+def raise_error(error):
+    raise error
+
+
+def py_manifest():
+    # `sha256sum` lines sorted bytewise, so the shell recipe above matches.
+    root = os.path.join(repo, "tensorrt_llm")
+    if not os.path.isdir(root):
+        raise ValueError("no tensorrt_llm/ in %s" % repo)
+    deadline = time.monotonic() + 60
+    paths = []
+    # onerror raises: a directory skipped in silence is a wrong digest, not
+    # an unknown one.
+    for dirpath, _, filenames in os.walk(root, onerror=raise_error):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if name.endswith(".py") and os.path.isfile(path) and not os.path.islink(path):
+                paths.append(os.fsencode(os.path.relpath(path, repo)))
+    manifest = hashlib.sha256()
+    for rel in sorted(paths):
+        if time.monotonic() > deadline:
+            raise ValueError("hashing took over 60s")
+        digest = sha256_file(os.path.join(os.fsencode(repo), rel))
+        manifest.update(b"%s  %s\n" % (digest.encode(), rel))
+    return [manifest.hexdigest(), len(paths)]
+
+
+def chat_template():
+    # The file a checkpoint loads its template from, in loading order.
+    if not os.path.isdir(model):
+        raise ValueError("model path %s is not a local directory" % model)
+    jinja = os.path.join(model, "chat_template.jinja")
+    if os.path.isfile(jinja):
+        return ["chat_template.jinja", sha256_file(jinja)]
+    config_path = os.path.join(model, "tokenizer_config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+        template = config.get("chat_template") if isinstance(config, dict) else None
+        if template is not None:
+            if not isinstance(template, str):
+                template = json.dumps(template, sort_keys=True, ensure_ascii=False)
+            return ["tokenizer_config.json:chat_template",
+                    hashlib.sha256(template.encode("utf-8")).hexdigest()]
+    return ["none", "none"]
+
+
+report(["origin"], lambda: git_text("config", "--get", "remote.origin.url"))
+report(["branch"], lambda: git_text("branch", "--show-current"))
+report(["commit"], lambda: git_text("rev-parse", "HEAD"))
+report(["dirty", "dirty_count"], worktree_status)
+report(["diff_sha256"], tracked_diff)
+report(["py_manifest_sha256", "py_files"], py_manifest)
+report(["chat_template", "chat_template_sha256"], chat_template)
+PY
+    if (( status != 0 )); then
+        echo "provenance_error=collector exited with status ${status}; lines above may be partial"
     fi
 }
 
@@ -467,6 +639,9 @@ cmd_submit() {
         --gres "gpu:${CFG_TASKS_PER_NODE}"
         --time "${CFG_TIME}"
         --output "${log_dir}/${CFG_NAME}-%j.out"
+        # A requeued job reuses its job id, so the same log file: append, or
+        # each requeue truncates the previous run's log.
+        --open-mode append
     )
     if [[ -n "${CFG_RESERVATION}" ]]; then
         sbatch_args+=(--reservation "${CFG_RESERVATION}")
@@ -582,6 +757,11 @@ job_is_gone() {
 # taking the deployment down for. Reported only when the outcome changes,
 # because the weights take minutes to load and the probe fails for all of it.
 GW_REGISTERED=""
+# `,"pool":"<name>"` when the deployment names a gateway pool, else nothing.
+gateway_pool_field() {
+    [[ -z "${CFG_GATEWAY_POOL}" ]] || printf ',"pool":"%s"' "${CFG_GATEWAY_POOL}"
+}
+
 register_gateway() {
     [[ -n "${CFG_GATEWAY_REGISTER_URL}" ]] || return 0
     local state out
@@ -589,8 +769,9 @@ register_gateway() {
     if out="$(curl -fsS -m 20 -X POST \
             -H "x-api-key: ${CFG_GATEWAY_API_KEY}" \
             -H 'content-type: application/json' \
-            --data-binary "$(printf '{"job_id":"%s","url":"%s","run_dir":"%s","state":"%s"}' \
-                "${SLURM_JOB_ID}" "${FLEET_URL}" "${RUN_DIR}" "${state:-unknown}")" \
+            --data-binary "$(printf '{"job_id":"%s","url":"%s","run_dir":"%s","state":"%s"%s}' \
+                "${SLURM_JOB_ID}" "${FLEET_URL}" "${RUN_DIR}" "${state:-unknown}" \
+                "$(gateway_pool_field)")" \
             "${CFG_GATEWAY_REGISTER_URL}/_gateway/backend" 2>&1)"; then
         [[ "${GW_REGISTERED}" == "yes" ]] || echo "registered with ${CFG_GATEWAY_REGISTER_URL}"
         GW_REGISTERED="yes"
@@ -608,7 +789,8 @@ deregister_gateway() {
     curl -fsS -m 10 -X POST \
         -H "x-api-key: ${CFG_GATEWAY_API_KEY}" \
         -H 'content-type: application/json' \
-        --data-binary "$(printf '{"job_id":"%s","force":true}' "${SLURM_JOB_ID}")" \
+        --data-binary "$(printf '{"job_id":"%s","force":true%s}' "${SLURM_JOB_ID}" \
+            "$(gateway_pool_field)")" \
         "${CFG_GATEWAY_REGISTER_URL}/_gateway/backend/remove" >/dev/null 2>&1 || true
     return 0
 }
@@ -655,6 +837,9 @@ start_attempt() {
     else
         cp "${CFG_SERVER_CONFIG}" "${attempt_dir}/server_config.yaml"
     fi
+    # The code is snapshotted per attempt too: each one reinstalls the repo,
+    # so an edit made before a restart is what that attempt runs.
+    provenance "${CFG_REPO_DIR}" "${CFG_MODEL_PATH}" > "${attempt_dir}/provenance.txt" || true
 
     printf '%s\n' "${attempt}" > "${CONTROL_DIR}/attempt"
     printf '%s\n' "${attempt_dir}" > "${CONTROL_DIR}/current_attempt_dir"
@@ -667,6 +852,36 @@ start_attempt() {
     printf '%s\n' "${server_pid}" > "${CONTROL_DIR}/server_pid"
     printf '%s\n' "running attempt ${attempt}" > "${CONTROL_DIR}/state"
     echo "started attempt ${attempt} with launcher PID ${server_pid}"
+}
+
+# Print the given nodes grouped by topology block, and by name within a block.
+#
+# Workers are cut from the node list in order, so a worker stays inside one
+# block (one NVL72 rack, one NVLink domain) only if each block's nodes are
+# adjacent in that list. --segment keeps every segment inside one block, but
+# under TopologyParam=BlockAsNodeRank SLURM_JOB_NODELIST follows node rank,
+# which can interleave blocks: a three-segment allocation came back as one node
+# of rack d006, four of d002, the other three of d006, four of d025. Sorting by
+# name within a block also puts first in each slice the node srun runs task 0
+# on. If any node reports no Topology, the order is left as Slurm gave it.
+order_nodes_by_block() {
+    local listed
+    listed="$(scontrol show node -o "$(IFS=,; echo "$*")" 2>/dev/null | awk '
+        {
+            name = ""; block = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^NodeName=/) name = substr($i, 10)
+                else if ($i ~ /^Topology=/) block = substr($i, 10)
+            }
+            if (name == "" || block == "" || block == "(null)") { missing = 1; exit }
+            print block "\t" name
+        }
+        END { if (missing) exit 1 }')" || listed=""
+    if [[ -z "${listed}" || "$(wc -l <<< "${listed}")" -ne "$#" ]]; then
+        printf '%s\n' "$@"
+        return
+    fi
+    sort -t $'\t' -k1,1V -k2,2V <<< "${listed}" | cut -f2
 }
 
 cmd_run() {
@@ -683,6 +898,7 @@ cmd_run() {
         die "allocation has ${#nodes[@]} node(s); ${CFG_NAME} needs ${CFG_NODES}" \
             "($(topology_summary) over ${CFG_TASKS_PER_NODE} GPUs per node)"
     fi
+    mapfile -t nodes < <(order_nodes_by_block "${nodes[@]}")
 
     # user_MMDDHH_slurmjob_jobname, shared across every attempt of this job.
     # Date-partitioned: <root>/runs/2026-08/19/serli_081914_... . The flat
@@ -703,6 +919,42 @@ cmd_run() {
     CONTROL_DIR="${RUN_DIR}/control"
     mkdir -p "${CONTROL_DIR}"
 
+    # A requeued job runs this controller again under the same job id, and a
+    # requeue within the same hour lands on the same RUN_DIR. The new run used
+    # to start over at attempt-001: it truncated the previous run's launcher,
+    # server and worker logs and wrote its request traces into the same
+    # attempt. On 10-09 that erased the only server-side record of two lhr runs
+    # that ended in NODE_FAIL. Number this run's attempts after the ones
+    # already here, and keep the previous run's deployment snapshot and
+    # metadata beside the new ones.
+    local existing previous_attempt kept
+    for existing in "${RUN_DIR}"/attempt-[0-9][0-9][0-9]; do
+        [[ -d "${existing}" ]] || continue
+        previous_attempt="${existing##*attempt-}"
+        if (( 10#${previous_attempt} > attempt )); then
+            attempt=$(( 10#${previous_attempt} ))
+        fi
+    done
+    # Kept as <name>.before-run-<k>, k the first index free for that file, so
+    # no earlier copy is ever overwritten: not by a second requeue within the
+    # same second, nor by a controller that died halfway through this loop.
+    for existing in deployment.yaml run_metadata.txt server_url; do
+        [[ -f "${RUN_DIR}/${existing}" ]] || continue
+        kept=1
+        while [[ -e "${RUN_DIR}/${existing}.before-run-${kept}" ]]; do
+            kept=$(( kept + 1 ))
+        done
+        mv -n "${RUN_DIR}/${existing}" "${RUN_DIR}/${existing}.before-run-${kept}"
+        if [[ -e "${RUN_DIR}/${existing}" ]]; then
+            # Serving matters more than this copy: say so and carry on.
+            echo "WARNING: could not keep ${RUN_DIR}/${existing}; this run overwrites it"
+        fi
+    done
+    if (( attempt > 0 )); then
+        echo "run dir already holds ${attempt} attempt(s) of an earlier run of job" \
+             "${SLURM_JOB_ID}; this run starts at attempt $(( attempt + 1 ))"
+    fi
+
     # The server config is snapshotted per attempt, not here: it can be edited
     # between a stop and the next start, and the attempt copy is what ran.
     cp "${ARG_YAML}" "${RUN_DIR}/deployment.yaml"
@@ -713,9 +965,7 @@ cmd_run() {
         echo "container=${CFG_IMAGE}"
         echo "topology=$(topology_summary) on ${CFG_NODES}x${CFG_TASKS_PER_NODE}"
         echo "nodes=$(IFS=,; echo "${nodes[*]}")"
-        echo "origin=$(git -C "${CFG_REPO_DIR}" config --get remote.origin.url)"
-        echo "branch=$(git -C "${CFG_REPO_DIR}" branch --show-current)"
-        echo "commit=$(git -C "${CFG_REPO_DIR}" rev-parse HEAD)"
+        provenance "${CFG_REPO_DIR}" "${CFG_MODEL_PATH}"
     } > "${RUN_DIR}/run_metadata.txt"
 
     echo "http://${nodes[0]}:${CFG_PORT}" > "${RUN_DIR}/server_url"
@@ -1011,6 +1261,28 @@ cmd_launch() {
         fi
         export_env+=",TRTLLM_REQUEST_TRACE_DIR=${request_trace_dir}"
     fi
+    # What the model emitted, before the reasoning and tool parsers had it. The
+    # request trace above keeps the wire payload, which is what those parsers
+    # made of the text; when one drops a tool call the text it was looking at is
+    # already gone, so the two are read together and joined on the engine
+    # request id -- it reaches the client inside the response id
+    # ("chatcmpl-<id>"), so it is in the traced body, and it is what the hook is
+    # keyed on.
+    #
+    # Deliberately not gated on server.capture, which is true everywhere and
+    # true by default: this writes on the generation path of a fleet that may be
+    # under load, and a deployment debugging a parser opts in.
+    #
+    # Stays under the attempt directory rather than following trace.request_root
+    # across filesystems: debugging output with a short life, not the training
+    # data another team consumes.
+    #
+    # Same pid-per-file reasoning as the trace, and it matters more here -- with
+    # post-processing workers enabled the hook runs in those processes rather
+    # than the server's, so one node writes several of these.
+    if [[ "${CFG_RAW_OUTPUT}" == "1" ]]; then
+        export_env+=",TRTLLM_RAW_OUTPUT_DIR=${attempt_dir}/raw_output"
+    fi
     # Attention-DP routing decisions, one JSON line per batch that routed
     # something. Content-free -- request ids, token counts and per-rank prefix
     # match lengths, no prompt text -- so unlike the request trace it is not
@@ -1071,6 +1343,44 @@ cmd_launch() {
         --ntasks-per-node 1
         bash -lc "cd '${CFG_REPO_DIR}' && python3 -m pip install -e ."
     )
+    # server.post_install: once per node, in the same container the install
+    # step used and the workers will use, from the checkout's root so a
+    # relative wheel path means what it says. It sees the workers'
+    # environment (--export), which is where server.env puts anything a pip
+    # mirror or a proxy needs. Each command runs on its own; the first to fail
+    # stops the node's list and names itself, and the attempt fails before
+    # any worker starts -- a model served without the package it needs fails
+    # far later and far less legibly. `post_install` is the script's $0, which
+    # is also how the launcher tests recognise this step.
+    local post_install_cmd=()
+    if (( ${#CFG_POST_INSTALL[@]} )); then
+        post_install_cmd=(
+            "${clean_env[@]}"
+            srun "${common[@]}"
+            --ntasks "${CFG_NODES}"
+            --ntasks-per-node 1
+            --export="${export_env}"
+            bash -lc '
+                cd "$1" || exit 1
+                shift
+                for cmd in "$@"; do
+                    echo "post_install on $(hostname): ${cmd}"
+                    bash -c "${cmd}"
+                    rc=$?
+                    if (( rc != 0 )); then
+                        echo "post_install FAILED on $(hostname) (exit ${rc}): ${cmd}"
+                        exit "${rc}"
+                    fi
+                done
+            ' post_install "${CFG_REPO_DIR}" "${CFG_POST_INSTALL[@]}"
+        )
+    fi
+    # Only one server here, so there is no context/generation split to respect:
+    # whatever it serves, it generated.
+    local agg_hook_args=()
+    if [[ "${CFG_RAW_OUTPUT}" == "1" ]]; then
+        agg_hook_args=(--post_processor_hook "${RAW_OUTPUT_HOOK}")
+    fi
     local serve_cmd=(
         "${clean_env[@]}"
         srun "${common[@]}"
@@ -1101,6 +1411,7 @@ cmd_launch() {
                 "$@"
         ' _ "${CFG_MODEL_PATH}" "${CFG_PORT}" "${config_file}" "${CFG_NUMACTL}" "${CFG_TOOL_PARSER}" \
             "${CFG_UCX_TLS}" "${CFG_UCX_NET_DEVICES}" \
+        ${agg_hook_args[@]+"${agg_hook_args[@]}"} \
         ${CFG_SERVE_EXTRA_ARGS[@]+"${CFG_SERVE_EXTRA_ARGS[@]}"}
     )
 
@@ -1111,6 +1422,10 @@ cmd_launch() {
         if [[ "${CFG_INSTALL_REPO}" == "1" ]]; then
             printf '\n# install:\n'
             format_cmd "${install_cmd[@]}"
+        fi
+        if (( ${#post_install_cmd[@]} )); then
+            printf '\n# post_install:\n'
+            format_cmd "${post_install_cmd[@]}"
         fi
         if [[ "${CFG_DISAGG}" == "1" ]]; then
             # serve_cmd describes the aggregated path and is not what runs
@@ -1126,6 +1441,16 @@ cmd_launch() {
     if [[ "${CFG_INSTALL_REPO}" == "1" ]]; then
         echo "installing $(git -C "${CFG_REPO_DIR}" branch --show-current) on ${nodelist}"
         "${install_cmd[@]}" |& tee "${attempt_dir}/install.log"
+    fi
+    if (( ${#post_install_cmd[@]} )); then
+        echo "post_install: ${#CFG_POST_INSTALL[@]} command(s) on ${nodelist}"
+        local post_rc=0 failed
+        "${post_install_cmd[@]}" |& tee "${attempt_dir}/post_install.log" || post_rc=$?
+        if (( post_rc != 0 )); then
+            failed="$(grep -m1 'post_install FAILED' "${attempt_dir}/post_install.log" || true)"
+            die "server.post_install failed (exit ${post_rc}); no worker was started." \
+                "${failed:-See ${attempt_dir}/post_install.log}"
+        fi
     fi
 
     echo "starting ${CFG_MODEL_KEY} at http://${LAUNCH_NODES[0]}:${CFG_PORT}"
@@ -1181,16 +1506,28 @@ launch_disagg() {
     local nodes_per_ctx=$((CFG_CTX_RANKS / CFG_TASKS_PER_NODE))
     local nodes_per_gen=$((CFG_GEN_RANKS / CFG_TASKS_PER_NODE))
 
+    # A worker's url must name the node srun puts its task 0 on, because that
+    # rank serves HTTP. srun places a step's tasks in node-table order (by name
+    # here), not in the order a --nodelist was written, and SLURM_JOB_NODELIST
+    # need not be sorted: with TopologyParam=BlockAsNodeRank it follows block
+    # rank, and `scontrol show hostlist` keeps that order. On nsc-lhr-slurm-1
+    # the first node of each slice was therefore not the one serving, and the
+    # proxy waited forever on ports nobody had opened.
+    first_in_hostlist_order() {
+        tr ',' '\n' <<< "$1" | sort -V | head -n 1
+    }
     local ctx_urls=() gen_urls=() ctx_nodes=() gen_nodes=()
-    local i port node_cursor=0 next_port=$((CFG_PORT + 1))
+    local i port node_cursor=0 next_port=$((CFG_PORT + 1)) slice
     for ((i = 0; i < CFG_CTX_INSTANCES; i++)); do
-        ctx_nodes+=("$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_ctx}")")
-        ctx_urls+=("${LAUNCH_NODES[node_cursor]}:${next_port}")
+        slice="$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_ctx}")"
+        ctx_nodes+=("${slice}")
+        ctx_urls+=("$(first_in_hostlist_order "${slice}"):${next_port}")
         node_cursor=$((node_cursor + nodes_per_ctx)); next_port=$((next_port + 1))
     done
     for ((i = 0; i < CFG_GEN_INSTANCES; i++)); do
-        gen_nodes+=("$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_gen}")")
-        gen_urls+=("${LAUNCH_NODES[node_cursor]}:${next_port}")
+        slice="$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_gen}")"
+        gen_nodes+=("${slice}")
+        gen_urls+=("$(first_in_hostlist_order "${slice}"):${next_port}")
         node_cursor=$((node_cursor + nodes_per_gen)); next_port=$((next_port + 1))
     done
 
@@ -1294,6 +1631,14 @@ PY
             if [[ "${role}" == "gen" && -n "${CFG_TOOL_PARSER}" ]]; then
                 parser_args=(--tool_parser "${CFG_TOOL_PARSER}")
             fi
+            # Generation-only for the reason directly above: a context worker's
+            # text is deliberately truncated, so recording it would fill the
+            # dump with fragments that were never meant to be an answer. The
+            # variable is exported to every worker regardless; what makes this
+            # one write is being given the hook.
+            if [[ "${role}" == "gen" && "${CFG_RAW_OUTPUT}" == "1" ]]; then
+                parser_args+=(--post_processor_hook "${RAW_OUTPUT_HOOK}")
+            fi
             # Each worker is its own engine with its own rank 0, so both would
             # otherwise append to the one adp_route_trace.jsonl that cmd_launch
             # put in export_env and the two streams would interleave. Give each
@@ -1375,6 +1720,7 @@ gateway_submit() {
         --cpus-per-task 4
         --time "${CFG_GW_TIME}"
         --output "${log_dir}/${CFG_NAME}-gateway-%j.out"
+        --open-mode append
     )
     if [[ -n "${CFG_GW_QOS}" ]]; then
         sbatch_args+=(--qos "${CFG_GW_QOS}")
@@ -1528,6 +1874,13 @@ main() {
         submit) cmd_submit "$@" ;;
         run) cmd_run "$@" ;;
         launch) cmd_launch "$@" ;;
+        # Internal like launch: prints what a launch would record, by hand.
+        provenance) provenance "${1:?usage: serve.sh provenance REPO_DIR MODEL_PATH}" \
+                               "${2:?usage: serve.sh provenance REPO_DIR MODEL_PATH}" ;;
+        # Internal too: the configuration a deployment file resolves to --
+        # job name, fleet dir, trace roots, post-install commands -- exactly
+        # as submit, run and launch eval it, with no cluster needed.
+        resolve) parse_args "$@"; reject_control_flags; resolve "${ARG_YAML}" ;;
         gateway) cmd_gateway "$@" ;;
         start|restart|stop|quit|status) cmd_control "${command}" "$@" ;;
         -h|--help|help) usage ;;

@@ -22,10 +22,10 @@ def _load_agent(
             return module, None
         missing = [a for a in required_attributes if not hasattr(module, a)]
         err = ImportError(f"Module {module_name} is missing required attributes: {missing}")
-        logger.warning("%s", err)
+        logger.warning(str(err))
         return None, err
     except ImportError as e:
-        logger.warning("Failed to import module: %s. Error: %s", module_name, str(e))
+        logger.warning(f"Failed to import module: {module_name}. Error: {str(e)}")
         return None, e
 
 

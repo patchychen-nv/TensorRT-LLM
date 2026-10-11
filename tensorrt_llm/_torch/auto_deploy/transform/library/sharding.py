@@ -1259,9 +1259,8 @@ class Sharding(BaseTransform):
                     and transform_container.ep_transforms
                 ):
                     ad_logger.info(
-                        "Reverting %d EP sharding transform(s) on draft submodel "
-                        "under attention_dp (replicating instead).",
-                        len(transform_container.ep_transforms),
+                        f"Reverting {len(transform_container.ep_transforms)} EP sharding "
+                        f"transform(s) on draft submodel under attention_dp (replicating instead)."
                     )
                     transform_container.ep_transforms.clear()
             if ShardingDim.BMM in config.sharding_dims:

@@ -17,9 +17,10 @@
 # names -- is the one a person can get wrong, and is therefore the one worth
 # guarding in the launcher rather than trusting.
 #
-# The worker configs are deliberately NOT scaled down: same DEP4 context, same
-# DEP8+MTP generation as production. Only the count of context workers differs.
-# A test fleet built from different parts tests different parts.
+# The worker configs are deliberately NOT scaled down: the same DEP8+MTP
+# generation worker as production, and a context worker at the widest shape the
+# checkpoint admits. Only the count of context workers differs. A test fleet
+# built from different parts tests different parts.
 #
 #   ./fleetctl --config deployments/fleet_jhb_test.yaml up
 
@@ -32,12 +33,36 @@ defaults:
   repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM
 
   model:
-    name: glm5.2
-    # Not the path in serli's file. That one resolves through
-    # /lustre/fsw/portfolios/coreai/users/serli -> coreai_mlperf_inference,
-    # a PPP this account cannot read; every read there fails EACCES. This is
-    # the copy under coreai_kf_dev, same checkpoint, readable.
-    path: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/models/GLM-5.2-NVFP4
+    # name keys the fleet directory (<cluster_name>_<name>), which the gateway
+    # is pointed at by GW_FLEET_NAME. Changing it here without restarting the
+    # gateway against the new directory leaves the gateway watching an empty
+    # one and 503ing every request while the fleet is perfectly healthy.
+    name: glm5.3
+    # The JET distribution, owned by svc-jet:jet-admins. JET publishes it as
+    # /lustre/fsw/... and datagen-glm53 reads it under that name, but this must
+    # be the /scratch/fsw spelling: the two are the same file (identical inode,
+    # verified) and only /scratch/fsw is in container.mounts.
+    #
+    # Measured from inside the container, with these mounts:
+    #     /lustre/fsw    not visible
+    #     /scratch/fsw   visible, all 141 safetensors readable
+    #
+    # The claim elsewhere in this file that "/lustre/fsw is mounted by default
+    # on this cluster" holds for the host and the login node, NOT for the
+    # worker container -- trace.request_root works because serve.sh symlinks
+    # the attempt directory at the lustre path from outside the container,
+    # which is not evidence the container can read it.
+    #
+    # Getting this wrong does not fail as "file not found". _maybe_download_model
+    # (commands/utils.py:43) treats a path that does not exist as a HuggingFace
+    # repo id and tries to download it, so the symptom is
+    #     HFValidationError: Repo id must be in the form 'repo_name' or
+    #     'namespace/repo_name': '/lustre/fsw/...'
+    # which reads like a config typo rather than a missing mount.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/zai-org_glm-5.3/hf/hf-e0b07fd_orig
+    # Unchanged from 5.2, and that is a measured claim rather than an
+    # assumption: 5.3 is still model_type glm_moe_dsa /
+    # GlmMoeDsaForCausalLM, so the same tool markup and the same parser apply.
     tool_parser: glm47
 
   slurm:
@@ -51,7 +76,23 @@ defaults:
     qos: normal
     time: "24:00:00"
     gpus_per_node: 4
-    extra_args: []
+    # TEMPORARY. nvl72d333-T13/T14 failed NIXL/UCX backend creation on 4
+    # of 4 attempts (job 533432, ranks 0-3 only, which are the ranks on
+    # T13) while ctx-1 and gen-0 of the same job -- same config, same
+    # instant, other nodes -- came up fine. Node-local, and Slurm keeps
+    # the allocation across attempts, so retrying there never succeeds.
+    # Remove once those two nodes are known good.
+    # --segment=6 keeps all six nodes of an instance inside one NVL72
+    # block (scontrol show topology: one nvl72dNNN prefix == one
+    # 18-node block). Verified with `sbatch --test-only`: without it a
+    # 6-node request spread across three blocks, with it all six landed
+    # in one. The flag is absent from `sbatch --help` on 25.11.6 but is
+    # parsed -- a deliberately bogus spelling is rejected, this one is
+    # not. NOTE: the UCX block below is the cross-rack configuration;
+    # a single-rack instance would prefer
+    # UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp and none of those four.
+    # Left as-is on purpose so that placement is the only variable.
+    extra_args: ["--exclude=nvl72d333-T13,nvl72d333-T14", "--segment=6"]
 
   container:
     # The image `jenkins/current_image_tags.properties` pins for this source
@@ -68,10 +109,21 @@ defaults:
     install_repo: true
     numactl: "0,1"
     capture: true
+    # Dump what the model emitted before the reasoning and tool parsers saw it,
+    # to <attempt>/raw_output/<UTC hour>/raw-<pid>.jsonl. Read beside the
+    # request trace and joined on the engine request id, which is the number
+    # inside the response's "chatcmpl-<id>".
+    #
+    # On here and nowhere else. The data-gen fleet is what these traces are
+    # collected from and is not being debugged; this costs it a write on every
+    # generation for output nobody would read.
+    raw_output: true
     extra_args: []
     env:
       TLLM_LOG_LEVEL: INFO
-      TRTLLM_SERVER_DISABLE_GC: "1"
+      # The cyclic GC must stay on in every process that parses requests: see ENV_DEFAULTS in serve.sh.
+      TRTLLM_SERVER_DISABLE_GC: "0"
+      TRTLLM_DISAGG_SERVER_DISABLE_GC: "0"
       TRTLLM_WORKER_DISABLE_GC: "1"
       TRTLLM_ENABLE_PDL: "1"
       TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
@@ -149,13 +201,21 @@ defaults:
       # cache with a single instance before bringing up the rest.
       #
       # Must be writable: a cache hit still rewrites ~31 files.
-      # Shared with the data-gen fleet on purpose. The cache is keyed by
-      # FlashInfer version and module signature, and both fleets run the
-      # same build against the same model, so the entries are identical --
-      # sharing saves the test fleet a 20-minute compile and costs nothing.
-      # Point this elsewhere if the test fleet is ever used to try a
-      # *different* build, since then the entries would not be identical.
-      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer
+      #
+      # NOT shared with the data-gen fleet any more, and the note above says
+      # why: sharing was justified by both fleets running "the same build
+      # against the same model, so the entries are identical". This fleet now
+      # runs GLM-5.3-FP8 against the data-gen fleet's GLM-5.2-NVFP4. The cache
+      # is keyed by FlashInfer version and module signature, and a different
+      # quantization gives different signatures, so the first 5.3 instance
+      # would be doing *first-compiles* into a directory the data-gen fleet is
+      # actively reading -- and concurrent first-compiles are the one case
+      # measured above as not safe. A private directory costs this fleet one
+      # ~20-minute compile and costs the data-gen fleet nothing.
+      #
+      # Still warm it with a single instance before bringing up the second,
+      # for the same reason.
+      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer-glm53
     disagg:
       start_timeout: 7200
 
@@ -231,15 +291,37 @@ defaults:
 # So both fleets live inside 8200-8880, which is clear of all six, and are
 # spaced 20 apart because a disaggregated deployment binds the proxy port plus
 # one per worker frontend -- an 8P1D instance uses port..port+9.
+# The context worker is DEP8 here where the 5.2 fleet ran it DEP4, and that is
+# forced by the checkpoint, not a tuning choice. GLM-5.3 is FP8 (704 GB) where
+# 5.2 was NVFP4 (433 GB), a factor of 1.626. Measured on the 5.2 fleet, a DEP4
+# context rank held 136.46 GiB of weights inside torch plus 2.94 outside and
+# took a 49.81 GiB KV quota -- the max_tokens bound binds here, not
+# free_gpu_memory_fraction. Scaling the weights alone puts DEP4 on 5.3 at
+#
+#     139.4 x 1.626 + 49.81  =  276.5 GiB   against 276.62 GiB on a GB300
+#
+# i.e. the whole card before a single activation. DEP8 halves the expert shard
+# and lands at ~198.9 GiB, leaving ~78 GiB. The generation worker was already
+# DEP8 and stays as it is.
+#
+# Node count is NOT declared: fleetctl's nodes_for() derives it from the engine
+# configs' rank counts, and serve.sh refuses to submit when the two disagree.
+# Doubling the context ranks therefore moves each instance from 4 nodes to 6
+# (2 ctx x 8 + 1 gen x 8 = 24 ranks / 4 GPUs per node) on its own.
 instances:
-  - name: t0
-    port: 8800
-    topology: server_configs/glm5.2_disagg_2p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # Both instances RELEASED 2026-09-23 by request: the Kernel-Trace run
+  # moved to the datagen fleet, and these 12 GPU nodes were idle. The
+  # gateway (kept running) resubmits anything listed here via its
+  # recovery, so releasing means commenting THIS list, then scancel --
+  # in that order. Uncomment + `fleetctl up` to bring the test fleet back.
+  # - name: t0
+  # port: 8800
+  # topology: server_configs/glm5.3_disagg_2p1d.yaml
+  # ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+  # gen: server_configs/glm5.3_gen_dep8_mtp.yaml
 
-  - name: t1
-    port: 8820
-    topology: server_configs/glm5.2_disagg_2p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: t1
+  # port: 8820
+  # topology: server_configs/glm5.3_disagg_2p1d.yaml
+  # ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+  # gen: server_configs/glm5.3_gen_dep8_mtp.yaml

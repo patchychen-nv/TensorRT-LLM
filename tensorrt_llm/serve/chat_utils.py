@@ -170,8 +170,8 @@ def parse_chat_message_content_part(
     # if part_type is text/image_url/video_url/audio_url but content is None, log a warning and skip
     if part_type in VALID_MESSAGE_CONTENT_MM_PART_TYPES and content is None:
         logger.warning(
-            "Skipping multimodal part '%s' (type: '%s') with empty / unparsable content.",
-            part, part_type)
+            f"Skipping multimodal part '{part}' (type: '{part_type}') with "
+            f"empty / unparsable content.")
         return None
 
     if part_type == "text":
@@ -192,8 +192,8 @@ def parse_chat_message_content_part(
             # names the modality but not the model and reads like a bug in the
             # request. Seen 52,813 times against GLM-5.2 in one deployment.
             logger.warning(
-                "Dropping a %s part: model type %r has no %s support.",
-                part_type, mm_data_tracker._model_type, modality)
+                f"Dropping a {part_type} part: model type "
+                f"{mm_data_tracker._model_type!r} has no {modality} support.")
             return f"[{modality} omitted: this model accepts text only]"
 
     if part_type in REASONING_PART_TYPES:

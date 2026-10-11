@@ -1826,9 +1826,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             n_dropped = n_total - len(weights)
             if n_dropped:
                 logger.warning(
-                    "Ignoring %d non-mtp.* tensors from speculative_model while "
-                    "loading MTP heads (kept %d mtp.* tensors).", n_dropped,
-                    len(weights))
+                    f"Ignoring {n_dropped} non-mtp.* tensors from "
+                    f"speculative_model while loading MTP heads (kept "
+                    f"{len(weights)} mtp.* tensors).")
             if weight_mapper is None:
                 raise ValueError(
                     "weight_mapper is required to load separate MTP heads")

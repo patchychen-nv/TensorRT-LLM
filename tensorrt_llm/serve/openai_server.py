@@ -37,6 +37,8 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
@@ -113,13 +115,18 @@ from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
                                               request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+                                                ServerArrivalTimeMiddleware,
+                                                StreamKeepalive,
+                                                add_stop_kept_in_output)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
-from tensorrt_llm.serve.responses_utils import (get_steady_clock_now_in_seconds,
+from tensorrt_llm.serve.responses_utils import (first_tool_call_stop,
+                                                get_steady_clock_now_in_seconds,
                                                 guard_responses_stream)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.responses_utils import (
+    responses_stream_keepalive_interval, stamp_sse_sequence_number)
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
@@ -460,8 +467,8 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
     if tool_parser_cls is None:
         logger.warning(
-            "Tool parser '%s' not found, cannot enforce strict mode for tools.",
-            tool_parser_name)
+            f"Tool parser '{tool_parser_name}' not found, cannot enforce "
+            f"strict mode for tools.")
         return None
 
     parser = tool_parser_cls()
@@ -475,8 +482,8 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
             by_alias=True, exclude_none=True))
     if not parser.supports_structural_tag():
         logger.warning(
-            "Tool parser '%s' does not support structural tags, "
-            "cannot enforce strict mode for tools.", tool_parser_name)
+            f"Tool parser '{tool_parser_name}' does not support structural "
+            f"tags, cannot enforce strict mode for tools.")
         return None
 
     get_info = parser.structure_info()
@@ -903,7 +910,18 @@ class OpenAIServer(_VideoRoutesMixin):
             # expect.
             if self.metrics_collector:
                 self.metrics_collector.log_request_error(http_code=400)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+            # pydantic echoes each failing item's `input` verbatim, and a
+            # rejected multimodal part carries megabytes of base64 -- which
+            # then travels into the client's retry logs and, for a Kernel
+            # Factory agent, into the campaign STOP_REASON (measured: a whole
+            # PNG in one). The locations are the diagnostic content; the
+            # payload is not. Truncation is by error, so short messages are
+            # untouched.
+            detail = str(exc)
+            if len(detail) > 4096:
+                detail = detail[:4096] + " ... [truncated %d bytes]" % (
+                    len(detail) - 4096)
+            return JSONResponse(status_code=400, content={"error": detail})
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -975,9 +993,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.processor = AutoProcessor.from_pretrained(
                     hf_tokenizer_path, trust_remote_code=trust_remote_code)
             except Exception:
-                logger.debug(
-                    "Failed to load AutoProcessor or AutoConfig for %s",
-                    hf_tokenizer_path)
+                logger.debug(f"Failed to load AutoProcessor or AutoConfig for "
+                             f"{hf_tokenizer_path}")
                 self.processor = None
 
         # load model config
@@ -990,7 +1007,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 checkpoint_format=getattr(self.generator.args,
                                           "checkpoint_format", None))
         except Exception:
-            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
+            logger.debug(f"Failed to load AutoConfig for {hf_tokenizer_path}")
             self.model_config = None
 
         self.chat_template = load_chat_template(chat_template)
@@ -1122,7 +1139,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if torch.cuda.is_available():
                 model_config["gpu_type"] = torch.cuda.get_device_name(0)
         except (ImportError, RuntimeError) as e:
-            logger.debug("Could not detect GPU type for config metrics: %s", e)
+            logger.debug(f"Could not detect GPU type for config metrics: {e}")
 
         # Parallel config — prefer parallel_config from generator args
         # for accurate values including cp_size and world_size.
@@ -1228,11 +1245,17 @@ class OpenAIServer(_VideoRoutesMixin):
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
+        # Over-length prompts are detected from the message text because they
+        # cross the executor IPC boundary as plain strings (RequestError), so
+        # no exception type survives to here.
+        code: Union[int, str] = status_code.value
+        if is_context_length_exceeded_message(message):
+            code = CONTEXT_LENGTH_EXCEEDED_CODE
         error_response = ErrorResponse(message=message,
                                        type=err_type,
-                                       code=status_code.value)
+                                       code=code)
         return JSONResponse(content=error_response.model_dump(),
-                            status_code=error_response.code)
+                            status_code=status_code.value)
 
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
@@ -2397,19 +2420,39 @@ class OpenAIServer(_VideoRoutesMixin):
         # turns with. The chat handler this forwards into hooks the same request
         # again and finds this context already there.
         trace_handle = await self._request_trace.on_request(raw_request)
+
+        def _reject(message: Any, err_type: str, status_code: int) -> Response:
+            # Every deliberate rejection settles the trace before returning.
+            # These returns used to leave no terminal record at all, so the
+            # trace showed the request arriving and never finishing
+            # (tr_2796138ec3b64f3ba6cdcdc5c3636971: on the requests shard,
+            # absent from the responses shard) - indistinguishable from a
+            # request still in flight. One helper rather than a record at
+            # each return, so a future early exit cannot reopen the gap.
+            # on_response is exactly-once per handle, and the streaming
+            # return below keeps delegating its terminal record to
+            # wrap_stream, which writes it when the client's stream ends.
+            # The record keeps the body the client reads.
+            response = anthropic_error_response(message, err_type, status_code)
+            self._request_trace.on_response(
+                trace_handle,
+                payload=json.loads(response.body),
+                status=(f"rejected_{status_code}"
+                        if status_code < 500 else "error"),
+                http_status=status_code,
+            )
+            return response
+
         try:
             chat_request = convert_anthropic_request(request)
         except AnthropicRequestError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
+            return _reject(str(e), "invalid_request_error", 400)
         except ValidationError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
+            return _reject(str(e), "invalid_request_error", 400)
 
         response = await self.openai_chat(chat_request, raw_request)
         if response is None:
-            return anthropic_error_response("Internal server error",
-                                            "api_error", 500)
+            return _reject("Internal server error", "api_error", 500)
 
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
@@ -2428,7 +2471,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 message = "Internal server error"
             err_type = ("invalid_request_error"
                         if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(message, err_type, status)
+            return _reject(message, err_type, status)
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
@@ -3098,9 +3141,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 harmony_tokens = tokenize_harmony_chat_request(
                     request, harmony_adapter=self.harmony_adapter)
             except Exception:
-                logger.error("messages_dict: %s", request.messages)
-                logger.error("tools: %s", request.tools)
-                logger.error("request: %s", request)
+                logger.error(f"messages_dict: {request.messages}")
+                logger.error(f"tools: {request.tools}")
+                logger.error(f"request: {request}")
                 raise
 
             # Get harmony stop tokens
@@ -3176,13 +3219,31 @@ class OpenAIServer(_VideoRoutesMixin):
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:
-            logger.error("Error in harmony chat completion: %s", e)
-            logger.debug("Error details: %s", traceback.format_exc())
+            logger.error(f"Error in harmony chat completion: {e}")
+            logger.debug(f"Error details: {traceback.format_exc()}")
             return self.create_error_response(message=str(e),
                                               err_type="internal_error")
 
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:
+        """Serve one /v1/responses request, streaming or not.
+
+        ``parallel_tool_calls=false`` is honoured by ending generation on the
+        text that completes the first tool call. The recorded output stays an
+        exact prefix of what the model generated
+        (responses_utils.first_tool_call_stop). Tool-call formats without such
+        text, and the Harmony path, accept the option without enforcing it.
+
+        On the non-Harmony path, ``tool_choice`` values other than "auto" and
+        "none" are accepted for schema compatibility but not enforced.
+        Honouring them would mean constraining what the model generated, and
+        these turns are recorded as training data, where a falsified output is
+        worse than an unconstrained one. A once-per-process warning below says
+        so instead of silently swallowing the option. ``tool_choice="none"``
+        can be honoured losslessly: the tool parser is bypassed and any call
+        markup stays in the visible text verbatim (see
+        responses_utils._effective_tool_parser).
+        """
         trace_handle = await self._request_trace.on_request(raw_request)
 
         async def create_response(
@@ -3200,11 +3261,17 @@ class OpenAIServer(_VideoRoutesMixin):
                     model_name=self.model,
                     conversation_store=self.conversation_store,
                     generation_result=None,
-                    enable_store=self.enable_store and request.store,
+                    # The server-side switch; create_response applies
+                    # request.store itself before persisting anything.
+                    enable_store=self.enable_store,
                     use_harmony=self.use_harmony,
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
                     num_prompt_tokens=args.num_prompt_tokens,
+                    # This path does no postprocessing in a worker, so nothing
+                    # has populated args.tokenizer. Used only to count
+                    # reasoning tokens for usage.
+                    tokenizer=self.tokenizer,
                 )
 
             await self._extract_metrics(promise, raw_request)
@@ -3214,16 +3281,41 @@ class OpenAIServer(_VideoRoutesMixin):
                                              postproc_params: PostprocParams):
             post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             streaming_processor = args.streaming_processor
+            # One monotonic counter per response, restamped onto every frame
+            # right before it leaves the server. The producers cannot number
+            # the stream themselves: with postprocessing workers enabled the
+            # two opening events below come from this process's streaming
+            # processor while every later frame is built by a pickled copy of
+            # it inside a worker, each counting from zero, so one response's
+            # stream carried 0,1,0,1,2,... (221 of 221 measured responses).
+            # Both configurations flow through this generator - workers hand
+            # back ready-made frames in _postprocess_result, the in-process
+            # path builds them via post_processor - so this is the one point
+            # where a response-wide sequence exists to be assigned.
+            sequence_number = 0
             initial_responses = streaming_processor.get_initial_responses()
             for initial_response in initial_responses:
-                yield initial_response
+                yield stamp_sse_sequence_number(initial_response,
+                                                sequence_number)
+                sequence_number += 1
+            # A tool call is sent only once complete; while a long one is
+            # generated the opening response.in_progress is repeated so the
+            # client does not drop the silent stream (see StreamKeepalive).
+            keepalive = StreamKeepalive(initial_responses,
+                                        responses_stream_keepalive_interval())
 
             async for res in promise:
                 pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                         res, args)
                 for pp_res in pp_results:
-                    yield pp_res
+                    yield stamp_sse_sequence_number(pp_res, sequence_number)
+                    sequence_number += 1
+                keepalive_frame = keepalive.step(bool(pp_results))
+                if keepalive_frame is not None:
+                    yield stamp_sse_sequence_number(keepalive_frame,
+                                                    sequence_number)
+                    sequence_number += 1
             await self._extract_metrics(res, raw_request)
 
         try:
@@ -3255,6 +3347,31 @@ class OpenAIServer(_VideoRoutesMixin):
                              f"{web_search_error}."),
                 )
 
+            # parallel_tool_calls=false becomes a stop after the first call
+            # where the tool-call format allows one (see the docstring).
+            # Elsewhere it is accepted and said once per process, like the
+            # tool_choice values below: rejecting would break clients that
+            # always send them.
+            single_call_stop = None if self.use_harmony else first_tool_call_stop(
+                self.tool_parser, request)
+            if (request.parallel_tool_calls is False and request.tools
+                    and request.tool_choice != "none"
+                    and single_call_stop is None):
+                logger.warning_once(
+                    "Responses API: 'parallel_tool_calls=false' is accepted "
+                    "but not enforced for this tool-call format; the model "
+                    "may still emit several tool calls in one turn.",
+                    key="responses_parallel_tool_calls_unenforced")
+            # "none" is excluded: it is honoured by bypassing the tool parser
+            # (responses_utils._effective_tool_parser), which loses nothing.
+            if not self.use_harmony and request.tool_choice not in ("auto",
+                                                                    "none"):
+                logger.warning_once(
+                    "Responses API: 'tool_choice' values other than 'auto' "
+                    "and 'none' are accepted but not enforced on this model "
+                    "path; generation is not constrained by them.",
+                    key="responses_tool_choice_unenforced")
+
             # Get prev response
             prev_response = None
             if self.enable_store:
@@ -3276,7 +3393,15 @@ class OpenAIServer(_VideoRoutesMixin):
                 request=request,
                 prev_response=prev_response,
                 conversation_store=self.conversation_store,
-                enable_store=self.enable_store and request.store,
+                # The server-side switch alone, because two independent things
+                # hang off it downstream: whether PRIOR context is fetched
+                # (gated there on previous_response_id being present) and
+                # whether THIS request is persisted (gated there on
+                # request.store). Folding request.store in here collapsed the
+                # two, so a follow-up sent with store=false had its
+                # previous_response_id loaded and validated above - and then
+                # generated with no history at all, silently.
+                enable_store=self.enable_store,
                 use_harmony=self.use_harmony,
                 tokenizer=self.tokenizer if not self.use_harmony else None,
                 model_config=self.model_config
@@ -3285,6 +3410,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 reasoning_parser=self.generator.args.reasoning_parser
                 if not self.use_harmony else "gpt_oss",
             )
+            if single_call_stop is not None:
+                add_stop_kept_in_output(sampling_params, single_call_stop)
 
             streaming_processor = None
             if request.stream:
@@ -3294,7 +3421,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     sampling_params=sampling_params,
                     model_name=self.model,
                     conversation_store=self.conversation_store,
-                    enable_store=self.enable_store and request.store,
+                    # Same as above: the processor's create_response applies
+                    # request.store before persisting.
+                    enable_store=self.enable_store,
                     use_harmony=self.use_harmony,
                     reasoning_parser=self.generator.args.reasoning_parser,
                     tool_parser=self.tool_parser,
@@ -3414,7 +3543,9 @@ class OpenAIServer(_VideoRoutesMixin):
         if response is None:
             return self._create_response_id_not_found_error(response_id)
 
-        return JSONResponse(content=response.model_dump())
+        # by_alias for the reason given on the POST path above: the stored
+        # object is the one POST returned, `schema_` and all.
+        return JSONResponse(content=response.model_dump(by_alias=True))
 
     async def openai_responses_delete_response(
             self, response_id: str) -> JSONResponse:

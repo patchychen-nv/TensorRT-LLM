@@ -220,6 +220,114 @@ def test_messages_route_reframes_streaming_response(server_kind):
     assert backend.await_args.args[0].stream
 
 
+# ---------------------------------------------------------------------------
+# Every /v1/messages exit must leave exactly one terminal trace record
+# ---------------------------------------------------------------------------
+#
+# A deliberate early 400 used to return before any terminal record was
+# written, so the trace showed the request arriving and never finishing
+# (tr_2796138ec3b64f3ba6cdcdc5c3636971: present in the requests shard, absent
+# from all of the responses shard) - indistinguishable from a request still in
+# flight. Standard server only: the disaggregated handler has the same gap and
+# is not fixed here.
+
+
+def _make_traced_route_client(openai_response):
+    """The standard-server route client, with a recording trace writer.
+
+    The writer is real - on_request/on_response run their own logic, exactly-
+    once guard included - with only the queue handoff replaced by a list, so
+    the records can be asserted without running the drain task.
+    """
+    app = FastAPI()
+    server = object.__new__(OpenAIServer)
+    server.model = MODEL
+    writer = RequestTraceWriter("unused-trace-dir")
+    writer._task = object()  # enabled, without a running drain task
+    records = []
+    writer._submit = lambda bucket, kind, record: records.append((kind, record))
+    server._request_trace = writer
+    backend = AsyncMock(return_value=openai_response)
+    server.openai_chat = backend
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+    return TestClient(app), records
+
+
+def _terminal_records(records):
+    return [record for kind, record in records if kind == "responses"]
+
+
+def test_messages_route_rejection_leaves_one_terminal_trace_record():
+    client, records = _make_traced_route_client(_json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "data": "QUJD",
+                                "media_type": "application/pdf",
+                            },
+                        }
+                    ],
+                }
+            ]
+        ),
+    )
+
+    assert response.status_code == 400
+    requests = [record for kind, record in records if kind == "requests"]
+    terminals = _terminal_records(records)
+    assert len(requests) == 1
+    assert len(terminals) == 1
+    assert terminals[0]["status"] == "rejected_400"
+    assert "not supported" in json.dumps(terminals[0]["response"])
+    # The two lines must join, or the terminal record explains nothing.
+    assert terminals[0]["trace_id"] == requests[0]["trace_id"]
+
+
+def test_messages_route_upstream_error_leaves_one_terminal_trace_record():
+    client, records = _make_traced_route_client(
+        JSONResponse(content={"message": "too busy"}, status_code=429)
+    )
+
+    response = client.post("/v1/messages", json=_request())
+
+    assert response.status_code == 429
+    terminals = _terminal_records(records)
+    assert len(terminals) == 1
+    assert terminals[0]["status"] == "rejected_429"
+
+
+def test_messages_route_success_still_records_exactly_once():
+    client, records = _make_traced_route_client(_json_chat_response())
+
+    response = client.post("/v1/messages", json=_request())
+
+    assert response.status_code == 200
+    terminals = _terminal_records(records)
+    assert len(terminals) == 1
+    assert terminals[0]["status"] == "completed"
+
+
+def test_messages_route_streaming_still_records_exactly_once():
+    """The stream's terminal record stays with wrap_stream, written once."""
+    client, records = _make_traced_route_client(_streaming_chat_response())
+
+    response = client.post("/v1/messages", json=_request(stream=True))
+
+    assert response.status_code == 200
+    terminals = _terminal_records(records)
+    assert len(terminals) == 1
+    assert terminals[0]["status"] == "completed"
+
+
 @pytest.fixture
 def prometheus_multiproc_dir(tmp_path, monkeypatch):
     """A multiprocess metrics directory that does not outlive the test.

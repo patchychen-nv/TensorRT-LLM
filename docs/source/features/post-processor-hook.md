@@ -140,6 +140,45 @@ class SuppressHook:
         return suppress()
 ```
 
+### Dump raw output for debugging (built in)
+
+`tensorrt_llm.executor.raw_output_hook.RawOutputDump` ships with TensorRT-LLM and records what the
+model produced without changing it. It is the hook to reach for when a reasoning or tool parser is
+mangling output and you need to see the text the parser was given:
+
+```bash
+export TRTLLM_RAW_OUTPUT_DIR=/path/to/raw_output
+trtllm-serve <model> \
+    --post_processor_hook tensorrt_llm.executor.raw_output_hook.RawOutputDump
+```
+
+Both halves are required; with either missing the hook passes every chunk through and writes nothing.
+It writes one JSONL line per finished output — not per chunk — to
+`$TRTLLM_RAW_OUTPUT_DIR/<UTC hour>/raw-<pid>.jsonl`:
+
+| Field | Meaning |
+|---|---|
+| `request_id` | The engine request id, as a string |
+| `output_index` | Beam / `n` index within the request |
+| `text` | The full detokenized output |
+| `frames` | The per-chunk deltas, kept separate |
+| `streaming`, `aborted`, `started_at`, `finished_at` | Context for the record |
+
+`frames` is a list rather than a joined string because incremental parsers fail on chunk boundaries —
+a tool-call marker split across two chunks looks identical to one the model never emitted once the
+deltas are concatenated.
+
+To see what the parsers then made of that text, enable the request trace
+(`tensorrt_llm/serve/request_trace.py`) by setting `TRTLLM_REQUEST_TRACE_DIR`, and join the two files
+on the request id: it reaches the client inside the response id, as the `<id>` in
+`chatcmpl-<id>` / `cmpl-<id>`. That join also holds across disaggregated serving, where the parsers
+run only in the generation worker while the request trace is written by the proxy — the proxy relays
+the worker's bytes without rewriting them, so the id the client sees is the one the generation worker
+minted.
+
+Unlike a hook that vets output, this one never fails a request: the hook seam is fail-closed by
+design, but a debug dump that cannot write its file drops the record and lets the response through.
+
 ## Per-request state
 
 The hook instance is owned by the `LLM` (built once in each post-processing worker process when the

@@ -48,8 +48,8 @@ def disable_native_allreduce_autotuner(reason: str) -> None:
     if _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
         _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = False
         logger.warning(
-            "Disabling native AllReduce autotuner (%s); falling back to the Python autotuner.",
-            reason)
+            f"Disabling native AllReduce autotuner ({reason}); falling back to "
+            f"the Python autotuner.")
 
 
 def set_allreduce_autotuner_tuning_mode(is_tuning_mode: bool) -> None:

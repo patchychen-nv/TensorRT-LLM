@@ -1,0 +1,330 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.3-FP8 CONTEXT worker: 8 GPUs over two 4-GPU GB300 nodes as DEP8
+# (attention data-parallel, experts expert-parallel), with MTP speculative
+# decoding. Two of these feed one DEP8 generation worker; see
+# glm5.3_gen_dep8_mtp.yaml and glm5.3_disagg_2p1d.yaml beside this file.
+#
+# Derived from glm5.2_ctx_dep4_mtp.yaml, which this fleet runs on
+# GLM-5.2-NVFP4 today. Exactly two things change:
+#
+#   1. DEP4 -> DEP8, because the checkpoint got heavier. Measured, not
+#      estimated. GB300 reports 284,208 MiB = 276.62 GiB usable per GPU. The
+#      DEP4/5.2 worker loads 136.46 GiB inside torch plus 2.94 GiB outside it,
+#      and takes a 49.81 GiB KV quota. GLM-5.2-NVFP4 is 433 GB on disk and
+#      GLM-5.3-FP8 is 704 GB (du on both checkpoints), a ratio of 1.626.
+#      Scaling the weight term by that leaves a DEP4 worker at ~276.5 GiB of
+#      276.62 GiB before a single activation: it cannot fit. At DEP8 the same
+#      worker is ~149 GiB plus the same 49.81 GiB of KV, leaving ~78 GiB
+#      against the ~87 GiB the DEP4/5.2 worker has free today. That near
+#      equality is the point of moving parallelism rather than sizing knobs:
+#      every number below was tuned against ~87 GiB of headroom and none of
+#      them has to move.
+#
+#   2. moe_config.backend CUTEDSL -> TRTLLM, because CUTEDSL cannot serve an
+#      FP8 block-scale checkpoint at all. Full argument at that key.
+#
+# Nothing else differs, and that was checked rather than assumed. The two
+# config.json files differ only in transformers_version (5.11.0 -> 5.15.0),
+# quantization_config (compressed-tensors NVFP4 group_size 16 -> fp8 e4m3
+# weight_block_size [128,128]), four keys 5.2 carries and 5.3 drops
+# (bos_token_id, layer_types, mlp_bias, num_experts) and one 5.3 adds
+# (moe_router_dtype: float32, which no TRT-LLM code path reads). None of the
+# four dropped keys reaches this model: n_routed_experts, not num_experts, is
+# what the DeepSeek/GLM path reads, and layer_types only matters when a
+# checkpoint declares more than one distinct layer type
+# (_util.py:_get_num_pool_groups_for_estimation), which glm_moe_dsa does not.
+# Every architecture value the settings below derive from is identical:
+# architectures [GlmMoeDsaForCausalLM], model_type glm_moe_dsa,
+# num_hidden_layers 78, kv_lora_rank 512, qk_rope_head_dim 64,
+# n_routed_experts 256, index_topk 2048, index_n_heads 32, index_head_dim 128,
+# num_nextn_predict_layers 1.
+#
+# This worker only runs prefill: the proxy sends it request_type=context_only
+# with stream=False and keeps nothing but choices[0].disaggregated_params.
+
+# NCCL, unchanged in value but no longer merely a preference. At DEP8 this
+# worker spans two nodes, and the fleet allocates an instance with no rack
+# constraint (see the UCX_NET_DEVICES note in the deployment YAML), so the
+# custom allreduce and userbuffers -- both confined to one NVL domain --
+# cannot serve it. AUTO would fall back to NCCL here by itself; stating it
+# keeps that fallback from being something to rediscover in a log. The DEP8
+# generation worker has run cross-node on this fleet since it started.
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# LOCAL, not the reference. The reference sets enable_kv_cache_aware_routing
+# false and routes on kv_cache_routing_conversation_affinity instead, but that
+# affinity is driven by Dynamo -- the recipe pairs it with DYN_ENGINE_CONV_AFFINITY
+# and DYN_ROUTER_SESSION_AFFINITY_TTL_SECS, and it is Dynamo's router that
+# assigns the session id. This deployment has no Dynamo: trtllm-serve's own
+# disaggregated proxy is the router, so turning conversation affinity on would
+# leave the prefill side with neither affinity nor prefix routing.
+enable_attention_dp: true
+attention_dp_config:
+  # Route by prefix-match length alone. _score_rank is
+  #   (req_tokens - match_len) + load_balance_weight * normalized_load
+  # so weight 0 drops the load term entirely and the rank holding the longest
+  # matching prefix wins outright. Ties -- every rank at match_len 0 on a cold
+  # tree, for instance -- still fall to the least-loaded rank, which is a
+  # hard-coded tie-break in the scoring loop, not a knob.
+  enable_kv_cache_aware_routing: true
+  kv_cache_routing_load_balance_weight: 0.0
+  # Kept on. The first dp_size requests are round-robined by ascending rank
+  # index without scoring at all, so every rank caches the shared system prompt
+  # before scoring starts. Without it the first request seeds one rank, that
+  # rank is then the only one with a nonzero match_len, and with the load term
+  # gone nothing at all pulls traffic back to the others.
+  #
+  # dp_size is 8 here rather than 4, so the warmup phase is now eight requests
+  # long instead of four. Same argument, one doubling further, and slightly
+  # more load-bearing: with the load term at 0.0 this warmup is the only thing
+  # that seeds the four new ranks' radix trees at all.
+  kv_cache_routing_cold_start_warmup: true
+  # Added 2026-09-30 against measured queueing: with the load term at 0.0 a
+  # rank holding a long prefix eats every request that matches it, and one
+  # 650K-token cold prefill then walls off the rank for ~70-113s of TTFT
+  # (measured p50 67.5s at 100-700K uncached; even fully-cached requests hit
+  # p90 TTFT 14s from sitting behind it). The fair-share cap lets a rank take
+  # at most 64x its fair share of queued work before the router overflows to
+  # the next-best prefix match, so a whale prefill no longer starves the
+  # small requests behind it.
+  kv_cache_routing_fair_share_multiplier: 64
+  # match_rate_threshold stays at its 0.1 default, which is also what the
+  # reference pins through TLLM_ADP_ROUTER_MATCH_RATE_THRESHOLD=0.10 -- so that
+  # env var is not carried into the deployment YAML, it would set what is
+  # already set.
+
+# NIXL because the Python transceiver supports only NIXL and DEFAULT; PYTHON
+# because "auto" falls back to the C++ transceiver, whose binding takes the V1
+# BaseKVCacheManager. Both match the reference.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  # 10 minutes, same as the reference. Must be >= the 60s default, which cancels
+  # a request whose KV has not finished moving, and these contexts run to ~1M
+  # tokens. The reference also exports TRTLLM_KV_CACHE_TRANSFER_TIMEOUT_SEC=600;
+  # the deployment YAML carries that.
+  kv_transfer_timeout_ms: 600000
+  # LOCAL, not the reference's 1048576. This sizes a real buffer, and 8192 is
+  # what the Flash disaggregated bring-up validated end to end on this container.
+  # The reference pairs 1048576 with kv_cache_bounce_size_mb: 5120, i.e. it caps
+  # the staging buffer separately; adopting the token count without the bounce
+  # cap would size the buffer off max_seq_len instead of off a chunk. Raise both
+  # together or neither.
+  #
+  # Not touched by this change: the buffer is sized in tokens, per transfer,
+  # and neither the rank count nor the checkpoint's quantization enters that.
+  max_tokens_in_buffer: 8192
+
+# No cuda_graph_config: graphs need every rank generation-only in the same
+# step, which never happens on a context worker. The reference sets
+# cuda_graph_config: null here for the same reason.
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  # fp8, carried over unchanged and deliberately so. This types the KV CACHE,
+  # not the weights: it is read straight out of kv_cache_config and has no
+  # dependency on the checkpoint's quantization. The fleet owner's proven
+  # GLM-5.3-FP8 config (datagen-glm53/config/glm53_gen_128k.yaml) carries the
+  # same `dtype: fp8` on the same checkpoint. It is moe_config.backend below,
+  # not this key, that NVFP4 owned.
+  dtype: fp8
+  enable_block_reuse: true
+  # REFERENCE, down from the local 0.85. Two reasons to take the more
+  # conservative number here rather than defend the old one: MTP adds an
+  # unquantized draft head plus draft-token activations that the 0.85 profiling
+  # never saw, and _cal_max_memory splits what is left AFTER the profiled peak,
+  # so a KV pool sized before the draft head grows cannot be given back.
+  #
+  # Still 0.75 at DEP8, and worth knowing that this knob is not what binds.
+  # The DEP4/5.2 worker's measured KV quota is 49.81 GiB while 0.75 of its free
+  # memory would have allowed ~103 GiB. At DEP8 on 5.3 the fraction allows
+  # ~96 GiB against the same 49.81 GiB quota, so it stays inert, and the ~78 GiB
+  # it leaves unclaimed is what the MoE workspace draws on. Lowering it would
+  # not buy headroom and raising it would not buy KV.
+  free_gpu_memory_fraction: 0.75
+  # LOCAL 40 GiB, not the reference's 128 GiB. Host DRAM is not scarce -- 920 GiB
+  # per node against 4 ranks -- so this is headroom to spend deliberately, not a
+  # constraint; it is left where the running deployment has it so that a slow
+  # prefill can be attributed to MTP or the MoE backend rather than to a changed
+  # cache.
+  #
+  # UNCHANGED at DEP8, and this is the key that looks rank-dependent and is not.
+  # host_cache_size is per rank, but ranks per node are fixed at
+  # slurm.gpus_per_node = 4; doubling TP adds a second node, it does not add
+  # ranks to a node. The pinned host footprint per node is therefore still
+  # 4 x 40 = 160 GiB of that node's 920 GiB, exactly as at DEP4. What doubles is
+  # the worker's aggregate host pool, 8 x 40 = 320 GiB, and that is spread over
+  # two nodes' DRAM rather than one node's.
+  host_cache_size: 42949672960
+  tokens_per_block: 64
+
+# LOCAL 16, not the reference's 256, and this one is not a preference.
+# 128 was tried on this deployment and killed a rank: the MoE kernel asked for
+# 3.93 GiB with 709 MiB free (job 525279, 22:08). The reference reaches 256 with
+# six prefill workers absorbing a benchmark's arrival pattern; a single Claude
+# Code prompt is tens of thousands of tokens and admits far more work per step
+# than startup profiling measured. The headroom is not recoverable by lowering
+# free_gpu_memory_fraction either -- see the note there. Bounding the batch is
+# what keeps the step within what profiling saw.
+#
+# UNCHANGED at DEP8. It is per rank under attention DP, so the worker's
+# aggregate admission doubles to 8 x 16 = 128 on its own. Leaving the per-rank
+# number alone is what keeps the argument above valid: the failure it guards
+# against is a per-rank allocation against per-rank free memory, and DEP8 on
+# 5.3 leaves ~78 GiB free per rank where DEP4 on 5.2 leaves ~87 GiB -- slightly
+# less, not more. Raising it here would spend headroom that just got smaller.
+#
+# If this is raised, raise it with the TRTLLM MoE backend already proven on
+# this checkpoint, one step at a time, and watch for the MoE allocation failure
+# rather than for a latency change.
+# 16 -> 64 on 2026-09-30, the step the paragraph above says to take with the
+# TRTLLM MoE backend proven on this checkpoint - which it now is, after ten
+# days of production on FP8. Operator-directed, against the measured TTFT
+# table: large-prefill aggregate throughput was ~4.9K tok/s and admission at
+# 16/rank was the queue. The warning above still stands: watch for the MoE
+# allocation failure on the ctx workers, not for a latency change, and step
+# back to 32 if it appears.
+max_batch_size: 64
+max_beam_width: 1
+max_input_len: 1048575
+# 8192, matching the reference and the running deployment. Per rank under
+# attention DP, so like max_batch_size the worker's aggregate token budget
+# doubles at DEP8 without this number moving.
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # TRTLLM, changed from the 5.2 file's CUTEDSL, and this is not a preference:
+  # CUTEDSL cannot serve this checkpoint at all. GLM-5.3-FP8 declares
+  # quant_method fp8 with weight_block_size [128,128], which TRT-LLM reads as
+  # QuantAlgo.FP8_BLOCK_SCALES. moe_resolution._candidates_for("CUTEDSL")
+  # builds exactly three candidates and every one of them rejects that on
+  # GB300:
+  #   * CuteDslB12xFusedMoE  -- SM120/121 NVFP4 decode only;
+  #   * CuteDslFusedMoE      -- fused_moe_cute_dsl.py:433 rejects
+  #     FP8_BLOCK_SCALES outright, because its only FP8-block GEMM is an fp32
+  #     einsum-per-expert reference rather than a kernel ("DeepGemm /
+  #     TRTLLMGen own it on SM100/103");
+  #   * CutlassFusedMoE      -- the single fallback the resolver appends;
+  #     fused_moe_cutlass.py:116 gates FP8_BLOCK_SCALES to SM in {90, 120},
+  #     and GB300 is neither.
+  # With no eligible candidate, impl_class_for raises "no MoE implementation
+  # can serve this layer" while the layer is being built, so the worker dies
+  # before it loads a weight. That is a hard startup failure, not the quiet
+  # per-layer fallback the 5.2 file warned about -- there is nothing to grep
+  # the log for.
+  #
+  # TRTLLM is also what the fleet owner's proven GLM-5.3-FP8 config selects
+  # (datagen-glm53/config/glm53_gen_128k.yaml, ~20 live jobs on this
+  # checkpoint). DEEPGEMM is equally eligible and the source does not rank the
+  # two; A/B it if prefill latency disappoints, but start where the proven
+  # config is.
+  #
+  # use_low_precision_moe_combine stays absent here as it was in the 5.2 file.
+  # llm_args.py:1463-1467 scopes it to NVFP4; the 5.2 GENERATION worker sets it
+  # and the 5.3 one must not. See that file.
+  backend: TRTLLM
+moe_expert_parallel_size: 8
+
+# LOCAL, absent from the reference, which runs its prefill fleet behind Dynamo
+# and never terminates HTTP in trtllm-serve itself. This does NOT add GPUs or a
+# second engine: it runs 8 HTTP frontend processes against the ONE executor that
+# already owns this worker's ranks. Frontend 0 is the process launched by srun --
+# it holds the engine and spawns the other 7, which re-exec the same trtllm-serve
+# command line, attach to the running executor over IPC, and share --port via
+# SO_REUSEPORT (the kernel spreads incoming connections by 4-tuple hash).
+#
+# The reason is this worker's request shape, not its GPU work: a single Claude
+# Code prompt is tens of thousands of tokens and max_input_len is ~1M, so the
+# frontend's JSON parse and tokenizer call are large, CPU-bound, and hold the GIL
+# against every other in-flight request on the same event loop. Splitting the
+# HTTP side across processes is the only way to overlap them; max_batch_size: 16
+# bounds what actually reaches the GPU either way.
+#
+# Requirements, all satisfied by serve.sh's launch line: the default (classic
+# IPC) executor path -- setting orchestrator_type would make this fail at
+# startup -- and a fixed --port, since port 0 / --report_addr is rejected when
+# this is > 1 (the attached frontends would each bind their own random port).
+# It survives trtllm-llmapi-launch because each child is spawned with the MPI and
+# SLURM identity vars stripped and TLLM_DISABLE_MPI=1, so it never tries to
+# rejoin the launcher's job. Ceiling is 64 (a 6-bit frontend id is packed into
+# the high bits of client_id to keep request ids distinct per frontend).
+#
+# UNCHANGED at DEP8, and this is the second key that looks rank-dependent and
+# is not. The frontends are per ENGINE, not per rank and not per node: srun
+# starts `ranks` tasks, trtllm-llmapi-launch elects one of them to run
+# trtllm-serve, and that one launcher forks the other 7 as local children
+# (serve.py:_spawn_attached_frontends). All 8 live on the worker's FIRST node,
+# with the same one engine and the same CPU budget they had at DEP4; the second
+# node runs MPI worker ranks and terminates no HTTP at all. The DEP8 generation
+# worker has been doing exactly this with num_serve_frontends: 4 since this
+# fleet started.
+num_serve_frontends: 8
+
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. serve.sh appends
+# perf_metrics_output_dir per attempt, since only it knows the path.
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+
+# REFERENCE. glm5.2_ctx_tep4.yaml deliberately omitted this block, reasoning from
+# the DeepSeek-V4-Pro recipes that every batch from 07-24 onward declares sparse
+# attention on decode only. That generalisation does not hold for GLM: the
+# reference recipe sets it on prefill AND decode, and GLM-5.3 declares the same
+# glm_moe_dsa architecture and the same indexer geometry as 5.2
+# (index_topk 2048, index_n_heads 32, index_head_dim 128).
+#
+# algorithm is the discriminator and is not optional -- sparse_attention_config
+# is a tagged union keyed on it, so a block without it fails TorchLlmArgs
+# validation outright and the worker dies before loading a weight (job 623663).
+# dsa is the tag this model resolves to: model_config.py rebuilds the field as
+# DeepSeekSparseAttentionConfig for GlmMoeDsaForCausalLM.
+#
+# index_topk is deliberately absent, matching the reference, so it falls back to
+# the checkpoint -- which is 2048 in GLM-5.3-FP8's config.json, the same value
+# 5.2 declares, so this stays a no-op rather than becoming one.
+#
+# use_cute_dsl_paged_mqa_logits is absent here as it was in the 5.2 file; the
+# 5.3 generation worker drops it, and the reasoning is written up there.
+sparse_attention_config:
+  algorithm: dsa
+  enable_heuristic_topk: true
+
+# REFERENCE. GLM-5.3 ships num_nextn_predict_layers: 1 exactly as 5.2 does, and
+# MTPDecodingConfig.use_mtp_vanilla defaults false, so a single-layer checkpoint
+# takes the EAGLE-style one-model path and max_draft_len may exceed the layer
+# count -- which is how 3 runs off one nextn layer. GlmMoeDsaForCausalLM
+# registers in modeling_deepseekv3.py, so this is the DeepSeek MTP
+# implementation, not a GLM-specific one. The 5.3 checkpoint carries the MTP
+# weights (model.layers.78.*, 1569 tensors, max layer index 78 against
+# num_hidden_layers 78), and the fleet owner's own GLM-5.3-FP8 config runs the
+# same decoding_type/max_draft_len pair.
+#
+# Must match the generation worker exactly. The reference additionally exports
+# TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.99, which pins the acceptance
+# rate to a constant instead of measuring it -- that is a benchmark instrument,
+# it makes the numbers comparable across recipes, and it is deliberately NOT
+# carried into a serving deployment, where it would silently fabricate the
+# speedup it is meant to report.
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+
+# 8, up from the 5.2 file's 4. This and moe_expert_parallel_size are the whole
+# of the parallelism change; the arithmetic that forces it is in the header.
+# serve.sh derives the allocation from this (ranks_of() x num_instances /
+# slurm.gpus_per_node), so a 2P1D instance grows from 4 nodes to 6 by itself --
+# no node count is written down anywhere that needs a matching edit.
+tensor_parallel_size: 8
+trust_remote_code: true

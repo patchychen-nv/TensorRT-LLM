@@ -25,12 +25,25 @@ defaults:
   repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM
 
   model:
-    name: glm5.2
-    # Not the path in serli's file. That one resolves through
-    # /lustre/fsw/portfolios/coreai/users/serli -> coreai_mlperf_inference,
-    # a PPP this account cannot read; every read there fails EACCES. This is
-    # the copy under coreai_kf_dev, same checkpoint, readable.
-    path: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/models/GLM-5.2-NVFP4
+    # Keys the fleet directory (<cluster_name>_<name>): changing it moves the
+    # registration dir, and the gateway must be restarted with the matching
+    # GW_FLEET_NAME or it will watch the old, empty one and 503 everything.
+    name: glm5.3
+    # The JET distribution. Must be the /scratch/fsw spelling: /lustre/fsw is
+    # the same filesystem but is NOT in container.mounts, and a path that does
+    # not exist inside the container is treated as a HuggingFace repo id --
+    # the failure reads as HFValidationError, not as a missing mount.
+    # FP8 (704 GB), not the nvfp4 variant beside it. That one is modelopt
+    # MIXED_PRECISION -- dense MLP FP8, experts NVFP4, MTP excluded -- and the
+    # GLM/DeepSeek decoder layer cannot load it: modeling_deepseekv3.py
+    # asserts "MIXED_PRECISION is ambiguous" at layer build (its own FIXME
+    # admits the gap), on rc26 and on main alike. Four attempts of job 556811
+    # died there before loading a weight, 2026-09-21. Return here when the
+    # per-layer resolution lands upstream; until then FP8 forces DEP8 ctx
+    # workers and 10-node instances.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/zai-org_glm-5.3/hf/hf-e0b07fd_orig
+    # Unchanged from 5.2 and measured, not assumed: 5.3 is still model_type
+    # glm_moe_dsa / GlmMoeDsaForCausalLM, same tool markup, same parser.
     tool_parser: glm47
 
   slurm:
@@ -62,18 +75,36 @@ defaults:
     # the common case and stays cheap.
     time: "7-00:00:00"
     gpus_per_node: 4
-    # One NVL72 rack per instance. fleetctl turns `auto` into this instance's
-    # node count, which under topology/block is what confines the allocation to
-    # a single block. Required by the UCX_TLS setting below, not optional with
-    # it: that transport list has no IB path, so a cross-rack allocation falls
-    # back to TCP and gets slow rather than failing.
+    # Each 2-node worker inside one NVL72 rack; the instance itself may span
+    # racks. 2026-10-06: `auto` (all 14 nodes in one rack) left the whole fleet
+    # pending for hours in a maintenance-depleted batch_long, so the instance
+    # was opened up to cross-rack placement once UCX_TLS below gained an RDMA
+    # path (rc over the rdma_vf rails) for ctx->gen KV transfer.
     #
-    # Measured before this was set: of instances whose nodes landed in more
-    # racks than half their node count, 81% hit the MNNVL peer-access failure;
-    # of the compact ones, 5%. The cost is that an instance pends until one
-    # rack has room, which is visible, unlike the alternative.
-    segment: auto
-    extra_args: []
+    # Not unconstrained, though. Every ctx and gen worker is DEP8 over 2 nodes,
+    # and a worker split across racks has no NVLink between its halves while
+    # MnnvlMemory.supports_mnnvl() only checks the LOCAL links - so the MoE
+    # still picks the NVLink all-to-all. Measured before `auto` was set: of
+    # instances whose nodes landed in more racks than half their node count,
+    # 81% hit the MNNVL peer-access failure; of the compact ones, 5%.
+    #
+    # --segment=2 keeps every pair in one block, and the pairs line up with the
+    # workers: serve.sh slices `scontrol show hostnames` (sorted, so grouped by
+    # nvl72dNNN block) into consecutive 2-node workers from offset 0, and each
+    # block contributes an even number of nodes. Change this with the worker
+    # size: it must equal the nodes per worker, and divide the node count.
+    segment: 2
+    # Exemption from the cluster's Occupied Idle Job Reaper (job-level
+    # --comment JSON, format per HWINFCSSUP "GPU Idle Time Exemption Guide").
+    # The reaper cancels a job whose GPUs show DCGM SM_ACTIVE <= 0.01 for
+    # 30 min. Every start and in-allocation restart spends 20-50 min with idle
+    # SMs (pip install of the checkout, weights read from Lustre, startup
+    # profiling) - on 2026-10-06 instances were reaped ~31 min into a start
+    # and during crash recovery. 60 min covers a cold start; inference_server
+    # is the reason code for a server that must stay up between bursts. Keep
+    # it no longer than needed: exemptions are monitored.
+    extra_args:
+      - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.7-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
 
   container:
     # The image `jenkins/current_image_tags.properties` pins for this source
@@ -90,29 +121,72 @@ defaults:
     install_repo: true
     numactl: "0,1"
     capture: true
+    # Dump the model text before the reasoning and tool parsers, one jsonl per
+    # UTC hour per pid under <attempt>/raw_output. Kept ON for the first
+    # Kernel-Trace pass by decision of 2026-09-22: measured 47MB per ~10
+    # campaigns against 3.3GB engine logs per attempt, and it is the artifact
+    # every parser investigation this month started from. Turn off later by
+    # flipping this and restarting instances, or prune with find -mtime.
+    raw_output: true
+    # NIXL's UCX plugin, patched. The image ships NIXL v1.4.0, whose endpoint
+    # error callback force-closes the UCP endpoint but keeps the pointer; the
+    # next metadata load for that peer then unpacks rkeys against freed memory
+    # and SIGSEGVs every rank of the context worker
+    # (ucp_ep_rkey_unpack_internal <- nixlUcxEngine::internalMDHelper <-
+    # NixlTransferAgent::loadRemoteAgent). On a pair of nodes whose endpoints
+    # fail, that is every attempt: 7 of 7 on two instances on 2026-10-06.
+    # NIXL v1.5.0 fixed it upstream (the callback only marks the endpoint
+    # failed, closeImpl force-closes it); this .so is that change applied to the
+    # v1.4.0 source and built inside this image -- its exported symbols and
+    # NEEDED entries match the stock plugin. A failed endpoint now costs the
+    # transfers on it (and logs "UCX endpoint ... failed: <status>"), not the
+    # worker. Drop this once the image's NIXL is >= 1.5.0. The checksum makes a
+    # missing or different file fail the start instead of running unpatched.
+    post_install:
+      - >-
+        echo "478e574dacb967e082626d00e0a7d06519c60138d5a1991066c0161b3f98d5de  /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.05/libplugin_UCX.so" | sha256sum -c -
+        && cp -f /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.05/libplugin_UCX.so /opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu/plugins/libplugin_UCX.so
     extra_args: []
     env:
       TLLM_LOG_LEVEL: INFO
-      TRTLLM_SERVER_DISABLE_GC: "1"
+      # The cyclic GC must stay on in every process that parses requests: see ENV_DEFAULTS in serve.sh.
+      TRTLLM_SERVER_DISABLE_GC: "0"
+      TRTLLM_DISAGG_SERVER_DISABLE_GC: "0"
       TRTLLM_WORKER_DISABLE_GC: "1"
+      # Attached frontends re-import the package before READY; on 10-08 that took >300s and
+      # the default timeout tore down every instance right after its weight load.
+      TLLM_FRONTEND_READY_TIMEOUT: "1800"
       TRTLLM_ENABLE_PDL: "1"
       TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
       ENROOT_ALLOW_DEV: "yes"
       NCCL_GRAPH_MIXING_SUPPORT: "0"
       MIMALLOC_PURGE_DELAY: "0"
       TLLM_PROFILE_LOG_RANKS: all
+      # Off everywhere, ctx too: a per-process 16-entry store can't back previous_response_id here.
+      TRTLLM_RESPONSES_API_DISABLE_STORE: "1"
 
-      # KV transfer transport, for an instance pinned to one NVL72 rack by
-      # `segment: auto` above. The two settings are a pair: this list names no
-      # IB transport, so it is only correct while the placement constraint
-      # holds. Remove the constraint and this does not fail -- KV transfer
-      # falls back to TCP and merely gets slow.
+      # KV transfer transport, for instances that span racks (`segment: 2`
+      # above). 2026-10-06: rc over the four rdma_vf rails gives cross-rack
+      # ctx->gen KV transfer an RDMA path; without it a cross-rack transfer
+      # falls back to TCP and merely gets slow. DEVX off, the rails named
+      # explicitly, and traffic class 96 (the cluster's RoCE lossless class).
       #
       # serve.sh exports this inside the worker shell rather than through
       # --export, because the GPU nodes' enroot environ.d injects UCX_TLS=tcp
       # after srun's environment and would otherwise win.
       #
-      # What this replaced, and why. The previous configuration turned DEVX off
+      # WATCH ON EVERY START: UCX's `rc` still opens a UD interface for wireup,
+      # and UD QP creation is exactly what failed on the SR-IOV-starved nodes
+      # in the history below. If "failed to create UD QP" or "createBackend:
+      # backend creation failed for 'UCX'" reappears, exclude those nodes
+      # (slurm.extra_args --exclude) or fall back to the TCP-only list.
+      UCX_TLS: "rc,tcp,cuda_ipc,cuda_copy,sm,self"
+      UCX_IB_MLX5_DEVX: "n"
+      UCX_NET_DEVICES: "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1"
+      UCX_IB_TRAFFIC_CLASS: "96"
+      #
+      # History - the single-rack, TCP-only list this replaced, and why it was
+      # adopted (2026-09-13). The configuration before THAT turned DEVX off
       # and named the four rdma_vf_rail devices, which left ud_verbs as the
       # only wireup transport. ud_verbs opens each interface with a UD QP, four
       # rails times four ranks per node, against an SR-IOV pool too small for
@@ -133,7 +207,8 @@ defaults:
       # cannot occur on any node. Verified by rolling i03 onto this list while
       # its allocation still contained a node from the known-bad list: 4 UD QP
       # failures and 22 NIXL failures before, 0 and 0 after, 7/7 workers up.
-      UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+      # (the TCP-only list, kept here as the fallback named above:)
+      # UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
 
       # Kept, though the note this replaced grouped it with the four transport
       # settings that went. It bounds NIXL's own worker threads and says
@@ -157,7 +232,14 @@ defaults:
       # cache with a single instance before bringing up the rest.
       #
       # Must be writable: a cache hit still rewrites ~31 files.
-      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer
+      # The glm5.3 cache the test fleet warmed. Sharing holds exactly while
+      # both fleets run the same build against the same checkpoint, which
+      # they do: one repo_dir, one model path. The old /flashinfer directory
+      # holds 5.2-NVFP4 signatures and would first-compile everything here.
+      # The FP8 cache the test fleet warmed: same build, same checkpoint, so
+      # the sharing premise holds and both instances may start concurrently
+      # (concurrent HITS are measured safe; only first-compiles are not).
+      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer-glm53
     disagg:
       start_timeout: 7200
 
@@ -217,7 +299,12 @@ defaults:
     # fail, the directory reads as empty, and nothing says so. serve.sh now
     # resolves this and warns when the target is outside every mount, but the
     # config should be right on its own.
-    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_data_gen
+    # Kernel-Trace traces are their own corpus: mixing them into
+    # trace_data_gen would make them indistinguishable from the GLM-5.2
+    # campaign traffic already collected there, and trace_test is the
+    # debug fleet's. Baked at job submit -- changing this requires
+    # restarting instances, not just editing.
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace
 
 # Ports are the one thing that must differ, and the range is not free to
 # choose. Measured on a jhb GPU node, the system already listens on 8080, 8081,
@@ -232,11 +319,104 @@ defaults:
 # one per worker frontend -- an 8P1D instance uses port..port+9.
 
 instances:
+  # The Kernel-Trace pass, 2026-10-01: four 6P1D GLM-5.3-FP8 instances for
+  # the 8045-problem mirror (was two 4P1D for the 1241-problem pass). The
+  # measured bottleneck of the previous pass was large-prefill aggregate
+  # throughput (~4.9K tok/s over 4 ctx workers; decode healthy at p50 86
+  # tok/s), so capacity moves toward prefill: 6 ctx per gen, and four
+  # instances instead of two. Each instance is (6+1) x 8 GPUs = 14 nodes in
+  # one NVL72 block via `segment: auto`; the fleet is 56 nodes. The ctx
+  # config keeps the TTFT settings added 2026-09-30 (kv-cache-aware routing,
+  # fair_share_multiplier 64, max_batch_size 64). The FlashInfer cache
+  # (flashinfer-glm53) is warm from ten days of FP8 production.
   - name: i00
     port: 8200
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Single-rack + TCP, the same settings as i02 and i03 below, while the
+    # RDMA rails are down cluster-wide (2026-10-07 OCI cluster-network
+    # incident: rail ports DOWN, rail interfaces without addresses). With the
+    # rails as UCX's only devices not even MPI can wire up ("no active
+    # messages transport"). Return to the fleet default once the rails are
+    # back.
+    slurm:
+      segment: 14
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
+
+  - name: i01
+    port: 8220
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Single-rack + TCP while the RDMA rails are down; see i00.
+    slurm:
+      segment: 14
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
+
+  - name: i02
+    port: 8240
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Single-rack, like i03 below and for the same reason: on two cross-rack
+    # allocations in a row this instance's rc endpoints were reset on some
+    # ctx->gen pairs (3% of KV transfers failed, then the gen worker
+    # segfaulted).
+    # 14 = every node of this 6P1D DEP8 instance in one NVL72 block. Not
+    # `auto`: fleetctl resolves `auto` before merging instance overrides, so
+    # here it would reach sbatch literally.
+    slurm:
+      segment: 14
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
+
+  - name: i03
+    port: 8260
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Single-rack placement with the pre-2026-10-06 transport list: KV moves
+    # over NVLink (cuda_ipc) inside the rack, TCP on eth0 carries only wireup.
+    # Why not the fleet default (cross-rack, rc on the rails): on two
+    # allocations in a row the rc endpoints between three of this instance's
+    # six ctx workers and its gen worker were reset every few minutes (15% of
+    # KV transfers failed, then the gen worker segfaulted), while i00 and i01
+    # on the same settings had none in ~130K requests. Why not cross-rack TCP:
+    # tried for 30 min - 0 failures, but GLM's 47.7 KB/token KV over eth0 left
+    # ~30% of requests without a first token after 2 min (clients gave up).
+    # 14 = every node of this 6P1D DEP8 instance in one NVL72 block. Not
+    # `auto`: fleetctl resolves `auto` before merging instance overrides, so
+    # here it would reach sbatch literally.
+    slurm:
+      segment: 14
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
+
+  # All three parked on 2026-09-18. The old queue finished -- every campaign
+  # reached a terminal phase and the launcher is holding new starts -- so these
+  # 22 nodes were serving zero requests. The next batch of problems runs from a
+  # different queue and needs its configuration settled first; until then there
+  # is nothing for the fleet to answer.
+  #
+  # Commented rather than cancelled alone, for the reason stated above: the
+  # gateway's recover_lost_backends runs `fleetctl up`, which reconciles
+  # against THIS list. Uncomment all three to resume.
+  # - name: i00
+  #   port: 8200
+  #   topology: server_configs/glm5.2_disagg_4p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # Parked on 2026-09-16, not deleted. Kernel Factory caps one user at 500
   # active campaigns (409 "active campaign limit 500 reached for this user"),
@@ -256,11 +436,11 @@ instances:
   #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
   #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i02
-    port: 8240
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i02
+  #   port: 8240
+  #   topology: server_configs/glm5.2_disagg_6p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # - name: i03
   #   port: 8260
@@ -268,11 +448,11 @@ instances:
   #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
   #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i04
-    port: 8280
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i04
+  # port: 8280
+  # topology: server_configs/glm5.2_disagg_7p1d.yaml
+  # ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  # gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # - name: i05
   #   port: 8300
@@ -280,11 +460,11 @@ instances:
   #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
   #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i06
-    port: 8320
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i06
+  # port: 8320
+  # topology: server_configs/glm5.2_disagg_7p1d.yaml
+  # ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  # gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # - name: i07
   #   port: 8340
@@ -327,9 +507,9 @@ instances:
   # transport in UCX_TLS never comes up. A multi-node aggregated instance would
   # need that revisited, because tensor-parallel all-reduce would then be
   # crossing the same link the KV transfer does.
-  - name: i12
-    port: 8440
-    server: server_configs/glm5.2_agg_dep8_mtp.yaml
+  # - name: i12
+  # port: 8440
+  # server: server_configs/glm5.2_agg_dep8_mtp.yaml
 
   # Host-resident KV experiment: same 6P1D shape as i00..i03, but the context
   # workers keep only a tenth of GPU memory for KV and spill to a 128 GB pinned
@@ -340,8 +520,8 @@ instances:
   #
   # Only the ctx half differs; gen is the same file the others use, so any
   # difference in served latency is attributable to where the KV lives.
-  - name: host-kv-i13
-    port: 8460
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp_hostkv.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: host-kv-i13
+  # port: 8460
+  # topology: server_configs/glm5.2_disagg_6p1d.yaml
+  # ctx: server_configs/glm5.2_ctx_dep4_mtp_hostkv.yaml
+  # gen: server_configs/glm5.2_gen_dep8_mtp.yaml

@@ -216,11 +216,8 @@ class GMSBackend:
             # "GMS optional / fall through to disk" guarantee at the cost
             # of also swallowing programming bugs (e.g. signature drift).
             logger.warning(
-                "Failed to connect to GMS at %s (mode=%s, tag=%s): %s",
-                socket_path,
-                self._mode,
-                self._tag,
-                e,
+                f"Failed to connect to GMS at {socket_path} (mode={self._mode}, tag={self._tag}): "
+                f"{e}"
             )
             self._client = None
             self._is_rw = None
@@ -244,14 +241,11 @@ class GMSBackend:
         try:
             patch_empty_cache()
         except Exception as e:
-            logger.debug("GMS patch_empty_cache failed (non-fatal): %s", e)
+            logger.debug(f"GMS patch_empty_cache failed (non-fatal): {e}")
 
         logger.info(
-            "Connected to GMS at %s (mode=%s, granted=%s, tag=%s)",
-            socket_path,
-            self._mode,
-            "RW" if self._is_rw else "RO",
-            self._tag,
+            f"Connected to GMS at {socket_path} (mode={self._mode}, granted="
+            f"{'RW' if self._is_rw else 'RO'}, tag={self._tag})"
         )
         return True
 
@@ -452,10 +446,8 @@ class GMSBackend:
         # so we mirror that state transition here.
         self._is_rw = False
         logger.info(
-            "GMS RW->RO: committed %.2f GiB at %s (tag=%s)",
-            bytes_committed / (1 << 30),
-            self._socket_path,
-            self._tag,
+            f"GMS RW->RO: committed {bytes_committed / (1 << 30):.2f} GiB at {self._socket_path} "
+            f"(tag={self._tag})"
         )
         return bytes_committed
 
@@ -511,12 +503,9 @@ class GMSBackend:
         materialize_module_from_gms(self._client, model, device_index=self._device_index)
 
         logger.info(
-            "GMS RO: materialized weights from %s (tag=%s, tp_rank=%d/%d, total_bytes=%.2f GiB)",
-            self._socket_path,
-            self._tag,
-            self._mapping.tp_rank,
-            self._mapping.tp_size,
-            int(self._client.total_bytes) / (1 << 30),
+            f"GMS RO: materialized weights from {self._socket_path} (tag={self._tag}, tp_rank="
+            f"{self._mapping.tp_rank}/{self._mapping.tp_size}, total_bytes="
+            f"{int(self._client.total_bytes) / (1 << 30):.2f} GiB)"
         )
 
     # ------------------------------------------------------------------
@@ -554,11 +543,11 @@ class GMSBackend:
                 # connect() in the same process can re-establish state.
                 # Log at debug so unrelated shutdown noise doesn't drown
                 # out the warning we already emit for the outer try.
-                logger.debug("GMS client.close() failed (best-effort): %s", e)
+                logger.debug(f"GMS client.close() failed (best-effort): {e}")
             evict_gms_client_memory_manager(client)
-            logger.info("GMS: disconnected from %s", self._socket_path)
+            logger.info(f"GMS: disconnected from {self._socket_path}")
         except Exception as e:
-            logger.warning("GMS cleanup error: %s", e)
+            logger.warning(f"GMS cleanup error: {e}")
         finally:
             self._client = None
             self._is_rw = None

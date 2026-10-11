@@ -943,7 +943,7 @@ class QwenImageLayeredPipeline(BasePipeline):
 
         additional_t_cond = torch.zeros(batch_size, device=device, dtype=torch.long)
         timer.mark_denoise_start()
-        logger.info("Denoising layered output (%d steps)...", len(timesteps))
+        logger.info(f"Denoising layered output ({len(timesteps)} steps)...")
         for _, t in self._profile_denoise_steps(timesteps):
             latent_model_input = torch.cat([latents, image_latents], dim=1)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -986,7 +986,7 @@ class QwenImageLayeredPipeline(BasePipeline):
         logger.info("Decoding layered output...")
         layer_stack = self._decode_layered_latents(latents, height, width, layers)
         if getattr(self, "rank", 0) == 0:
-            logger.info("Layered pipeline total: %.2fs", time.time() - pipeline_start)
+            logger.info(f"Layered pipeline total: {time.time() - pipeline_start:.2f}s")
 
         timer.mark_end()
         image = self._format_layer_output(layer_stack, save_layers_to_grid)

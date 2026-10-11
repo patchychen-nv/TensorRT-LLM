@@ -492,9 +492,8 @@ class Flux2Pipeline(BasePipeline):
                 sharder=getattr(self.transformer, "sharder", None),
             )
             logger.info(
-                "Prepared %d FLUX.2 reference image(s), %d tokens total",
-                len(condition_images),
-                image_latents.shape[1],
+                f"Prepared {len(condition_images)} FLUX.2 reference image(s), "
+                f"{image_latents.shape[1]} tokens total"
             )
 
         # Prepare timesteps with dynamic shifting

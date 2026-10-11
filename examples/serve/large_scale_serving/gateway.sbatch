@@ -99,6 +99,24 @@
 #   GW_SELF         script the chain resubmits   (default this file in GW_REPO)
 #   GW_PORT         listen port              (default 8333)
 #   GW_FLEET_CONFIG fleet.yaml for preemption recovery (default: off)
+#   GW_RELAY_ARGS   replaces the default --no-relay. For walltime relay:
+#                   "--yaml <fleet.yaml> --relay-per-instance --lead-time 3300"
+#                   (lead must exceed the ~50min cold start)
+#   GW_EXTRA_POOLS  more fleet directories behind the same address,
+#                   whitespace-separated, each a gateway.py --pool spec:
+#                     NAME=FLEET_DIR[,FLEET_CONFIG]
+#                   e.g. "kimi-k3=$GW_VAR/_fleet/kffleet_kimi-k3,<fleet_k3.yaml>".
+#                   Every directory's backends are one routing pool: requests,
+#                   retries and conversation pins treat them alike, whatever
+#                   model a request names. FLEET_CONFIG drives revive, recovery
+#                   and -- with --relay-per-instance in GW_RELAY_ARGS --
+#                   walltime relay for that pool's jobs alone; without one the
+#                   pool is routed but never supervised. A chain already
+#                   running never sees a change here (every link inherits the
+#                   environment it was submitted with), so to add a pool to a
+#                   live gateway put the same spec in $GW_DIR/pools.conf, one
+#                   per line, and POST /_gateway/handover: every generation
+#                   reads that file when it starts.
 #   GW_MAX_STARTS   chain-thrash threshold   (default 5 in 30 minutes)
 #   GW_EXTRA_ARGS   appended to the gateway command line
 #   GW_NO_CHAIN     set to anything to run once without a successor
@@ -238,6 +256,22 @@ if [ -n "${GW_FLEET_CONFIG:-}" ]; then
     fi
 fi
 
+# Extra pools (fleet directories). read -a rather than an unquoted expansion, so a spec is
+# split on whitespace and nothing else -- never globbed against this directory.
+POOLS=()
+read -r -a POOL_SPECS <<< "${GW_EXTRA_POOLS:-}"
+for spec in "${POOL_SPECS[@]}"; do
+    POOLS+=(--pool "$spec")
+    echo "extra pool: $spec"
+done
+if [ "${#POOL_SPECS[@]}" -gt 0 ] && [ -n "${GW_REMOTE_HOST:-}" ]; then
+    echo "WARNING: fleet-sync pulls only the default pool's directory; an extra pool's" >&2
+    echo "WARNING: FLEET_DIR has to be kept in sync from $GW_REMOTE_HOST some other way." >&2
+fi
+if [ -f "$GW_OWN/pools.conf" ]; then
+    echo "pools file: $GW_OWN/pools.conf (read by every gateway generation at startup)"
+fi
+
 echo "fleet dir: $FLEET_DIR"
 
 # ---------------------------------------------------------------------------
@@ -338,7 +372,8 @@ python3 "$HERE/gateway.py" \
     --router-state "$GW_OWN/router_state.json" \
     "${RECOVERY[@]}" \
     "${REMOTE_ARGS[@]}" \
-    --no-relay --log-level INFO \
+    "${POOLS[@]}" \
+    ${GW_RELAY_ARGS:---no-relay} --log-level INFO \
     ${GW_EXTRA_ARGS:-} &
 GEN_PID=$!
 GEN_OWNED=1

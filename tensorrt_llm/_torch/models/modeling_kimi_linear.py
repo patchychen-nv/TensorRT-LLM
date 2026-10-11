@@ -1332,18 +1332,13 @@ class KimiK3MoERuntime(nn.Module):
                         # Logged once per layer: the routed-expert format decides
                         # which MoE backends can serve this checkpoint at all.
                         logger.debug(
-                            "Kimi K3 layer %d routed experts: %s (group_size=%s) "
-                            "from the checkpoint",
-                            layer_idx,
-                            cfg.quant_algo,
-                            cfg.group_size,
+                            f"Kimi K3 layer {layer_idx} routed experts: {cfg.quant_algo} "
+                            f"(group_size={cfg.group_size}) from the checkpoint"
                         )
                         return cfg
         logger.debug(
-            "Kimi K3 layer %d routed experts: no per-layer quant config in the "
-            "checkpoint, defaulting to %s",
-            layer_idx,
-            _K3_DEFAULT_ROUTED_QUANT_ALGO,
+            f"Kimi K3 layer {layer_idx} routed experts: no per-layer quant config in the "
+            f"checkpoint, defaulting to {_K3_DEFAULT_ROUTED_QUANT_ALGO}"
         )
         return QuantConfig(quant_algo=_K3_DEFAULT_ROUTED_QUANT_ALGO)
 

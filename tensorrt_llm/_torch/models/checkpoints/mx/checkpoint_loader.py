@@ -541,13 +541,11 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 self._post_transform_weights_preloaded = False
                 self._source_identity_compatible_for_last_load = False
                 logger.warning(
-                    "MX P2P returned %d fallback weights (%.2f MiB, size mismatch) "
-                    "from a post-transform source at %s. Falling back to a full "
-                    "disk load to avoid mixing transformed P2P tensors with raw "
-                    "fallback tensors before the full post-load transform path.",
-                    len(fallback_weights),
-                    fallback_bytes / (1 << 20),
-                    self._mx_server_url,
+                    f"MX P2P returned {len(fallback_weights)} fallback weights ("
+                    f"{fallback_bytes / (1 << 20):.2f} MiB, size mismatch) from a post-transform "
+                    f"source at {self._mx_server_url}. Falling back to a full disk load to avoid "
+                    f"mixing transformed P2P tensors with raw fallback tensors before the full "
+                    f"post-load transform path."
                 )
                 return self._fallback_to_disk(
                     checkpoint_dir,
@@ -560,23 +558,17 @@ class MXCheckpointLoader(HfCheckpointLoader):
             # the standard disk path to apply. Keep the P2P transfer and
             # let ModelLoader merge these fallback tensors.
             logger.warning(
-                "MX P2P returned %d fallback weights (%.2f MiB, size mismatch) "
-                "from %s. Merging fallback weights through the disk pipeline; "
-                "if this warning persists for this model, disable MX for it to "
-                "avoid paying both P2P and disk-loading costs.",
-                len(fallback_weights),
-                fallback_bytes / (1 << 20),
-                self._mx_server_url,
+                f"MX P2P returned {len(fallback_weights)} fallback weights ("
+                f"{fallback_bytes / (1 << 20):.2f} MiB, size mismatch) from {self._mx_server_url}. "
+                f"Merging fallback weights through the disk pipeline; if this warning persists for "
+                f"this model, disable MX for it to avoid paying both P2P and disk-loading costs."
             )
             self._p2p_succeeded = True
             self._post_transform_weights_preloaded = False
             return fallback_weights
 
         self._p2p_succeeded = True
-        logger.info(
-            "MX P2P weight transfer succeeded from %s",
-            self._mx_server_url,
-        )
+        logger.info(f"MX P2P weight transfer succeeded from {self._mx_server_url}")
         return {}
 
     def _resolve_query_timeout_override(
@@ -822,9 +814,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 ):
                     publish_model_params(model, **metadata_kwargs)
                 logger.info(
-                    "Published post-transform weights to MX server at %s as model=%r",
-                    self._mx_server_url,
-                    resolved_name,
+                    f"Published post-transform weights to MX server at {self._mx_server_url} as "
+                    f"model={resolved_name!r}"
                 )
         except Exception:
             # Deliberately broad: publish is best-effort. A publish failure

@@ -2,7 +2,7 @@
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
@@ -86,15 +86,20 @@ class BaseToolParser(ABC):
         policy for unmatched names -- only a statement that no recovery was
         possible.
 
-        Two shapes are recovered, both observed in production traces:
+        Three shapes are recovered, all observed in production traces:
 
         * A group qualifier: models prompted with nested tool groups emit
           ``functions.exec_command`` for a tool declared as ``exec_command``.
+        * The same mismatch the other way round, which is the common one for
+          a Codex-style client: the tools arrive inside a ``namespace`` and are
+          declared ``functions.exec``, while the model writes ``exec``.
+          Measured over one GLM-5.3 fleet, 3102 of 3730 calls used the bare
+          spelling. Only an unambiguous tail is accepted.
         * Stray markup fused onto the name: ``apply_patch</arg_value>`` and
           ``<tool_call>exec_command`` both come from the model emitting an
           unbalanced tag, which shifts where the name regex starts or stops.
 
-        Both leave the arguments intact, so recovering the name turns a call
+        All leave the arguments intact, so recovering the name turns a call
         the client would have rejected back into the one the model meant.
 
         What is deliberately *not* recovered is a name that only *contains* a
@@ -108,15 +113,33 @@ class BaseToolParser(ABC):
             return None
         if name in tool_indices:
             return name
+
+        # Declared tools indexed by their bare tail, so that a model writing
+        # `exec` against a declared `functions.exec` can be matched. Only an
+        # unambiguous tail qualifies: two namespaces may declare the same tool
+        # name, and mis-routing a call is worse than not recovering it.
+        # responses_utils._tool_resolution applies the same rule one layer up.
+        by_tail: Dict[str, List[str]] = {}
+        for declared in tool_indices:
+            by_tail.setdefault(declared.rsplit(".", 1)[-1], []).append(declared)
+
         # The raw name first, then the same name with balanced markup removed.
         # Anything still holding a space, quote or bracket after that is prose
         # or source code, not a mangled identifier, and _QUALIFIED_NAME drops it.
         for candidate in (name, _MARKUP_TAG.sub("", name).strip()):
             if not _QUALIFIED_NAME.match(candidate):
                 continue
+            # The whole candidate before its tail: stripping the markup off
+            # `functions.exec </arg_value>` leaves a name that is declared
+            # verbatim, and testing only the tail used to miss it.
+            if candidate in tool_indices:
+                return candidate
             tail = candidate.rsplit(".", 1)[-1]
             if tail in tool_indices:
                 return tail
+            qualified = by_tail.get(tail)
+            if qualified is not None and len(qualified) == 1:
+                return qualified[0]
         return None
 
     def parse_base_json(self, action: Any,
@@ -389,6 +412,24 @@ class BaseToolParser(ABC):
         Check if the given text contains function call markers specific to this format.
         """
         raise NotImplementedError()
+
+    # The markup this format writes around and inside its calls. A delivered
+    # call whose arguments still contain any of it was not cleanly separated
+    # from the format; the request trace flags such calls.
+    markup_tokens: Tuple[str, ...] = ()
+
+    @property
+    def single_call_stop(self) -> Optional[str]:
+        """Text that completes exactly one tool call, if generation may end there.
+
+        Serving honours ``parallel_tool_calls=false`` by stopping generation
+        on this text and keeping it in the output, so a response carries at
+        most one call and its output stays an exact prefix of what the model
+        generated. None when the format has no such text, or when stopping on
+        it would leave an enclosing block unclosed; such formats keep
+        emitting every call the model writes.
+        """
+        return None
 
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""

@@ -21,7 +21,7 @@ import signal
 import socket
 import traceback
 from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from typing import Any, AsyncGenerator, Callable, List, Optional
 
 import aiohttp
 import uvicorn
@@ -32,6 +32,8 @@ from pydantic import ValidationError
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
@@ -55,18 +57,20 @@ from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    ResponsesRequest, UCompletionRequest, UCompletionResponse,
+    ErrorResponse, ResponsesRequest, UCompletionRequest, UCompletionResponse,
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
+from tensorrt_llm.serve.request_trace import (RequestTraceHandle,
+                                              RequestTraceWriter,
                                               request_trace_dir_from_env)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+from tensorrt_llm.serve.responses_utils import (RelayedResponseSnapshot,
+                                                ServerArrivalTimeMiddleware,
+                                                context_length_exceeded_stream,
                                                 get_steady_clock_now_in_seconds,
-                                                guard_responses_stream,
-                                                stream_error_event)
+                                                guard_responses_stream)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -75,6 +79,15 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+
+# nginx's "client closed request": what a request whose client hung up before
+# the response is answered with.
+_CLIENT_CLOSED_REQUEST = 499
+
+
+def _error_type(status_code: int) -> str:
+    """The error ``type`` the OpenAI and Anthropic shapes share for a status."""
+    return "invalid_request_error" if 400 <= status_code < 500 else "api_error"
 
 
 class RawRequestResponseHooks(ResponseHooks):
@@ -197,6 +210,22 @@ def _set_disagg_ids(hooks: "RawRequestResponseHooks") -> None:
     handle = getattr(hooks.raw_req.state, "request_trace_handle", None)
     if handle is not None:
         handle.set_ids(disagg_request_id=hooks.disagg_request_id)
+
+
+async def _iterate(frames: List[bytes]) -> AsyncGenerator[bytes, None]:
+    """Serve frames already built in full as a response body."""
+    for frame in frames:
+        yield frame
+
+
+class _DownstreamClientDisconnected(Exception):
+    """The downstream client hung up while its request was still being served.
+
+    Internal control flow only: raised by the disconnect watch so "client gone"
+    becomes a normal, fully finalized exit of the request pipeline instead of a
+    response nobody reads -- and, before this existed, instead of a 650K-token
+    prefill grinding on a context worker for a client that left minutes ago.
+    """
 
 
 class OpenAIDisaggServer:
@@ -400,6 +429,115 @@ class OpenAIDisaggServer:
         """
         resolve_request_conversation_id(req, raw_req.headers)
 
+    async def _watch_client_disconnect(self, raw_req: Request,
+                                       stop: asyncio.Event) -> None:
+        """Return when the downstream client is gone, or once ``stop`` is set.
+
+        Nothing in the pinned stack asks the transport on our behalf: FastAPI's
+        request_response runs the handler to completion whatever the socket
+        does, and uvicorn merely flags cycle.disconnected for whoever polls.
+        The aggregated server polls per engine promise
+        (openai_server.await_disconnected, same 1 Hz cadence); this proxy holds
+        no promise, so the poll lives here and its completion means "abort the
+        pipeline".
+
+        ``stop`` is checked after every poll because cancelling this task is
+        not enough on its own. Starlette's is_disconnected() reads receive()
+        inside an anyio cancel scope that it cancels itself; a Task.cancel()
+        that lands while that scope's cancellation is in flight is merged into
+        it, and the scope swallows the one resulting CancelledError as its
+        own. A pipeline that settles within a poll -- a rejection raised before
+        any upstream I/O does, every time -- hit exactly that window, and the
+        handler reaping this watch then sat on its answer until the client gave
+        up and disconnected.
+        """
+        while not await raw_req.is_disconnected():
+            if stop.is_set():
+                return
+            await asyncio.sleep(1)
+
+    async def _serve_until_client_disconnect(
+            self, entry_point: Callable, req: UCompletionRequest,
+            hooks: ResponseHooks, raw_req: Request):
+        """Run the entry point, aborting the whole pipeline if the client leaves.
+
+        The pre-response window is the orchestrator's blind spot: a
+        context-first disagg request spends its entire prefill -- minutes, for
+        a cold 100-700K-token conversation -- inside `await entry_point(...)`,
+        blocked on the context worker's non-streaming POST, and a client that
+        times out and hangs up during it used to change nothing. Once a
+        streaming response is returned, StreamingResponse's own
+        listen_for_disconnect owns the job; that is why the watch is scoped to
+        this call and cancelled on the way out instead of polling receive()
+        concurrently with it.
+
+        Cancelling entry_task is what actually aborts the upstream work: the
+        cancellation lands in the in-flight ctx/gen POST, aiohttp's
+        BaseException cleanup closes that connection (it is never returned to
+        the pool), the worker sees its client vanish, and the worker's own
+        await_disconnected poller aborts the engine request. The pipeline's
+        finalizers -- router load counts, routing entries, client metrics --
+        run under this single plain-asyncio cancel, so they complete; the
+        settlement is awaited before the disconnect is reported.
+        """
+        entry_task = asyncio.create_task(entry_point(req, hooks))
+        stop_watch = asyncio.Event()
+        watch_task = asyncio.create_task(
+            self._watch_client_disconnect(raw_req, stop_watch))
+        try:
+            done, _ = await asyncio.wait({entry_task, watch_task},
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if entry_task in done:
+                # Covers the race where the client vanished in the same tick:
+                # the response already exists, so hand it back -- uvicorn
+                # discards the send, and a streaming body is torn down by
+                # StreamingResponse's own disconnect handling.
+                return entry_task.result()
+            if watch_task.exception() is not None:
+                # The watch itself broke, which says nothing about the client.
+                # Degrading to the old serve-to-completion behavior beats
+                # cancelling a healthy request over a watcher bug.
+                logger.error(
+                    f"Disconnect watch failed; serving to completion: "
+                    f"{watch_task.exception()!r}")
+                return await entry_task
+            entry_task.cancel()
+            # Wait for the pipeline to settle before answering: its finalizers
+            # close the upstream sockets (the abort signal the workers act on)
+            # and release the router bookkeeping. Bounded: a cancelled aiohttp
+            # await raises immediately and the routers' finish paths carry
+            # their own timeouts.
+            await asyncio.wait({entry_task})
+            if entry_task.cancelled():
+                raise _DownstreamClientDisconnected()
+            # The cancel arrived after the pipeline finished on its own; fall
+            # through to the result -- or to its genuine error -- exactly as if
+            # the race had gone the other way.
+            return entry_task.result()
+        except asyncio.CancelledError:
+            # This handler itself is being cancelled (shutdown): take the
+            # pipeline down with it and let the cancellation keep unwinding.
+            entry_task.cancel()
+            raise
+        finally:
+            # Both signals: the cancel ends a watch that is sleeping between
+            # polls at once, and the stop flag ends one whose cancel Starlette
+            # swallowed mid-poll (see _watch_client_disconnect).
+            stop_watch.set()
+            watch_task.cancel()
+            # Reap the watcher so a failure in it is consumed here rather than
+            # logged at GC as "Task exception was never retrieved".
+            try:
+                await watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            # A failed pipeline is re-raised from this frame, so the error's
+            # traceback holds the frame. If the frame still held the entry
+            # task (directly or in asyncio.wait's sets), the task's stored
+            # error would close a frame -> task -> error -> traceback -> frame
+            # cycle that only the cyclic GC frees, with the request attached.
+            entry_task = watch_task = done = _ = None
+
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
         # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
@@ -408,6 +546,9 @@ class OpenAIDisaggServer:
         @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
             trace_handle = await self._request_trace.on_request(raw_req)
+            # Unset until the request is past its local checks; the failure
+            # exits below stamp the trace with its ids only once it exists.
+            hooks: Optional[RawRequestResponseHooks] = None
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:
@@ -423,7 +564,12 @@ class OpenAIDisaggServer:
                 hooks = RawRequestResponseHooks(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
-                response_or_generator = await entry_point(req, hooks)
+                # Raced against the client's own departure: with a context-first
+                # disagg request this await holds the entire prefill, and a
+                # client that hangs up during it must take the context-side
+                # engine request down with it (see _serve_until_client_disconnect).
+                response_or_generator = await self._serve_until_client_disconnect(
+                    entry_point, req, hooks, raw_req)
                 self._perf_metrics_collector.total_responses.inc()
                 _set_disagg_ids(hooks)
                 if req.stream:
@@ -436,16 +582,19 @@ class OpenAIDisaggServer:
                         # their content entirely in deltas and end on a
                         # sentinel, so a truncation there is already visible.
                         #
-                        # A bare `error` event rather than the worker's
-                        # `response.failed`: this is a byte relay with no view
-                        # of the response being assembled. It does count the
-                        # events it forwarded, so the sequence number is exact
-                        # -- and it is zero for the failures that never
-                        # reached a worker at all, which today produce a
-                        # recorded response with an entirely empty body.
+                        # The relay never assembles the response, but the
+                        # worker's opening `response.created` carries the
+                        # whole snapshot, which is all `response.failed`
+                        # needs. A cut stream therefore ends as the worker
+                        # ends one of its own: `error`, then
+                        # `response.failed`. Failures that never reached a
+                        # worker have no snapshot and end on the bare
+                        # `error`. Either way the events forwarded are
+                        # counted, so the sequence numbers are exact.
+                        snapshot = RelayedResponseSnapshot()
                         stream = guard_responses_stream(
-                            stream,
-                            stream_error_event,
+                            snapshot.observe(stream),
+                            snapshot.failed_events,
                             on_termination=functools.partial(
                                 self._request_trace.note_stream_termination,
                                 trace_handle),
@@ -454,33 +603,188 @@ class OpenAIDisaggServer:
                         content=self._request_trace.wrap_stream(
                             stream, trace_handle),
                         media_type="text/event-stream")
-                payload = response_or_generator.model_dump()
+                # by_alias: the wire name, not the python one -- `schema` for
+                # a json_schema text format, which pydantic only lets a model
+                # hold as `schema_`. The worker sent `schema`; re-serialising
+                # under the internal name handed the client a field the API
+                # does not have, and recorded the same wrong body.
+                payload = response_or_generator.model_dump(by_alias=True)
                 self._request_trace.on_response(trace_handle, payload=payload)
                 return JSONResponse(content=payload)
+            except _DownstreamClientDisconnected:
+                # A finalized abort, not an error: the pipeline was cancelled,
+                # its settlement awaited, and there is nobody left to answer.
+                # The trace terminal reuses the vocabulary wrap_stream already
+                # records for mid-stream hangups, so a pre-response hangup is
+                # searchable under the same status.
+                _set_disagg_ids(hooks)
+                self._request_trace.on_response(
+                    trace_handle, payload=None, status="client_disconnected")
+                logger.info(
+                    f"{raw_req.client} disconnected before the response; "
+                    f"aborted disagg request {hooks.disagg_request_id}")
+                # 499 is nginx's "client closed request". Nothing reaches the
+                # wire -- uvicorn discards sends once the client is gone -- but
+                # middleware and access logs see an honest status instead of a
+                # fabricated success or a 500.
+                return Response(status_code=_CLIENT_CLOSED_REQUEST)
+            except asyncio.CancelledError:
+                # The handler itself is being cancelled -- shutdown; a client
+                # hangup arrives above as _DownstreamClientDisconnected. Closed
+                # in the trace so the request does not read as still in
+                # flight, and the cancellation keeps unwinding.
+                if hooks is not None:
+                    _set_disagg_ids(hooks)
+                self._trace_cancelled(trace_handle)
+                raise
             except Exception as e:
-                self._handle_exception(e)
+                # The ids join this record to the workers' logs of the
+                # attempt; on /v1/messages they land on the adapter's handle.
+                if hooks is not None:
+                    _set_disagg_ids(hooks)
+                try:
+                    # Usually raises; returns a Response for worker errors that
+                    # carry a machine-readable code (context_length_exceeded).
+                    error_response = self._handle_exception(e)
+                except HTTPException as http_error:
+                    # Every failure the client is answered for leaves here: a
+                    # worker's 4xx/5xx, an internal error, the chat-template
+                    # rejection above. FastAPI answers an HTTPException with
+                    # {"detail": ...}; that body is what the trace keeps.
+                    self._trace_failure(trace_handle, http_error.status_code,
+                                        {"detail": http_error.detail})
+                    raise
+                if error_response is not None:
+                    error_body = json.loads(error_response.body)
+                    message = str(error_body.get("message", ""))
+                    if (isinstance(req, ResponsesRequest) and req.stream
+                            and error_body.get("code")
+                            == CONTEXT_LENGTH_EXCEEDED_CODE):
+                        # A streamed Responses request is failed in-stream, as
+                        # OpenAI fails one: the client acts on the terminal
+                        # event's code, where a 400 reads as an invalid request
+                        # (see context_length_exceeded_stream).
+                        return StreamingResponse(
+                            content=self._request_trace.wrap_stream(
+                                _iterate(
+                                    context_length_exceeded_stream(
+                                        req, message)), trace_handle),
+                            media_type="text/event-stream")
+                    # The worker's error envelope, relayed with its code, is
+                    # the body the client reads.
+                    self._trace_failure(trace_handle,
+                                        error_response.status_code, error_body)
+                    return error_response
+                # Reached only for CppExecutorError, after SIGINT was raised to
+                # take the server down. Nothing is returned, which FastAPI
+                # answers with a 200 and a JSON null.
+                self._request_trace.note_stream_termination(
+                    trace_handle, "internal_error", f"{type(e).__name__}: {e}")
+                self._request_trace.on_response(trace_handle,
+                                                payload=None,
+                                                status="error",
+                                                http_status=200)
         return wrapper
+
+    def _trace_failure(self,
+                       trace_handle: Optional[RequestTraceHandle],
+                       status_code: int,
+                       body: Any,
+                       *,
+                       cause: Optional[str] = None,
+                       detail: str = "") -> None:
+        """Close the trace of a request answered with an error.
+
+        ``body`` is exactly what the client receives -- FastAPI's
+        ``{"detail": ...}`` for an HTTPException, an error envelope a route
+        builds itself, the framework's plain-text 500 -- and ``status_code``
+        is its HTTP status, recorded as ``http_status`` so a worker's 503 stays
+        distinguishable from a 500 raised here. ``status`` uses the aggregated
+        server's vocabulary: ``rejected_<code>`` below 500, ``error`` from 500
+        up. ``cause`` and ``detail`` record what the body does not say, such as
+        the exception behind a bare 500. on_response is exactly-once per
+        handle, so a later record for the same request is a no-op.
+        """
+        if cause is not None:
+            self._request_trace.note_stream_termination(
+                trace_handle, cause, detail)
+        self._request_trace.on_response(
+            trace_handle,
+            payload=body,
+            status=(f"rejected_{status_code}"
+                    if status_code < 500 else "error"),
+            http_status=status_code,
+        )
+
+    def _trace_cancelled(self,
+                         trace_handle: Optional[RequestTraceHandle]) -> None:
+        """Close the trace of a handler cancelled before it answered."""
+        self._request_trace.on_response(
+            trace_handle,
+            payload={
+                "error": {
+                    "type": "cancelled",
+                    "message": "request handler cancelled before a response "
+                    "was sent",
+                }
+            },
+            status="cancelled",
+        )
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
-        """Serve Anthropic Messages through the disaggregated chat pipeline."""
+        """Serve Anthropic Messages through the disaggregated chat pipeline.
+
+        Owns the request's trace. The wrapped chat entry point is handed no
+        handle on this route, so every exit has to be closed on this side: the
+        deliberate answers in _serve_anthropic_messages, and here the exits
+        that raise -- a shutdown cancel, or a failure nobody anticipated, which
+        FastAPI answers with a bare 500.
+        """
         # Before the conversion, and before the wrapped chat entry point hooks
         # the same request again and is handed None for it.
         trace_handle = await self._request_trace.on_request(raw_request)
         try:
+            return await self._serve_anthropic_messages(request, raw_request,
+                                                        trace_handle)
+        except asyncio.CancelledError:
+            self._trace_cancelled(trace_handle)
+            raise
+        except Exception as e:
+            # Unanticipated, so FastAPI's error middleware answers it with its
+            # plain-text 500.
+            self._trace_failure(trace_handle,
+                                500,
+                                "Internal Server Error",
+                                cause="internal_error",
+                                detail=f"{type(e).__name__}: {e}")
+            raise
+
+    async def _serve_anthropic_messages(
+            self, request: AnthropicMessagesRequest, raw_request: Request,
+            trace_handle: Optional[RequestTraceHandle]) -> Response:
+        """The adapter itself; every answer it returns closes the trace."""
+
+        def _reject(message: str, status_code: int) -> Response:
+            # Every deliberate error answer settles the trace on its way out,
+            # with the body the client reads.
+            response = anthropic_error_response(message,
+                                                _error_type(status_code),
+                                                status_code)
+            self._trace_failure(trace_handle, status_code,
+                                json.loads(response.body))
+            return response
+
+        try:
             chat_request = convert_anthropic_request(request)
         except (AnthropicRequestError, ValidationError) as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
+            return _reject(str(e), 400)
 
         try:
             openai_response = await self._wrap_entry_point(
                 self._service.openai_chat_completion)(chat_request, raw_request)
         except HTTPException as e:
-            error_type = ("invalid_request_error"
-                          if 400 <= e.status_code < 500 else "api_error")
-            return anthropic_error_response(str(e.detail), error_type,
-                                            e.status_code)
+            return _reject(str(e.detail), e.status_code)
 
         if isinstance(openai_response, StreamingResponse):
             return StreamingResponse(
@@ -491,6 +795,15 @@ class OpenAIDisaggServer:
             )
 
         status = getattr(openai_response, "status_code", 500)
+        if status == _CLIENT_CLOSED_REQUEST:
+            # The wrapped entry point's pre-response hangup. It recorded
+            # nothing, holding no handle here, so the hangup is recorded under
+            # the status the OpenAI routes give it. Nobody is left to read an
+            # error envelope; the bare 499 goes back as it came.
+            self._request_trace.on_response(trace_handle,
+                                            payload=None,
+                                            status="client_disconnected")
+            return openai_response
         if status != 200:
             try:
                 payload = json.loads(openai_response.body)
@@ -498,9 +811,7 @@ class OpenAIDisaggServer:
                            or payload.get("error") or json.dumps(payload))
             except (json.JSONDecodeError, AttributeError, TypeError):
                 message = "Internal server error"
-            error_type = ("invalid_request_error"
-                          if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(str(message), error_type, status)
+            return _reject(str(message), status)
 
         try:
             chat_response = ChatCompletionResponse(
@@ -594,9 +905,23 @@ class OpenAIDisaggServer:
             # caller, so it goes through the same unwrapping the Anthropic
             # route uses. This branch is shared with /v1/completions and
             # /v1/chat/completions, so those get the same treatment.
-            raise HTTPException(
-                status_code=status,
-                detail=_upstream_error_message(exception)) from exception
+            message = _upstream_error_message(exception)
+            if is_context_length_exceeded_message(message):
+                # The worker tagged this rejection with the machine-readable
+                # code "context_length_exceeded" (openai_server.py,
+                # create_error_response). HTTPException would flatten it to
+                # {"detail": message}, dropping the code, so re-emit the
+                # worker's error envelope. Detection is by message text, the
+                # same way the worker itself detects it: only the string is
+                # guaranteed to survive the hops.
+                return JSONResponse(status_code=status,
+                                    content=ErrorResponse(
+                                        message=message,
+                                        type="BadRequestError",
+                                        code=CONTEXT_LENGTH_EXCEEDED_CODE,
+                                    ).model_dump())
+            raise HTTPException(status_code=status,
+                                detail=message) from exception
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())

@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import contextlib
+import ctypes
 import gc
 import importlib
 import inspect
@@ -1893,6 +1894,7 @@ def disaggregated(
     """Running server in disaggregated mode"""
 
     logger.set_level(log_level)
+    _bound_malloc_mmap_threshold()
     set_prometheus_multiproc_dir()
 
     if metrics_log_interval != 0:
@@ -2208,6 +2210,56 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                 process.terminate()
 
 
+# mallopt's M_MMAP_THRESHOLD, from glibc's <malloc.h>.
+_M_MMAP_THRESHOLD = -3
+# glibc ignores thresholds above HEAP_MAX_SIZE / 2 on 64-bit hosts.
+_MAX_MMAP_THRESHOLD = 32 * 1024 * 1024
+
+
+def _bound_malloc_mmap_threshold() -> None:
+    """Keep a disaggregated frontend's request-sized blocks out of the heap.
+
+    glibc raises its mmap threshold to the size of the largest block freed,
+    up to 32 MiB. A frontend that parses multi-megabyte request bodies soon
+    has every one of them carved from the heap, and the heap does not shrink
+    back: RSS climbs about 1 MiB per request with nothing live behind it
+    (10-09, a replay of production Responses traffic: glibc in use flat at
+    300 MiB while its heap grew 613 -> 1741 MiB in 1,000 requests). A fixed
+    threshold keeps those blocks in mmap, returned to the kernel on free.
+
+    TRTLLM_FRONTEND_MALLOC_MMAP_THRESHOLD sets it in bytes (default 131072,
+    glibc's own starting value); 0 keeps glibc's dynamic threshold. A process
+    must call this itself: the setting does not survive exec.
+    """
+    raw = os.getenv("TRTLLM_FRONTEND_MALLOC_MMAP_THRESHOLD", "131072")
+    try:
+        threshold = int(raw)
+    except ValueError:
+        logger.warning(
+            f"Ignoring TRTLLM_FRONTEND_MALLOC_MMAP_THRESHOLD={raw!r}: not a byte count"
+        )
+        return
+    if threshold <= 0:
+        return
+    if threshold > _MAX_MMAP_THRESHOLD:
+        logger.warning(
+            f"Ignoring TRTLLM_FRONTEND_MALLOC_MMAP_THRESHOLD={threshold}: "
+            f"glibc accepts at most {_MAX_MMAP_THRESHOLD}")
+        return
+    try:
+        mallopt = ctypes.CDLL("libc.so.6").mallopt
+    except (OSError, AttributeError):
+        return  # not glibc: its allocator has no such threshold
+    mallopt.argtypes = [ctypes.c_int, ctypes.c_int]
+    mallopt.restype = ctypes.c_int
+    if mallopt(_M_MMAP_THRESHOLD, threshold) != 1:
+        logger.warning(f"mallopt(M_MMAP_THRESHOLD, {threshold}) failed; "
+                       f"keeping glibc's dynamic threshold")
+        return
+    logger.info(f"glibc mmap threshold pinned at {threshold} bytes "
+                f"(pid {os.getpid()})")
+
+
 def _init_fleet_worker_process():
     """Per-process setup shared by every fleet worker (one OS process each).
 
@@ -2220,6 +2272,7 @@ def _init_fleet_worker_process():
     os.environ.pop("WEB_CONCURRENCY", None)
     if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
         gc.disable()
+    _bound_malloc_mmap_threshold()
 
     # This is a fresh Python process, so the TRT-LLM logger defaults to WARNING
     # and would drop the workers' INFO logs (per-request [ttft_split] /

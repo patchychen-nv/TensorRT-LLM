@@ -566,11 +566,8 @@ class BasePipeline(nn.Module):
                 mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
                 if mode not in coeff_data:
                     logger.warning(
-                        "TeaCache: matched variant %r but table has no %r entry "
-                        "(available keys: %s). Trying other variants.",
-                        model_size,
-                        mode,
-                        list(coeff_data.keys()),
+                        f"TeaCache: matched variant {model_size!r} but table has no {mode!r} entry "
+                        f"(available keys: {list(coeff_data.keys())}). Trying other variants."
                     )
                     continue
                 teacache_cfg.coefficients = coeff_data[mode]
@@ -1348,7 +1345,7 @@ class BasePipeline(nn.Module):
                                 f"({stats['cached']}/{stats['total']} steps)"
                             )
                     else:
-                        logger.info("Cache acceleration stats: %s", stats)
+                        logger.info(f"Cache acceleration stats: {stats}")
 
         return (latents, extra_stream_latents) if has_extra_streams else latents
 

@@ -43,7 +43,7 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
     ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent)
-from openai.types.responses.response import ToolChoice
+from openai.types.responses.response import IncompleteDetails, ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
@@ -275,7 +275,9 @@ class ErrorResponse(OpenAIBaseModel):
     message: str
     type: str
     param: Optional[str] = None
-    code: int
+    # HTTP status by default; a machine-readable string for conditions that
+    # define one (e.g. "context_length_exceeded", matching OpenAI).
+    code: Union[int, str]
 
 
 class CompletionLogProbs(OpenAIBaseModel):
@@ -1459,11 +1461,56 @@ class ResponsesRequest(OpenAIBaseModel):
                 return {**part, "annotations": []}
             return part
 
+        def _degrade_image(part):
+            """Replace an image content part with a text placeholder.
+
+            The Codex CLI attaches screenshots as ``input_image`` parts -- an
+            agent that plots something and views it sends the PNG back as
+            base64. The models served here are text-only, and the vendored
+            input union has no image member, so validation fell through to
+            ``ResponseInputTextParam`` and failed the WHOLE request with
+            "Field required: text" -- with the full base64 body echoed into
+            the error. The client retries a deterministic 400 until its
+            backoff limit and the campaign dies: 2 of the first 182
+            Kernel-Trace campaigns went exactly this way (2026-09-22).
+
+            A placeholder keeps the turn -- and with it the session -- alive,
+            and says what was dropped instead of leaking megabytes of base64.
+            """
+            if isinstance(part, dict) and part.get("type") == "input_image":
+                url = part.get("image_url") or ""
+                kind = url.split(";", 1)[0].removeprefix("data:") or "image"
+                return {
+                    "type":
+                    "input_text",
+                    "text":
+                    "[image omitted: %s, %d bytes as sent; this "
+                    "model accepts text only]" % (kind, len(url)),
+                }
+            return part
+
         cleaned = []
         for item in value:
             # A client may send a bare content part as a top-level item, not
             # only nested inside a message.
-            item = _with_annotations(item)
+            item = _with_annotations(_degrade_image(item))
+            if isinstance(item, dict) and isinstance(item.get("content"), list):
+                item = {
+                    **item,
+                    "content":
+                    [_degrade_image(part) for part in item["content"]],
+                }
+            # Tool results carry their parts under "output", not "content"
+            # (custom_tool_call_output / function_call_output). An agent that
+            # plots something gets the PNG back through the tool and Codex
+            # ships it as an input_image part in there -- 114 Kernel-Trace
+            # campaigns died on exactly this shape (2026-09-23) after the
+            # content/top-level shapes were already handled.
+            if isinstance(item, dict) and isinstance(item.get("output"), list):
+                item = {
+                    **item,
+                    "output": [_degrade_image(part) for part in item["output"]],
+                }
             if isinstance(item, dict) and item.get("type") in (None, "message"):
                 role = item.get("role")
                 if "id" in item and role in _ID_STRIPPED_ROLES:
@@ -1517,7 +1564,9 @@ class ResponsesRequest(OpenAIBaseModel):
     max_tool_calls: Optional[int] = None
     metadata: Optional[Metadata] = None
     model: str
-    parallel_tool_calls: Optional[bool] = False
+    # OpenAI's default. False ends generation after the first tool call; see
+    # responses_utils.first_tool_call_stop.
+    parallel_tool_calls: Optional[bool] = True
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
     reasoning: Optional[Reasoning] = None
@@ -1594,11 +1643,20 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
                 self.text.format, reasoning_parser=reasoning_parser)
 
+        # Logprobs are only returned when `include` names
+        # message.output_text.logprobs, so top_logprobs alone (0 when omitted)
+        # must not request them: SamplingParams computes logprobs for any
+        # non-None value, and one-model speculative decoding rejects every
+        # request that asks for them.
+        logprobs = None
+        if "message.output_text.logprobs" in (self.include or ()):
+            logprobs = self.top_logprobs
+
         sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            logprobs=self.top_logprobs,
+            logprobs=logprobs,
             stop_token_ids=stop_token_ids,
             guided_decoding=guided_decoding,
             thinking_token_budget=self.thinking_token_budget,
@@ -1631,7 +1689,8 @@ class ResponsesRequest(OpenAIBaseModel):
         hoisted = []
         kept = []
         for item in items:
-            if isinstance(item, dict) and item.get("type") == "additional_tools":
+            if isinstance(item,
+                          dict) and item.get("type") == "additional_tools":
                 hoisted.extend(item.get("tools") or [])
             else:
                 kept.append(item)
@@ -1707,11 +1766,31 @@ StreamingResponsesResponse: TypeAlias = Union[
 ]
 
 
+def _null_as_request_default(value: Any, field_name: str) -> Any:
+    """Return ``value``, or ``ResponsesRequest``'s default for it if None.
+
+    Several request fields accept an explicit JSON ``null`` while the
+    response fields they are echoed into require a value. A null means "not
+    specified", the same as leaving the field out, so it echoes what an
+    omitted field would. Copied through as None it failed response
+    validation - after the whole generation had run, or, in a stream, on the
+    opening snapshot, which ended the stream before its first event.
+    """
+    if value is not None:
+        return value
+    return ResponsesRequest.model_fields[field_name].get_default(
+        call_default_factory=True)
+
+
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # error: Optional[ResponseError] = None
-    # incomplete_details: Optional[IncompleteDetails] = None
+    # The SDK's own shape: reason is an enum naming why the response stopped
+    # short. Set by the response builder when a generation was cut at its
+    # token budget, so the non-streaming JSON body explains its "incomplete"
+    # status the way the streaming terminal event already does.
+    incomplete_details: Optional[IncompleteDetails] = None
     instructions: Optional[str] = None
     metadata: Optional[Metadata] = None
     model: str
@@ -1768,12 +1847,14 @@ class ResponsesResponse(OpenAIBaseModel):
             metadata=request.metadata,
             model=model_name,
             output=output,
-            parallel_tool_calls=request.parallel_tool_calls,
+            parallel_tool_calls=_null_as_request_default(
+                request.parallel_tool_calls, "parallel_tool_calls"),
             temperature=sampling_params.temperature,
             tool_choice=request.tool_choice,
             tools=request.tools,
             top_p=sampling_params.top_p,
-            background=request.background,
+            background=_null_as_request_default(request.background,
+                                                "background"),
             max_output_tokens=sampling_params.max_tokens,
             max_tool_calls=request.max_tool_calls,
             previous_response_id=request.previous_response_id,
@@ -1782,8 +1863,12 @@ class ResponsesResponse(OpenAIBaseModel):
             service_tier=request.service_tier,
             status=status,
             text=request.text,
-            top_logprobs=sampling_params.logprobs,
-            truncation=request.truncation,
+            # Echoed from the request: the sampling params carry no logprobs
+            # unless `include` asked for them.
+            top_logprobs=_null_as_request_default(request.top_logprobs,
+                                                  "top_logprobs"),
+            truncation=_null_as_request_default(request.truncation,
+                                                "truncation"),
             user=request.user,
             usage=usage,
         )

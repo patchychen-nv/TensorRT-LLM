@@ -2002,7 +2002,7 @@ class Receiver(ReceiverBase):
 
     def _request_sender_data(self, endpoint: str, receiver_info_bytes: bytes):
         # receiver_info serialized once and reused for every peer rank (block-table msgpack isn't free at fan-out).
-        logger.debug("Sending data request to endpoint '%s'", endpoint)
+        logger.debug(f"Sending data request to endpoint '{endpoint}'")
         messenger = self._get_or_connect_dealer(endpoint)
         messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes])
 

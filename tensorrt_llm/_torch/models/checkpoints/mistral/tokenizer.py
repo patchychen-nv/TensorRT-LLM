@@ -150,7 +150,7 @@ class MistralTokenizer(TransformersTokenizer):
             t_str = t_bytes.decode("utf-8")
             if t_str in tokenizer._special_tokens_reverse_vocab:
                 return tokenizer._special_tokens_reverse_vocab[t_str]
-            logger.warning("Failed to convert token %s to id, replacing with <unk>", t_bytes)
+            logger.warning(f"Failed to convert token {t_bytes} to id, replacing with <unk>")
             return tokenizer.unk_id
 
     def _is_special_token_id(self, token_id: int) -> bool:

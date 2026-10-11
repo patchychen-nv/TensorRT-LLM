@@ -538,7 +538,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         don't participate in the forward pass token budget.
         """
         if not self.kv_cache_manager.prepare_disagg_gen_init(req):
-            logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
+            logger.debug(f"prepare_disagg_gen_init failed for request {req.py_request_id}")
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
 
@@ -852,19 +852,11 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if down_block_start <= lo:
             logger.warning(
-                "req %s: MM block at chunk left edge "
-                "(lo=%s, block=[%s, %s)); snap-up does not fit "
-                "(up_size=%s, budget=%s, max_ctx=%s, ctx_rem=%s) and "
-                "snap-down would zero the chunk. Deferring request to next "
-                "iteration to preserve bidirectional MM attention.",
-                req.py_request_id,
-                lo,
-                block_start_abs,
-                block_end_abs,
-                up_chunk_size,
-                remaining_budget,
-                self.max_context_length,
-                context_remaining,
+                f"req {req.py_request_id}: MM block at chunk left edge (lo={lo}, block=["
+                f"{block_start_abs}, {block_end_abs})); snap-up does not fit (up_size="
+                f"{up_chunk_size}, budget={remaining_budget}, max_ctx={self.max_context_length}, "
+                f"ctx_rem={context_remaining}) and snap-down would zero the chunk. Deferring "
+                f"request to next iteration to preserve bidirectional MM attention."
             )
             return 0
 
@@ -897,9 +889,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if self.cross_kv_cache_manager is None:
             logger.warning(
-                "Decoder context request %s requires cross-KV cache but "
-                "no cross_kv_cache_manager is configured. Skipping.",
-                req.py_request_id,
+                f"Decoder context request {req.py_request_id} requires cross-KV cache but no "
+                f"cross_kv_cache_manager is configured. Skipping."
             )
             return ScheduleAction.STOP
 
@@ -917,8 +908,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if not self.cross_kv_cache_manager.prepare_context(req):
             logger.debug(
-                "cross prepare_context failed for decoder context request %s",
-                req.py_request_id,
+                f"cross prepare_context failed for decoder context request {req.py_request_id}"
             )
             return ScheduleAction.SKIP
         if not self.cross_kv_cache_manager.resize_context(req, req_tokens):
@@ -934,8 +924,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         if kv_cache is None:
             if not req.is_first_context_chunk:
                 logger.debug(
-                    "cross KV cache missing for non-first context chunk, request %s",
-                    req.py_request_id,
+                    f"cross KV cache missing for non-first context chunk, request "
+                    f"{req.py_request_id}"
                 )
                 return False
             input_tokens = (

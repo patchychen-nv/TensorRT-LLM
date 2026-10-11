@@ -540,6 +540,44 @@ async def test_context_retry_preserves_generation_reservation_id():
     assert gen_call.args[0].disaggregated_params.ctx_request_id == 202
 
 
+@pytest.mark.asyncio
+async def test_ctx_cancel_releases_the_reserved_generation_server():
+    """A client disconnect mid-prefill must not leak the conditional-disagg reservation.
+
+    With conditional disagg, a gen server is reserved before the context phase
+    so a local-prefill bypass can use it. The whole prefill then runs inside
+    the ctx send_request await; a downstream client that hangs up during it
+    cancels this coroutine exactly there. The reservation is released on
+    CancelledError the same as on an error -- otherwise every disconnected
+    retry of a giant prefill would leave a gen slot pinned on the coordinator.
+    """
+    service = _make_service("context_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    # Conditional disagg reserved gen:9001 under the disagg id before ctx ran.
+    service._check_conditional_disagg = AsyncMock(return_value=("gen:9001", True))
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._gen_router.finish_request = AsyncMock()
+
+    async def _cancelled_ctx(*_args, **_kwargs):
+        # The prefill await interrupted by the client's departure.
+        raise asyncio.CancelledError()
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_cancelled_ctx)
+
+    request = CompletionRequest(model="test-model", prompt="hello")
+    with pytest.raises(asyncio.CancelledError):
+        await service._send_disagg_request(request)
+
+    # The reserved gen server was released, as a failure, under the original
+    # reservation id -- not left pinned for a client that is already gone.
+    service._gen_router.finish_request.assert_awaited_once()
+    assert service._gen_router.finish_request.call_args.kwargs.get("success") is False
+    assert service._gen_router.finish_request.call_args.kwargs.get("req_id") == 101
+
+
 def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():
     ctx_usage = UsageInfo(
         prompt_tokens=128,

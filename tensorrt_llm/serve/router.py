@@ -886,9 +886,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         worker_tpb = info.get("tokens_per_block")
         if worker_tpb is not None and getattr(self, "_tpb_auto", False):
             if worker_tpb != self._tokens_per_block:
-                logger.info(
-                    "router tokens_per_block unset: adopting worker's %d on %s",
-                    worker_tpb, server)
+                logger.info(f"router tokens_per_block unset: adopting worker's "
+                            f"{worker_tpb} on {server}")
                 self._tokens_per_block = worker_tpb
             self._tpb_auto = False
         elif worker_tpb is not None and worker_tpb != self._tokens_per_block:
@@ -903,10 +902,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     f"Align kv_cache_config.tokens_per_block so that one evenly divides the other."
                 )
             logger.warning(
-                "tokens_per_block mismatch on %s: router=%d worker=%d. "
-                "KV events from worker cannot align with router block hashes; "
-                "skipping event polling and relying on routed-block tracking "
-                "for hit rate.", server, self._tokens_per_block, worker_tpb)
+                f"tokens_per_block mismatch on {server}: router="
+                f"{self._tokens_per_block} worker={worker_tpb}. KV events from "
+                f"worker cannot align with router block hashes; skipping event "
+                f"polling and relying on routed-block tracking for hit rate.")
         worker_algo = info.get("kv_cache_hash_algo")
         known_algos = {
             KV_CACHE_HASH_ALGO_V1,

@@ -276,11 +276,9 @@ class ChatWithMCPController(Controller):
             yield from self.generation_controller.process([chat_task])
             response_message = chat_task.messages[-1]
             if not isinstance(response_message, AssistantMessage):
-                logger.warning(
-                    "Stopping ChatWithMCP tool loop: expected AssistantMessage "
-                    "after generation, got %s",
-                    type(response_message).__name__,
-                )
+                logger.warning(f"Stopping ChatWithMCP tool loop: expected "
+                               f"AssistantMessage after generation, got "
+                               f"{type(response_message).__name__}")
                 break
             if response_message.tool_calls:
                 tool_calls = response_message.tool_calls

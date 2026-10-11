@@ -3763,7 +3763,7 @@ class PyTorchModelEngine(ModelEngine):
             self.cleanup()
         except (RuntimeError, AttributeError) as e:
             logger.warning(
-                "PyTorchModelEngine cleanup failed during destruction: %s", e)
+                f"PyTorchModelEngine cleanup failed during destruction: {e}")
 
     def _init_max_seq_len(self):
         # Allow user to override the inferred max_seq_len with a warning.

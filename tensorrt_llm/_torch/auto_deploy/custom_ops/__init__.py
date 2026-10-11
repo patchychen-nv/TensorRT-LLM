@@ -55,10 +55,6 @@ for _, full_name, _ in pkgutil.walk_packages(__path__, prefix=f"{__name__}."):
         __all__.append(full_name)
     except (ModuleNotFoundError, ImportError) as e:
         if _is_trtllm_import_error(e):
-            ad_logger.debug(
-                "Skipping %s (tensorrt_llm not fully available): %s",
-                full_name,
-                e,
-            )
+            ad_logger.debug(f"Skipping {full_name} (tensorrt_llm not fully available): {e}")
         else:
             raise  # Required package missing or real bug — propagate

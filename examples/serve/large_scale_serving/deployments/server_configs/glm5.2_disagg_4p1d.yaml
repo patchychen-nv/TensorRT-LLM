@@ -1,0 +1,16 @@
+# Four context workers to one generation worker.
+#
+# Derived from glm5.2_disagg_6p1d.yaml by dropping two context workers. The
+# node count follows from the shapes the ctx/gen files already fix: ctx is
+# dep4 (one node each) and gen is dep8 (two nodes), so 4 + 2 = 6 workers.
+# Checked against the two existing files rather than assumed: 6p1d is
+# num_workers 8 for 6 ctx, and 2p1d is num_workers 4 for 2 ctx -- both leave
+# exactly 2 for generation.
+backend: pytorch
+num_workers: 6
+context_servers:
+  num_instances: 4
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1

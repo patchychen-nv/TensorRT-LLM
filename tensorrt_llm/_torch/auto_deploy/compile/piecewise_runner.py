@@ -360,20 +360,16 @@ class ADPiecewiseRunner(nn.Module):
         entry = self.entries.get(num_tokens)
         if entry is None:
             ad_logger.warning(
-                "ADPiecewiseRunner.get_dynamic_out_buf: no entry for "
-                "num_tokens=%d, dynamic_submod_id=%d.",
-                num_tokens,
-                dynamic_submod_id,
+                f"ADPiecewiseRunner.get_dynamic_out_buf: no entry for num_tokens={num_tokens}, "
+                f"dynamic_submod_id={dynamic_submod_id}."
             )
             return None
         buf = entry.dynamic_out_bufs.get(dynamic_submod_id)
         if buf is None:
             ad_logger.warning(
-                "ADPiecewiseRunner.get_dynamic_out_buf: no buffer for "
-                "num_tokens=%d, dynamic_submod_id=%d. Shape discovery may "
-                "have failed or this runner has no linked dynamic op.",
-                num_tokens,
-                dynamic_submod_id,
+                f"ADPiecewiseRunner.get_dynamic_out_buf: no buffer for num_tokens={num_tokens}, "
+                f"dynamic_submod_id={dynamic_submod_id}. Shape discovery may have failed or this "
+                f"runner has no linked dynamic op."
             )
             return None
         return buf
@@ -442,12 +438,10 @@ class ADPiecewiseRunner(nn.Module):
                     )
                     mismatches.append(f"  arg[{i}]: captured=0x{cap:x}, runtime=0x{cur:x} ({desc})")
             if mismatches:
+                joined = "\n".join(mismatches)
                 ad_logger.error(
-                    "ADPiecewiseRunner ADDRESS MISMATCH for nt=%d! %d/%d inputs changed:\n%s",
-                    num_tokens,
-                    len(mismatches),
-                    len(entry.input_addresses),
-                    "\n".join(mismatches),
+                    f"ADPiecewiseRunner ADDRESS MISMATCH for nt={num_tokens}! "
+                    f"{len(mismatches)}/{len(entry.input_addresses)} inputs changed:\n{joined}"
                 )
             entry._address_verified = True
 

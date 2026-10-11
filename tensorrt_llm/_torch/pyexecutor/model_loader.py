@@ -542,11 +542,11 @@ class ModelLoader:
                                           config.pretrained_config)
         _validate_and_adjust_mamba_snapshot_config(config, llm_args)
         if original_kv_cache_manager_setting == "auto":
-            logger.info(
-                "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
-                llm_args.kv_cache_config.use_kv_cache_manager_v2,
-                model_cls.__name__
-                if model_cls is not None else "unknown model")
+            model_name = (model_cls.__name__
+                          if model_cls is not None else "unknown model")
+            logger.info(f"Resolved use_kv_cache_manager_v2='auto' to "
+                        f"{llm_args.kv_cache_config.use_kv_cache_manager_v2} "
+                        f"for {model_name}")
 
         return llm_args
 
@@ -989,8 +989,9 @@ class ModelLoader:
                             gms_backend.finalize_write(model)
                         gms_post_load_handled = True
                         logger.info(
-                            "LoadFormat.GMS (RW): loaded and committed weights via %s",
-                            checkpoint_loader.checkpoint_format)
+                            f"LoadFormat.GMS (RW): loaded and committed "
+                            f"weights via {checkpoint_loader.checkpoint_format}"
+                        )
                     elif gms_backend.is_rw is False:
                         # RO path: weights are coming from a GMS donor that
                         # has already committed the post-post_load layout, so
@@ -1178,13 +1179,11 @@ class ModelLoader:
         profile = qualification.profile
         if qualification.qualified and profile is not None:
             logger.info(
-                "MX receiver using staged post-load profile %s for %s "
-                "(transform protocol v%d, layout ABI %s).",
-                profile.profile_id,
-                type(model).__name__,
-                cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-                profile.transform_abi_id,
-            )
+                f"MX receiver using staged post-load profile "
+                f"{profile.profile_id} for {type(model).__name__} (transform "
+                f"protocol v"
+                f"{cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}, layout "
+                f"ABI {profile.transform_abi_id}).")
             return True
 
         unsupported_features = ",".join(
@@ -1214,10 +1213,9 @@ class ModelLoader:
         mode_name = getattr(spec_dec_mode, "name", None)
         if not isinstance(mode_name, str):
             logger.warning(
-                "Unable to identify the speculative decoding mode from %s; "
-                "post-transform sharing is disabled for this load.",
-                type(spec_dec_mode).__name__,
-            )
+                f"Unable to identify the speculative decoding mode from "
+                f"{type(spec_dec_mode).__name__}; post-transform sharing is "
+                f"disabled for this load.")
             return "unknown"
         return mode_name.lower()
 
