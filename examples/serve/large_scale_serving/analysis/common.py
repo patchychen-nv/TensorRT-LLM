@@ -106,27 +106,36 @@ def _cell(value: Any) -> Any:
 TIME_COLUMNS = {"started_at": utc_iso, "handler_entry_at": utc_iso, "finished_at": utc_iso, "timestamp": utc_iso}
 
 
-def read_csv_rows(path: Path, time_columns: dict | None = None) -> list[dict]:
-    """The rows write_csv() wrote, typed again: '' -> None, True/False -> bool, ISO stamps -> epoch, numbers -> int/float.
+def read_csv_rows(
+    path: Path, time_columns: dict | None = None, text_columns: Iterable[str] | None = None,
+) -> list[dict]:
+    """Reload CSV rows, restoring missing values, booleans, epoch timestamps and numbers.
 
     Accepts the .csv or the .csv.gz that write_csv chose. Floats come back with the 4 decimals they were
     written with, which is what a re-rendered report is allowed to differ by.
+    ``text_columns`` preserves identifiers such as session "001" without numeric coercion.
     """
     candidates = [path, path.with_suffix(path.suffix + ".gz")] if path.suffix != ".gz" else [path]
     found = next((p for p in candidates if p.exists()), None)
     if found is None:
         return []
     stamps = set(time_columns or TIME_COLUMNS)
+    texts = set(text_columns or ())
     rows = []
     opener = gzip.open if found.suffix == ".gz" else open
     with opener(found, "rt", encoding="utf-8", newline="") as handle:
-        for raw in csv.DictReader(handle):
+        reader = csv.DictReader(handle)
+        for raw in reader:
+            if None in raw:
+                raise ValueError(f"{found}:{reader.line_num}: CSV row has more fields than its header")
             row = {}
             for key, value in raw.items():
                 if value == "" or value is None:
                     row[key] = None
                 elif key in stamps:
                     row[key] = parse_iso(value)
+                elif key in texts:
+                    row[key] = value
                 elif value == "True":
                     row[key] = True
                 elif value == "False":
@@ -141,6 +150,21 @@ def read_csv_rows(path: Path, time_columns: dict | None = None) -> list[dict]:
                             row[key] = value
             rows.append(row)
     return rows
+
+
+def effective_isl_new(r: dict, mode: str, tokens_per_block: int | None) -> tuple[float | None, str]:
+    """Return effective new input tokens and their source: usage, blocks, or missing.
+
+    Responses usage with cached >= total is untrusted. Only a disaggregated ctx
+    record can supply a block-based fallback; aggregated new blocks include decode.
+    """
+    total, cached, new = r.get("isl_total"), r.get("isl_cached"), r.get("isl_new")
+    bogus = r.get("route") == "/v1/responses" and bool(total) and cached is not None and cached >= total
+    if new is not None and not bogus:
+        return new, "usage"
+    if mode != "agg" and r.get("ctx_blocks_new") is not None and tokens_per_block:
+        return r["ctx_blocks_new"] * tokens_per_block, "blocks"
+    return None, "missing"
 
 
 def yaml_scalar(paths: Iterable[Path], key: str) -> int | None:

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # analysis
 
 Per-request and engine-side metrics for one serving run, from what an attempt directory holds:
@@ -27,6 +32,81 @@ side from the log names.
 | `charts.py` | SVG line charts and histograms, no dependencies |
 | `report.py` | entry point; CSVs plus the HTML |
 | `common.py` | time parsing, percentiles, CSV writer |
+| `modeling.py` | request / engine models, scheduling and observed conversation diagnostics |
+| `model_fit.py` | bounded linear fitting with chronological validation |
+| `model_view.py` | shared model input preparation, JSON output and HTML rendering |
+| `model_report.py` | model existing CSV reports, optionally merging consecutive hours |
+| `modeling.py` | optional request / engine models and observed conversation diagnostics |
+| `model_fit.py` | bounded sampling, chronological validation and linear fitting using the standard library |
+| `model_report.py` | recompute models from compatible hourly report CSVs |
+| `model_view.py` | HTML presentation of model results |
+
+## Optional empirical modeling
+
+Add `--model` to build `model.json` and include a modeling section in `REPORT.html`:
+
+```bash
+python3 analysis/report.py <attempt_dir> --hour 2026-09-28T17 --log-tz America/Los_Angeles --model
+```
+
+This reuses the parsed request and engine rows, preserving their in-memory timestamp precision. Existing
+reports can be modeled without scanning the logs again:
+
+```bash
+python3 analysis/report.py <attempt_dir> --hour 2026-09-28T17 --out <report_dir> --from-csv --model
+```
+
+CSV timestamps have whole-second precision; the model records this limitation. The separate millisecond latency
+columns retain fractional values, subject to CSV numeric rounding. `--json --model` also writes the usual `rollup.json`;
+`--json --json-only --model` writes `model.json` and `rollup.json` without the CSVs or HTML.
+Without `--model`, the report follows the existing analysis path.
+
+The models describe associations within the observed workload and deployment:
+
+| Model / diagnostic | Inputs and interpretation |
+|---|---|
+| Request prefill latency | Effective new-input and total-context tokens; separate fits by context worker, new-token source, model and route |
+| KV transfer latency | Transfer bytes on disaggregated runs; no transfer fit on aggregated runs |
+| Engine device step | Instance iteration workload, decode token slots and cached-context tokens when available; separate fits by role, worker, engine lifetime, rank count and iteration kind |
+| Scheduling | Rank skew, budget / batch occupancy, paused requests, KV state and host / device step summaries |
+| Observed conversation activity | Request occupancy, session spans and gaps between observed requests |
+
+Each linear fit reports the intercept and coefficients in the original units, training feature ranges, retained
+and dropped features, sample and filter counts, and MAE / RMSE / R² on the held-out time interval. Samples are
+ordered chronologically with an approximately 80% / 20% training / validation split, keeping equal timestamps
+together and requiring at least 20 training and 5 validation samples. A deterministic reservoir bounds each
+group's samples at 20,000. Constant or collinear
+features are dropped; insufficient data is reported instead of presenting unsupported coefficients.
+
+Before interpreting the fits, inspect their data-quality metadata and the report's join, padding, topology and
+timezone checks. Request fits use completed observations wholly within the engine window; hourly responses can
+extend past that window and are therefore excluded from these fits. Effective new-input tokens keep their
+provenance: usage-derived values and the disaggregated `ctx_blocks_new × tokens_per_block` fallback belong to
+separate groups. The fallback is a block-granularity estimate. Decode token slots include MTP / CUDA-graph padding
+and are not accepted output tokens. Host and device step values are elapsed spans, not GPU busy time. Coefficients
+are neither causal effects nor hardware-capacity estimates, and predictions outside the training ranges need
+separate validation.
+
+Observed sessions can contain tools, user think time or client scheduling between turns. They can also be
+truncated by the selected time window. `model.json` explicitly leaves full job metrics unavailable: computing
+job latency, jobs/h/user, jobs/h/GPU or a parallel critical path requires explicit job boundaries and the tool /
+branch dependency graph. Do not treat conversation spans as completed-job latency.
+
+To fit compatible consecutive hours together, use their report directories:
+
+```bash
+python3 analysis/model_report.py \
+  _reports/<run>_2026-09-28T17 _reports/<run>_2026-09-28T18 \
+  --out _reports/<run>_model_T17_T18
+```
+
+The command reads CSVs, `engine_meta.json` and `summary.json`, checks that the reports describe the same run,
+attempt, configuration, GPU count and log timezone, removes duplicate boundary iterations, and writes
+`model.json` plus `MODEL.html`. The UTC hours must be consecutive. This avoids reparsing the worker logs but
+retains the CSV timestamp precision limit. Fit combined details again; hourly coefficients, percentiles and
+compressed `rollup.json` distributions cannot be averaged into a model for the combined window.
+The CSV entry loads the selected detail tables into memory; select a small number of hours on a compute node.
+Fitting samples are bounded, but the input tables are not.
 
 ## REPORT.html §0 · Metrics
 

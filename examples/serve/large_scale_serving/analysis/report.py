@@ -19,6 +19,7 @@ Output (default: _reports/<run name>[_<hour>]/ beside this checkout):
                         server doing prefill and decode; its log is server.log)
     REPORT.html         §0 headline metrics, percentile tables, per-instance engine tables, charts
     summary.json        §0 as data plus run / attempt / hour / topology / GPUs, for a collector to plot across reports
+    model.json          empirical fits and validation metrics (with --model)
     notes.json, engine_meta.json   what --from-csv needs to re-render the page without the logs
 
 The deployment mode is read off the logs: ctx-N.log / gen-N.log is disaggregated, server.log alone
@@ -40,11 +41,21 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import charts
-from common import TIME_COLUMNS, local_tz, percentile, read_csv_rows, stats, utc_iso, write_csv, yaml_scalar
+from common import (
+    TIME_COLUMNS,
+    effective_isl_new,
+    local_tz,
+    percentile,
+    read_csv_rows,
+    stats,
+    utc_iso,
+    write_csv,
+    yaml_scalar,
+)
 from engine_iters import INSTANCE_COLUMNS, RANK_COLUMNS, TIER_COUNTERS, build_engine
 from requests_table import COLUMNS as REQUEST_COLUMNS
-from rollup import build_rollup
 from requests_table import build_requests
+from rollup import build_rollup
 
 REPORTS_ROOT = Path(__file__).resolve().parent.parent / "_reports"
 
@@ -252,23 +263,6 @@ def gpu_count(attempt: Path, mode: str, engine: dict) -> tuple[int | None, str]:
     if observed:
         return observed, f"GPUs = {observed} = distinct ranks in the worker logs ({observed_how}); no config snapshot to read tp/pp/cp from."
     return None, "GPUs unknown: no config snapshot and no worker log; the per-GPU rows are empty."
-
-
-def effective_isl_new(r: dict, mode: str, tokens_per_block: int | None) -> tuple[float | None, str]:
-    """Uncached prompt tokens of one request and where the number came from: usage, blocks or missing.
-
-    The usage block is exact where trustworthy. On /v1/responses older servers reported
-    cached_tokens == input_tokens (fixed by 2026-09-16); such a row falls back to the ctx worker's
-    newly allocated KV blocks × tokens_per_block on a disaggregated run. An aggregated worker's
-    record counts decode blocks in the same field, so there is no fallback there.
-    """
-    total, cached, new = r.get("isl_total"), r.get("isl_cached"), r.get("isl_new")
-    bogus = r.get("route") == "/v1/responses" and bool(total) and cached is not None and cached >= total
-    if new is not None and not bogus:
-        return new, "usage"
-    if mode != "agg" and r.get("ctx_blocks_new") is not None and tokens_per_block:
-        return r["ctx_blocks_new"] * tokens_per_block, "blocks"
-    return None, "missing"
 
 
 NO_SESSION = "_no_session"
@@ -1043,6 +1037,10 @@ def main() -> int:
     parser.add_argument("--from-csv", action="store_true",
                         help="re-render REPORT.html and summary.json from the CSVs, notes.json and engine_meta.json "
                              "already in --out; the attempt is only consulted for its config snapshots")
+    parser.add_argument(
+        "--model", action="store_true",
+        help="fit empirical performance models, write model.json, and include them in the report",
+    )
     args = parser.parse_args()
     if args.index_only or args.target is None:
         print(f"index -> {write_index(REPORTS_ROOT)}")
@@ -1052,7 +1050,7 @@ def main() -> int:
     out = args.out or REPORTS_ROOT / (run_name(attempt) + (f"_{hour}" if hour else ""))
     out.mkdir(parents=True, exist_ok=True)
     if args.from_csv:
-        return rerender(attempt, hour, out)
+        return rerender(attempt, hour, out, with_model=args.model)
 
     # B: requests
     requests, notes = build_requests(attempt, hour)
@@ -1104,8 +1102,25 @@ def main() -> int:
         notes.append(f"Window: {utc_iso(window[0])} to {utc_iso(window[1])} (UTC), from the hour's requests; "
                      f"engine iterations outside it are dropped after differencing. Worker log stamps read as {log_tz}.")
 
-    budgets = {"max_num_tokens": max_num_tokens, "max_batch_size": max_batch_size,
-               "tokens_per_block": tokens_per_block}
+    budgets = {
+        "max_num_tokens": max_num_tokens, "max_batch_size": max_batch_size,
+        "tokens_per_block": tokens_per_block, "ctx_max_batch_size": ctx_max_batch_size,
+        "gen_max_num_tokens": gen_max_num_tokens,
+    }
+    model_payload = None
+    if args.model:
+        from model_view import build_model_payload, write_model
+
+        model_payload = build_model_payload(
+            requests, engine, window, budgets,
+            {
+                "run": run_name(attempt), "attempt": attempt.name, "hour": hour,
+                "mode": mode, "gpus": total_gpu, "source": "raw", "log_tz": str(log_tz),
+                "selection": "hourly_request_cohorts" if hour else "whole_attempt",
+            },
+        )
+        write_model(out, model_payload)
+        print(f"  models -> {out / 'model.json'}")
     if args.json:
         # Written before the CSVs and the page, so a collector that only wants
         # this is not held up by the parts it will not read.
@@ -1120,7 +1135,7 @@ def main() -> int:
     (out / "engine_meta.json").write_text(json.dumps({"mode": mode, "workers": engine["workers"], "window": list(window),
                                                       "log_tz": str(log_tz), "budgets": budgets}, indent=1), encoding="utf-8")
     counts = render_report(out, attempt, hour, requests, engine, notes, mode, budgets, total_gpu, gpu_how,
-                           ctx_max_batch_size, gen_max_num_tokens, write_tables=True)
+                           ctx_max_batch_size, gen_max_num_tokens, write_tables=True, model_payload=model_payload)
     print(f"{len(requests)} requests, {counts} -> {out}")
     for note in notes:
         print("  note: " + note)
@@ -1131,7 +1146,8 @@ def main() -> int:
 
 def render_report(out: Path, attempt: Path, hour: str | None, requests: list[dict], engine: dict, notes: list[str],
                   mode: str, budgets: dict, total_gpu: int | None, gpu_how: str,
-                  ctx_max_batch_size: int | None, gen_max_num_tokens: int | None, write_tables: bool) -> str:
+                  ctx_max_batch_size: int | None, gen_max_num_tokens: int | None, write_tables: bool,
+                  model_payload: dict | None = None) -> str:
     """The CSVs (unless re-rendering), summary.json and REPORT.html. Returns the iteration counts for the log line."""
     max_num_tokens, max_batch_size, tokens_per_block = (budgets.get(k) for k in ("max_num_tokens", "max_batch_size", "tokens_per_block"))
     quotas = {w["worker"]: w for w in engine["workers"]}
@@ -1163,11 +1179,15 @@ def render_report(out: Path, attempt: Path, hour: str | None, requests: list[dic
             "<ul>" + "".join(f"<li>{esc(n)}</li>" for n in notes) + "</ul>",
             metrics_section(requests, mode, total_gpu, gpu_how, tokens_per_block),
             requests_section(requests, mode), *engine_sections]
+    if model_payload is not None:
+        from model_view import model_section
+
+        page.append(model_section(model_payload))
     (out / "REPORT.html").write_text("".join(page), encoding="utf-8")
     return counts
 
 
-def rerender(attempt: Path, hour: str | None, out: Path) -> int:
+def rerender(attempt: Path, hour: str | None, out: Path, with_model: bool = False) -> int:
     """REPORT.html and summary.json again from what a previous run left in `out`, without the logs or the trace.
 
     For changes to the page itself. Floats come back from the CSVs with 4 decimals, so the numbers can
@@ -1180,7 +1200,13 @@ def rerender(attempt: Path, hour: str | None, out: Path) -> int:
     meta = json.loads(meta_path.read_text())
     notes = json.loads((out / "notes.json").read_text()) if (out / "notes.json").exists() else []
     mode, budgets = meta["mode"], meta["budgets"]
-    requests = read_csv_rows(out / "requests.csv")
+    requests = read_csv_rows(
+        out / "requests.csv",
+        text_columns=(
+            "rid", "trace_id", "session", "route", "status", "model",
+            "ctx_instance", "route_phase", "validation_errors",
+        ),
+    )
     for r in requests:  # ids and enum-like columns are text in the table
         for key in ("rid", "trace_id", "route", "status", "model", "ctx_instance", "route_phase", "validation_errors"):
             if r.get(key) is not None:
@@ -1196,8 +1222,21 @@ def rerender(attempt: Path, hour: str | None, out: Path) -> int:
     total_gpu, gpu_how = gpu_count(attempt, mode, engine)
     ctx_max_batch_size = yaml_scalar([attempt / "ctx_config.yaml"], "max_batch_size")
     gen_max_num_tokens = yaml_scalar([attempt / "gen_config.yaml"], "max_num_tokens")
+    model_payload = None
+    if with_model:
+        from model_view import build_model_payload, write_model
+
+        model_payload = build_model_payload(
+            requests, engine, tuple(meta.get("window", (None, None))), budgets,
+            {
+                "run": run_name(attempt), "attempt": attempt.name, "hour": hour,
+                "mode": mode, "gpus": total_gpu, "source": "csv", "log_tz": meta.get("log_tz"),
+                "selection": "hourly_request_cohorts" if hour else "whole_attempt",
+            },
+        )
+        write_model(out, model_payload)
     counts = render_report(out, attempt, hour, requests, engine, notes, mode, budgets, total_gpu, gpu_how,
-                           ctx_max_batch_size, gen_max_num_tokens, write_tables=False)
+                           ctx_max_batch_size, gen_max_num_tokens, write_tables=False, model_payload=model_payload)
     print(f"re-rendered: {len(requests)} requests, {counts} -> {out}")
     return 0
 
