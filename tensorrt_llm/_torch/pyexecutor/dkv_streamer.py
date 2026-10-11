@@ -246,6 +246,11 @@ def max_peer_step_bytes(layout: StagingLayout) -> int:
     return sum(layout.slot_pages(kind) * layout.kind_page_bytes(kind) for kind in layout.kinds)
 
 
+def arena_peers(group_size: int) -> int:
+    """The peers that each of the two message arenas of a rank has room for, a step's worth each."""
+    return max(group_size - 1, 1)
+
+
 # Every message of a step starts at a multiple of this in the message arena.
 _MESSAGE_ALIGNMENT = 256
 
@@ -631,8 +636,9 @@ class DkvStreamer:
         # Every message of a step has its own region of the arena, so the messages of a step can
         # be packed first and issued together: a rank exchanges at most max_peer_step_bytes with
         # each of its peers in a step, in at most one message per deadline class.
-        peers = max(group_size - 1, 1)
-        arena = peers * (max_peer_step_bytes(layout) + len(DeadlineClass) * _MESSAGE_ALIGNMENT)
+        arena = arena_peers(group_size) * (
+            max_peer_step_bytes(layout) + len(DeadlineClass) * _MESSAGE_ALIGNMENT
+        )
         device = view.pool.buffer.device
         self._send_arena = torch.empty(arena, dtype=torch.uint8, device=device)
         self._recv_arena = torch.empty(arena, dtype=torch.uint8, device=device)

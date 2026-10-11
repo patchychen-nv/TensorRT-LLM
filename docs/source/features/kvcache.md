@@ -687,9 +687,12 @@ and without any transfer between ranks. It needs the DeepSeek-V4 cache manager, 
 BF16 KV cache (not `fp8_ds_mla` or NVFP4) and `cuda_graph_config: null`. The slots hold the
 cached and the new tokens of one iteration: `TRTLLM_DKV_STAGING_TOKENS` bounds their sum
 over the requests of a rank, and the scheduler admits a request to an iteration only while
-the sum fits (default: `max_seq_len` plus `max_num_tokens`, and no more than every request
-of the batch at `max_seq_len`; a value below `max_seq_len` is rejected, since a request of
-that length would never be admitted). `TRTLLM_DKV_STAGING_DEPTH` sets how many
+the sum fits. By default it is every request of the batch at `max_seq_len`, so that the staging
+area never holds a request back, as long as the pages that grow with it, those of the
+compressed history, take at most 1 GiB in the slots and message buffers of a rank; beyond that
+it is as many tokens as fit, but never fewer than a request of `max_seq_len` next to a full
+chunk. A value below `max_seq_len` is rejected, since a request of that length would never be
+admitted. `TRTLLM_DKV_STAGING_DEPTH` sets how many
 layers of a kind can use the staging area at once (default 2).
 `TRTLLM_DKV_STAGING_FILL=nan` overwrites the slots of a layer with NaN before its pages are
 fetched, so a page that the layer reads without it having been fetched or written turns the

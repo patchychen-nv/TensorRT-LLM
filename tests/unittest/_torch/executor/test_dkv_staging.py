@@ -361,6 +361,41 @@ def test_a_slot_holds_the_pages_of_any_batch_of_a_history_kind(batch, budget) ->
     assert layout.slot_pages(kind) == max(most.values())
 
 
+def _history_bytes(layout: StagingLayout, slot_copies: int) -> int:
+    return slot_copies * sum(
+        layout.slot_pages(kind) * layout.kind_page_bytes(kind)
+        for kind in layout.kinds
+        if layout.window(kind) is None
+    )
+
+
+@pytest.mark.parametrize("fp8", [True, False])
+@pytest.mark.parametrize("slot_copies", [2, 8, 16])
+@pytest.mark.parametrize("history_bytes", [64 << 20, 1 << 30, (1 << 30) + 12345])
+def test_the_most_tokens_within_a_history_budget_fit_it_and_one_more_does_not(
+    fp8, slot_copies, history_bytes
+) -> None:
+    tokens = StagingLayout(_geometry(has_fp8_kv_cache=fp8)).max_tokens_within(
+        history_bytes, slot_copies
+    )
+    fits = StagingLayout(_geometry(has_fp8_kv_cache=fp8, max_staging_tokens=tokens))
+    over = StagingLayout(_geometry(has_fp8_kv_cache=fp8, max_staging_tokens=tokens + 1))
+    assert _history_bytes(fits, slot_copies) <= history_bytes < _history_bytes(over, slot_copies)
+
+
+def test_a_history_budget_of_fewer_pages_than_requests_holds_a_token_per_page() -> None:
+    """Up to one token per request, every staged token takes a page of each history kind."""
+    layout = StagingLayout(_geometry())
+    block_bytes = sum(
+        layout.kind_page_bytes(kind) for kind in layout.kinds if layout.window(kind) is None
+    )
+    assert layout.max_tokens_within(3 * 2 * block_bytes, 2) == 3
+
+
+def test_a_model_whose_layers_only_keep_a_window_has_no_history_to_budget() -> None:
+    assert StagingLayout(_geometry(compress_ratios=(1, 1, 1))).max_tokens_within(1 << 30, 2) is None
+
+
 def test_the_geometry_is_validated() -> None:
     with pytest.raises(ValueError, match="ring_depth"):
         _geometry(ring_depth=0)

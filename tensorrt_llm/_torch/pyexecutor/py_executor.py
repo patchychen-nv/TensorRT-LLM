@@ -6263,7 +6263,7 @@ class PyExecutor:
         wrote are copied back. It exists to prove the staging path on its own, without any
         transfer between ranks. ``TRTLLM_DKV_STAGING_DEPTH`` sets the ring depth,
         ``TRTLLM_DKV_STAGING_TOKENS`` the cached and new tokens, summed over its requests, that one
-        rank may stage in an iteration (default: every request of the batch at ``max_seq_len``)
+        rank may stage in an iteration (default: see ``_default_dkv_staging_tokens``)
         and ``TRTLLM_DKV_STAGING_FILL=nan`` overwrites the slots of a layer with NaN before its
         pages are fetched, so a page that is read without having been fetched or written turns
         the output into NaN.
@@ -6314,26 +6314,53 @@ class PyExecutor:
 
         The slots hold the cached and the new tokens of the requests a rank schedules in one
         iteration, and the scheduler admits requests only while their sum fits. A request of
-        ``max_seq_len`` must fit alone; by default it also fits next to a full chunk.
+        ``max_seq_len`` must fit alone.
         """
         manager = self.kv_cache_manager
-        staging_tokens = int(
-            os.environ.get(
-                "TRTLLM_DKV_STAGING_TOKENS",
-                max(
-                    min(manager.max_batch_size * manager.max_seq_len,
-                        manager.max_seq_len + manager.max_num_tokens),
-                    manager.max_num_tokens)))
+        staging_depth = int(os.environ.get("TRTLLM_DKV_STAGING_DEPTH", "2"))
+        staging_tokens = os.environ.get("TRTLLM_DKV_STAGING_TOKENS")
+        staging_tokens = (int(staging_tokens) if staging_tokens is not None else
+                          self._default_dkv_staging_tokens(staging_depth))
         if staging_tokens < manager.max_seq_len:
             raise ValueError(
                 f"TRTLLM_DKV_STAGING_TOKENS ({staging_tokens}) must hold one "
                 f"request of max_seq_len ({manager.max_seq_len} tokens)")
         return {
-            "staging_depth": int(os.environ.get("TRTLLM_DKV_STAGING_DEPTH",
-                                                "2")),
+            "staging_depth": staging_depth,
             "staging_tokens": staging_tokens,
             "staging_fill": os.environ.get("TRTLLM_DKV_STAGING_FILL", ""),
         }
+
+    def _default_dkv_staging_tokens(self, staging_depth: int) -> int:
+        """The tokens a rank stages per iteration when ``TRTLLM_DKV_STAGING_TOKENS`` is not set.
+
+        Every request of the batch at ``max_seq_len``, so that the staging area never holds a
+        request back, unless the history pages of that many tokens would take more than
+        ``DEFAULT_STAGING_HISTORY_BYTES`` in the slots of the rank. Then it is the most tokens
+        that fit, but never fewer than a request of ``max_seq_len`` next to a full chunk, as far
+        as the batch holds that much, nor than one full chunk.
+        """
+        from .dkv_staging import (DEFAULT_STAGING_HISTORY_BYTES,
+                                  StagingGeometry, StagingLayout)
+        from .dkv_streamer import arena_peers
+
+        manager = self.kv_cache_manager
+        full_batch = manager.max_batch_size * manager.max_seq_len
+        least = max(
+            min(full_batch, manager.max_seq_len + manager.max_num_tokens),
+            manager.max_num_tokens)
+        layout = StagingLayout(
+            StagingGeometry.from_cache_manager(manager,
+                                               max_staging_tokens=least,
+                                               ring_depth=staging_depth))
+        slot_copies = staging_depth
+        if getattr(self, "dkv_layer_split", False) is True:
+            # The send and the receive arena of the data plane hold a slot for every peer.
+            slot_copies += 2 * arena_peers(self.dist.tp_size)
+        within = layout.max_tokens_within(DEFAULT_STAGING_HISTORY_BYTES,
+                                          slot_copies)
+        return max(least,
+                   full_batch if within is None else min(full_batch, within))
 
     def _create_dkv_staged_view(self, settings: dict[str, object]):
         """The staging buffers of this rank and the cache manager the attention backend sees."""

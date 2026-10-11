@@ -58,6 +58,11 @@ BAD_PAGE_INDEX = -1
 # a larger step keeps the regions on separate cache lines of the memory system.
 REGION_ALIGNMENT = 256
 
+# Unless the user sets the token budget of the staging area, the pages of the kinds that keep the
+# history, the only ones that grow with it, take at most this many bytes in all the copies of a slot
+# that a rank holds (see ``StagingLayout.max_tokens_within``).
+DEFAULT_STAGING_HISTORY_BYTES = 1 << 30
+
 
 # The cache roles a layer holds for each kind of storage, in the order their regions are laid out.
 _ATTENTION_TYPES: dict[StagingKind, tuple[DeepseekV4AttentionType, ...]] = {
@@ -308,6 +313,27 @@ class StagingLayout:
             2 * n + max(0, (geometry.max_num_tokens + n * (window - 3)) // block)
             for n in {1, min(batch, geometry.max_num_tokens)}
         )
+
+    def max_tokens_within(self, history_bytes: int, slot_copies: int) -> int | None:
+        """The largest budget whose history pages fit ``history_bytes`` in ``slot_copies`` slots.
+
+        Only the kinds that keep the history grow with the token budget; a sliding-window kind holds
+        the window of every request whatever the budget is. The result does not depend on the
+        budget of this layout. ``None`` when no kind keeps the history, since then no budget costs
+        more than another.
+        """
+        block_bytes = slot_copies * sum(
+            self.kind_page_bytes(kind) for kind in self.kinds if self.window(kind) is None
+        )
+        if block_bytes == 0:
+            return None
+        batch, block = self.geometry.max_batch_size, self.geometry.tokens_per_block
+        pages = history_bytes // block_bytes
+        # The inverse of ``slot_pages``: a budget of up to ``batch`` tokens takes as many pages, and
+        # every page beyond that holds a block.
+        if pages < batch:
+            return pages
+        return batch + (pages - batch + 1) * block - 1
 
     def slot_bytes(self, component: StagingComponent) -> int:
         return self.slot_pages(component.kind) * self.page_bytes(component)
