@@ -708,10 +708,14 @@ class DisaggTransferCoordinator:
             self._poll_dkv_context_sends()
             self._dkv_fatal_messages.extend(self._stalled_dkv_transfers())
         except Exception as error:
-            logger.error(f"DKV context transfer polling failed: {error}")
-            logger.error(traceback.format_exc())
-            self._dkv_fatal_messages.append(f"DKV context transfer polling failed: {error}")
+            self._record_dkv_polling_failure(error)
         return tuple(self._dkv_transfer_events[key] for key in sorted(self._dkv_transfer_events))
+
+    def _record_dkv_polling_failure(self, error: Exception) -> None:
+        """Keep a failure to poll the local sends for the next S-control to deliver to all ranks."""
+        logger.error(f"DKV context transfer polling failed: {error}")
+        logger.error(traceback.format_exc())
+        self._dkv_fatal_messages.append(f"DKV context transfer polling failed: {error}")
 
     def take_dkv_fatal_messages(self) -> Tuple[str, ...]:
         """Drain the fatal conditions found by the DKV transfer path on this rank."""
@@ -865,7 +869,12 @@ class DisaggTransferCoordinator:
     def reap_context_sends(self, at_least: int = 0) -> None:
         """Poll send-side transfers and release settled requests."""
         if self._is_local is not None:
-            self._poll_dkv_context_sends()
+            # Under DKV a failure is not raised on this rank alone: like a failure of the poll at
+            # S-control, it becomes a fatal error that the next S-control delivers to every rank.
+            try:
+                self._poll_dkv_context_sends()
+            except Exception as error:
+                self._record_dkv_polling_failure(error)
             return
         ctx_status = self._transceiver.check_context_transfer_status(at_least)
         failed_req_ids = set(ctx_status.error_request_ids)

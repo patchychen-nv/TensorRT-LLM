@@ -344,6 +344,19 @@ def test_polling_failure_becomes_a_fatal_message_instead_of_a_one_rank_exception
     assert list(worker.transfers.requests_in_transfer()) == [7]
 
 
+def test_polling_failure_after_the_batch_waits_for_the_next_control_exchange():
+    request = _request()
+    worker = _rank(1, [request])
+    worker.coordinator.send_completed_context([request])
+    worker.transceiver.check_context_transfer_status.side_effect = RuntimeError("status boom")
+    # The poll after the batch runs on this rank alone, so it must not raise here.
+    worker.coordinator.reap_context_sends()
+    assert worker.coordinator.take_dkv_fatal_messages() == (
+        "DKV context transfer polling failed: status boom",
+    )
+    assert list(worker.transfers.requests_in_transfer()) == [7]
+
+
 def test_replica_does_not_poll_or_cancel_based_on_local_clock():
     request = _request()
     worker = _rank(0, [request])
