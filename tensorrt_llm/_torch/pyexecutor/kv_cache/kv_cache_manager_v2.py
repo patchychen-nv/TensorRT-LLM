@@ -2181,11 +2181,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 * self.host_kv_cache_block_offsets.element_size()
             )
             logger.info(f"DKV host KV block offsets use {host_table_bytes} bytes")
-            logger.warning(
-                "DKV duplicates the global KV workload on every rank with the same device "
-                f"byte budget: effective per-rank capacity is approximately 1/{self.dkv_group_size} "
-                "of ADP. In-flight context transfers also retain these replicated pages."
-            )
+            if self.dkv_layer_split:
+                logger.info(
+                    "DKV layer split: this rank holds the KV of its own layers for the requests of "
+                    f"all {self.dkv_group_size} ranks, so the group keeps one copy of the KV and "
+                    "holds close to as many blocks as the ranks of ADP together; the rank with the "
+                    "most bytes per block sets the page count of all. In-flight context transfers "
+                    "also retain these pages."
+                )
+            else:
+                logger.warning(
+                    "DKV duplicates the global KV workload on every rank with the same device "
+                    f"byte budget: effective per-rank capacity is approximately "
+                    f"1/{self.dkv_group_size} of ADP. In-flight context transfers also retain "
+                    "these replicated pages."
+                )
 
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
