@@ -28,6 +28,8 @@ pytestmark = pytest.mark.cpu_only
 
 def _executor(dist, requests, *, dkv_enabled: bool = True) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = dkv_enabled
     executor._dkv_commit_reason = None
     executor.dist = dist

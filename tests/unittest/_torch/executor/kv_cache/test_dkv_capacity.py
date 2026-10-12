@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -51,6 +52,9 @@ def _manager(group_size: int | None) -> KVCacheManagerV2:
     manager.max_batch_size = 2
     manager.max_num_tokens = 100
     manager.max_seq_len = 4096
+    manager.max_beam_width = 1
+    manager.kv_cache_type = CacheTypeCpp.SELF
+    manager.enable_partial_reuse = False
     manager.tokens_per_block = 64
     manager._has_cp_helix = False
     manager._generation_kv_capacity_headroom = 1
@@ -247,6 +251,7 @@ def test_generation_dummy_can_still_initialize_kv() -> None:
     cache = SimpleNamespace(
         num_committed_tokens=0,
         capacity=0,
+        beam_width=1,
         resume=Mock(return_value=True),
         stop_committing=Mock(),
     )
@@ -263,7 +268,8 @@ def test_generation_dummy_can_still_initialize_kv() -> None:
     assert len(requests) == 1
     assert requests[0].py_request_id == CUDA_GRAPH_DUMMY_REQUEST_ID
     assert requests[0].is_dummy_request
-    assert cache.capacity == 3
+    # The two tokens of the dummy: one of history and the input of its generation step.
+    assert cache.capacity == 2
     cache.stop_committing.assert_called_once()
 
 

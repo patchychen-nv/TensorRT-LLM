@@ -45,6 +45,8 @@ class _WaitingQueue:
 
 def _executor(dist, requests, *, debug: bool = True) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = True
     executor.dist = dist
     executor.enable_attention_dp = True

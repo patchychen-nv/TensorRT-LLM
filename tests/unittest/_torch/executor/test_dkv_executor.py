@@ -51,6 +51,8 @@ def _queue_item(request_id: int, *, children: list[int] | None = None) -> Reques
 
 def _fetch_executor(dist, items, *, dkv_enabled: bool = True, routes=None) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dist = dist
     executor.dkv_enabled = dkv_enabled
     executor.enable_attention_dp = True
@@ -205,6 +207,8 @@ def test_startup_capacity_is_checked(monkeypatch, different_capacity: bool) -> N
 
     def initialize(dist):
         executor = PyExecutor.__new__(PyExecutor)
+        executor.model_engine = None
+        executor.draft_model_engine = None
         executor.dist = dist
         capacity = 8 + (dist.tp_rank if different_capacity else 0)
         executor.kv_cache_manager = SimpleNamespace(
@@ -230,6 +234,8 @@ def test_different_startup_switches_are_detected_without_waiting_for_a_check(
 
     def initialize(dist):
         executor = PyExecutor.__new__(PyExecutor)
+        executor.model_engine = None
+        executor.draft_model_engine = None
         executor.dist = dist
         executor.kv_cache_manager = SimpleNamespace(
             get_dkv_config_fingerprint=lambda: [], get_dkv_startup_settings=lambda: {}
@@ -260,6 +266,8 @@ def test_startup_settings_cover_every_process_level_switch(monkeypatch) -> None:
         "tensorrt_llm._torch.pyexecutor.py_executor.DkvInvariantChecker", _RecordingChecker
     )
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dist = None
     executor.kv_cache_manager = SimpleNamespace(
         get_dkv_config_fingerprint=lambda: [],
@@ -276,6 +284,8 @@ def test_layer_split_ranks_must_agree_on_the_ownership_table(layer_split: bool) 
 
     def initialize(dist):
         executor = PyExecutor.__new__(PyExecutor)
+        executor.model_engine = None
+        executor.draft_model_engine = None
         executor.dist = dist
         executor.dkv_layer_split = layer_split
         # The ranks disagree about how many layers the model has.
@@ -315,6 +325,8 @@ def test_layer_split_records_the_ownership_table_in_the_startup_settings(monkeyp
         "tensorrt_llm._torch.pyexecutor.py_executor.DkvInvariantChecker", _RecordingChecker
     )
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dist = SimpleNamespace(mapping=SimpleNamespace(tp_size=4))
     executor.dkv_layer_split = True
     executor.kv_cache_manager = SimpleNamespace(
@@ -337,6 +349,8 @@ def _staging_executor(
 ) -> PyExecutor:
     """An executor whose cache manager has the geometry of DeepSeek-V4-Pro, BF16 KV, FP4 indexer."""
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dist = SimpleNamespace(tp_size=group_size)
     executor.dkv_layer_split = layer_split
     executor.kv_cache_manager = SimpleNamespace(
@@ -459,6 +473,8 @@ def test_the_plan_is_fingerprinted_only_when_the_checks_are_on(monkeypatch, chec
         lambda plan: fingerprinted.append(plan) or "fingerprint",
     )
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor._dkv_invariant_checker = SimpleNamespace(
         enabled=checks, check=lambda *args: checked.append(args)
     )
@@ -481,6 +497,7 @@ def test_the_staged_view_publishes_its_token_budget_to_the_scheduler() -> None:
 
 def _scheduled_executor(dist, *, trace, requests, checker_enabled=True) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.draft_model_engine = None
     executor.dist = dist
     executor.dkv_enabled = True
     executor.iter_counter = 3
@@ -547,6 +564,8 @@ def test_global_context_cap_is_preserved_until_dual_ledger_enabled(
     dkv_enabled: bool, dual_ledger: bool
 ) -> None:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = dkv_enabled
     requests = [make_request(1), make_request(2, compute_rank=1)]
     for request in requests:
@@ -573,7 +592,10 @@ def test_global_context_cap_is_preserved_until_dual_ledger_enabled(
 
 def _request_executor(*, dkv_enabled: bool = True) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = dkv_enabled
+    executor.kv_cache_manager = None
     executor.kv_cache_transceiver = None
     executor.max_beam_width = 1
     executor._validate_token_id_range = Mock()
@@ -620,26 +642,27 @@ def test_request_guard_rejects_unsupported_requests(request_type: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "field",
-    [
-        "multimodal_embedding",
-        "multimodal_hashes",
-        "multimodal_positions",
-        "multimodal_lengths",
-        "mrope_rotary_cos_sin",
-        "mrope_position_deltas",
-    ],
+    "field", ["multimodal_hashes", "multimodal_positions", "multimodal_lengths"]
 )
 def test_request_guard_rejects_preprocessed_multimodal_fields(field: str) -> None:
     values = {
-        "multimodal_embedding": torch.zeros(1, 1),
         "multimodal_hashes": [[0] * 8],
         "multimodal_positions": [0],
         "multimodal_lengths": [1],
-        "mrope_rotary_cos_sin": torch.zeros(1, 1),
-        "mrope_position_deltas": 0,
     }
     request = _request(**{field: values[field]})
+    with pytest.raises(ValueError, match="multimodal inputs is not supported"):
+        _request_executor()._validate_request(request)
+
+
+def test_request_guard_rejects_mrope_inputs_in_the_multimodal_data() -> None:
+    request = _request()
+    request.py_multimodal_data = {
+        "mrope_config": {
+            "mrope_rotary_cos_sin": torch.zeros(1, 1),
+            "mrope_position_deltas": torch.zeros(1, dtype=torch.int32),
+        }
+    }
     with pytest.raises(ValueError, match="multimodal inputs is not supported"):
         _request_executor()._validate_request(request)
 
@@ -683,6 +706,8 @@ def test_request_guard_checks_context_only_request_budget(max_new_tokens: int) -
 
 def test_dkv_skips_rank_local_dummy_allocation() -> None:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = True
     executor._pad_attention_dp_dummy_request()
     executor._pad_empty_attention_dp_batch(ScheduledRequests())
@@ -690,6 +715,8 @@ def test_dkv_skips_rank_local_dummy_allocation() -> None:
 
 def test_dkv_rejects_rank_local_balancing() -> None:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = True
     with pytest.raises(ValueError, match="not supported with dkv_config yet"):
         executor._balance_adp_requests([], [])
@@ -720,6 +747,8 @@ def test_measurement_snapshot_is_exported_whenever_the_manager_collects_a_dict(
     dkv_enabled: bool, manager, expected
 ) -> None:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = dkv_enabled
     executor.kv_cache_manager = manager
     assert executor._dkv_measurement_snapshot() == expected
@@ -729,6 +758,8 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
     from tensorrt_llm._torch.pyexecutor.dkv_streamer import DataPlaneStats
 
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = True
     executor.kv_cache_manager = SimpleNamespace(get_dkv_measurement_snapshot=lambda: {"rank": 1})
     executor.dkv_streamer = SimpleNamespace(
@@ -772,6 +803,8 @@ def test_measurement_snapshot_carries_what_the_data_plane_of_the_layer_split_mov
 
 def _control_timing_executor() -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = True
     executor.dist = None
     executor.iter_counter = 0

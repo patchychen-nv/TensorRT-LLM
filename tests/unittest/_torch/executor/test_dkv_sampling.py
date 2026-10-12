@@ -31,6 +31,8 @@ pytestmark = pytest.mark.cpu_only
 
 def _executor(*, dkv_enabled: bool = True) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dkv_enabled = dkv_enabled
     executor.sampler = Mock()
     executor._dkv_sampler_errors = []

@@ -9664,7 +9664,8 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
-        self._check_dkv_free_window(request)
+        if getattr(self, "dkv_enabled", False) is True:
+            self._check_dkv_free_window(request)
         self.resource_manager.free_resources(request)
         if (getattr(self, "dkv_enabled", False) is True and not request.is_dummy
                 and self._dkv_invariant_checker.enabled):

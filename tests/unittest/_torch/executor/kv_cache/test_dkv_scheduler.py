@@ -118,6 +118,17 @@ class _PageManager:
     def is_request_active(self, request_id: int) -> bool:
         return self.kv_cache_map[request_id].is_active
 
+    def context_replay_tokens(self, req: LlmRequest) -> int | None:
+        """No resume fixed recovery rows for a request, so the ordinary budget applies."""
+        return None
+
+    def has_pending_preemption(self) -> bool:
+        """No preemption waits for a connector: these pages have none."""
+        return False
+
+    def is_preemption_pending(self, req: LlmRequest) -> bool:
+        return False
+
 
 def _scheduler(
     manager: _PageManager,

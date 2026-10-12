@@ -48,6 +48,8 @@ def _request(rank: int) -> LlmRequest:
 
 def _executor(dist) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.dist = dist
     executor.dkv_enabled = True
     executor.enable_attention_dp = True
@@ -303,6 +305,8 @@ def test_response_pass_ignores_local_transfer_observations(owner_timed_out: bool
 
 def test_adapter_can_defer_replica_termination_without_a_response() -> None:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor._pending_transfer_responses = []
     executor._pending_response_terminations = []
     executor._terminate_request = Mock()
@@ -388,6 +392,8 @@ def test_reaped_failure_before_context_publication_sends_only_an_error(timed_out
 
 def _runtime_executor() -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor.kv_cache_manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     executor.kv_cache_manager.enable_block_reuse = True
     executor.kv_cache_transceiver = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)

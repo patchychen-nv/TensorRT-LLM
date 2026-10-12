@@ -81,6 +81,7 @@ def _check_executor_rank(scenario: str) -> bool:
     torch.cuda.set_device(rank)
     dist = MPIDist(Mapping(world_size=2, rank=rank, tp_size=2, enable_attention_dp=True))
     executor = PyExecutor.__new__(PyExecutor)
+    executor.draft_model_engine = None
     executor.dist = dist
     executor.dkv_enabled = True
     executor.enable_attention_dp = True

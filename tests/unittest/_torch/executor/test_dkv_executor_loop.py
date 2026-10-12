@@ -289,6 +289,8 @@ def _check_data_plane(group_size: int, records_of, *, enabled: bool = True):
 
     def rank_main(dist) -> None:
         executor = PyExecutor.__new__(PyExecutor)
+        executor.model_engine = None
+        executor.draft_model_engine = None
         executor.dist = dist
         executor.iter_counter = 7
         executor.dkv_streamer = SimpleNamespace(last_plan=None)
