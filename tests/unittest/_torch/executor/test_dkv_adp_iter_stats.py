@@ -139,7 +139,8 @@ def test_payload_without_dkv_counts_keeps_its_original_width() -> None:
     payload = RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=4, num_gen_requests=2)
     assert len(payload.serialize()) == 9
     state = RankState(rank=3, num_active_requests=5, iter_stats=payload)
-    assert len(state.serialize()) == 13
+    # The rank, three loads, the nine stats and the two forward counts.
+    assert len(state.serialize()) == 15
     assert RankState.deserialize(state.serialize()) == state
 
 
@@ -149,7 +150,7 @@ def test_any_nonzero_dkv_count_is_transported_with_the_full_width(name: str) -> 
     assert len(payload.serialize()) == 13
     assert RankIterStatsPayload.deserialize(payload.serialize()) == payload
     state = RankState(rank=1, iter_stats=payload)
-    assert len(state.serialize()) == 17
+    assert len(state.serialize()) == 19
     assert RankState.deserialize(state.serialize()) == state
 
 
@@ -184,8 +185,35 @@ def test_measurement_snapshot_travels_with_the_payload_and_widens_it() -> None:
     assert len(values) == 14 and values[-1] == _snapshot(1, 2)
     assert RankIterStatsPayload.deserialize(values) == payload
     state = RankState(rank=1, iter_stats=payload)
-    assert len(state.serialize()) == 18
+    assert len(state.serialize()) == 20
     assert RankState.deserialize(state.serialize()) == state
+
+
+def test_dkv_fields_follow_the_forward_counts_of_the_rank_state() -> None:
+    payload = RankIterStatsPayload(
+        has_iter_stats=1,
+        iter_stats_iter=6,
+        num_context_requests=7,
+        has_local_request_counts=1,
+        num_active_requests=3,
+        dkv_measurement=_snapshot(1, 2),
+    )
+    state = RankState(
+        rank=1,
+        num_active_requests=8,
+        iter_stats=payload,
+        num_context_requests=2,
+        num_generation_requests=4,
+    )
+    values = state.serialize()
+    assert values[13:15] == [2, 4]
+    assert RankState.deserialize(values) == state
+    # Without the DKV fields the payload is that of a run without DKV.
+    plain = RankState.deserialize(values[:15])
+    assert plain.num_context_requests == 2 and plain.num_generation_requests == 4
+    assert plain.iter_stats == replace(
+        payload, has_local_request_counts=0, num_active_requests=0, dkv_measurement=None
+    )
 
 
 def test_each_rank_reports_its_own_measurement_through_the_stats_fanout() -> None:

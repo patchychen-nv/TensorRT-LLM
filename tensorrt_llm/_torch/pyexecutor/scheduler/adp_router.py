@@ -141,6 +141,10 @@ class RankIterStatsPayload:
         return cls(*values)
 
 
+# The fields of the iteration stats before the DKV counts and the measurement snapshot.
+_ITER_STATS_BASE_FIELDS = len(fields(RankIterStatsPayload)) - _DKV_COUNT_FIELDS - 1
+
+
 @dataclass
 class RankState:
     """Per-rank state information shared via allgather before request assignment.
@@ -155,6 +159,8 @@ class RankState:
     num_active_tokens: int = 0
     num_retiring_requests: int = 0
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
+    num_context_requests: int = 0
+    num_generation_requests: int = 0
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
         if iter_stats_payload is None:
@@ -162,13 +168,22 @@ class RankState:
         self.iter_stats = replace(iter_stats_payload)
 
     def serialize(self) -> list[int]:
-        """Serialize to a flat list for allgather transport."""
+        """Serialize to a flat list for allgather transport.
+
+        The iteration stats without their DKV fields come first and the forward counts after
+        them. The DKV fields of the stats, when the stats carry any, come last, so a payload
+        without them has the layout it has without DKV.
+        """
+        stats = self.iter_stats.serialize()
         return [
             self.rank,
             self.num_active_requests,
             self.num_active_tokens,
             self.num_retiring_requests,
-            *self.iter_stats.serialize(),
+            *stats[:_ITER_STATS_BASE_FIELDS],
+            self.num_context_requests,
+            self.num_generation_requests,
+            *stats[_ITER_STATS_BASE_FIELDS:],
         ]
 
     @classmethod
@@ -177,7 +192,9 @@ class RankState:
         values = list(data)
         rank_state_prefix_field_count = 4
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
-        max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
+        stats_end = rank_state_prefix_field_count + _ITER_STATS_BASE_FIELDS
+        counts_end = stats_end + 2
+        max_field_count = counts_end + len(fields(RankIterStatsPayload)) - _ITER_STATS_BASE_FIELDS
         if len(values) < 1:
             raise ValueError("RankState payload is missing required field rank")
         if len(values) > max_field_count:
@@ -197,7 +214,11 @@ class RankState:
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
             num_retiring_requests=rank_values[3],
-            iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
+            iter_stats=RankIterStatsPayload.deserialize(
+                values[rank_state_prefix_field_count:stats_end] + values[counts_end:]
+            ),
+            num_context_requests=values[stats_end] if len(values) > stats_end else 0,
+            num_generation_requests=values[stats_end + 1] if len(values) > stats_end + 1 else 0,
         )
 
 
@@ -351,6 +372,7 @@ class ADPRouter(ABC):
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
+        forward_work: tuple[int, int] | None = None,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -361,6 +383,8 @@ class ADPRouter(ABC):
                 new-request info (e.g. KV-cache-aware routing).
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
+            forward_work: Context and generation work eligible before this
+                iteration polls transfers, used by conditional attention DP.
         """
         if self.dkv_enabled:
             # Under DKV active_requests is globally replicated (every rank holds
@@ -379,6 +403,8 @@ class ADPRouter(ABC):
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
         local_state.num_retiring_requests = num_retiring_requests
         local_state.copy_iter_stats_from(iter_stats_payload)
+        if forward_work is not None:
+            local_state.num_context_requests, local_state.num_generation_requests = forward_work
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
 

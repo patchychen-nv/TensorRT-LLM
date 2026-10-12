@@ -48,6 +48,7 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    bounded_replay_on_generation: bool = False
     # The instance is a layer-split group of DKV published as a pipeline: every rank is a stage
     # that holds a range of the layers of every request, and every stage writes to a peer.
     layer_split: bool = False
@@ -118,6 +119,7 @@ class RankInfo:
             ),
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
+            bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
         )
 
     @classmethod

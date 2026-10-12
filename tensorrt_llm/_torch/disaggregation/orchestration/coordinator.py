@@ -27,6 +27,8 @@ from .admission import DisaggTransferAdmissionController
 from .interfaces import ActiveRequestRegistry, DkvTransferEvent, ExecutorEffects
 
 if TYPE_CHECKING:
+    import torch
+
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 
@@ -78,6 +80,10 @@ class DisaggTransferCoordinator:
     disaggregation is off.
     """
 
+    # Class-level default, so a coordinator assembled without ``__init__``
+    # keeps the blocking receive fence.
+    _defer_unready_gen_receives = False
+
     def __init__(
         self,
         *,
@@ -94,6 +100,7 @@ class DisaggTransferCoordinator:
         is_kv_manager_v2: bool = False,
         is_local: Optional[Callable[[LlmRequest], bool]] = None,
         every_rank_sends: bool = False,
+        defer_unready_gen_receives: bool = False,
     ) -> None:
         self._transceiver = transceiver
         self._transfers = transfer_manager
@@ -131,6 +138,16 @@ class DisaggTransferCoordinator:
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
+        # When a forward is still in flight at admission, as under the overlap
+        # scheduler, an asynchronous receive whose admission readiness event
+        # has not completed is published by a later poll instead of blocking
+        # the executor thread on that event.
+        self._defer_unready_gen_receives = defer_unready_gen_receives
+        # Prepared generation requests awaiting publication, in admission
+        # order, each with the readiness event its cache admission recorded.
+        self._unpublished_gen_receives: Dict[
+            int, Tuple[LlmRequest, Optional["torch.cuda.Event"]]
+        ] = {}
 
     # -- loop head -----------------------------------------------------------
 
@@ -228,6 +245,8 @@ class DisaggTransferCoordinator:
         """Poll receive-side transfers and their timeouts; rank-synchronized."""
         if not uses_async_gen_transfer():
             return
+        if self._defer_unready_gen_receives:
+            self._publish_ready_gen_receives()
         # Gen-transfer status performs cross-rank consensus internally. Enter
         # it symmetrically; ranks with no ready local future contribute an
         # empty ready set.
@@ -347,6 +366,10 @@ class DisaggTransferCoordinator:
         start their KV receive in the configured transfer mode."""
         if not admitted:
             return
+        defer_unready = self._defer_unready_gen_receives and uses_async_gen_transfer()
+        # Take the admission readiness events first, so preparing resources
+        # does not block this thread on them; publication polls them instead.
+        fences = self._take_receive_fences(admitted) if defer_unready else {}
         self._effects.prepare_gen_resources(admitted)
 
         # gen_only_no_context has no CTX worker, so mark each request as
@@ -365,15 +388,68 @@ class DisaggTransferCoordinator:
             self._check_transfer_errors("generation requests")
             return
 
-        for req in admitted:
-            self._transceiver.request_and_receive_async(req)
-
-        if self._transceiver.kv_transfer_timeout_ms is not None:
+        if defer_unready:
             for req in admitted:
-                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                    req.py_kv_transfer_start_time = time.monotonic()
+                self._unpublished_gen_receives[req.py_request_id] = (
+                    req,
+                    fences.get(req.py_request_id),
+                )
+            self._publish_ready_gen_receives()
+            # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
+            # every admitted request ends in the same state on every rank and
+            # the scheduler does not admit it again.
+            for req in admitted:
+                if req.py_request_id in self._unpublished_gen_receives:
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        else:
+            for req in admitted:
+                self._transceiver.request_and_receive_async(req)
+            self._stamp_gen_transfer_start(admitted)
 
         self.reap_gen_receives(0)
+
+    def _take_receive_fences(
+        self, requests: List[LlmRequest]
+    ) -> Dict[int, Optional["torch.cuda.Event"]]:
+        """Take each request's admission readiness event from the cache manager."""
+        take = getattr(self._kv_cache_manager, "take_disagg_receive_ready", None)
+        if take is None:
+            return {}
+        return {req.py_request_id: take(req) for req in requests}
+
+    def _publish_ready_gen_receives(self) -> None:
+        """Start the asynchronous receive of each waiting request whose
+        admission readiness event has completed.
+
+        RDMA cannot observe stream ordering, so a destination is published
+        only after the event its admission recorded. The event is polled,
+        never waited on, so the next forward's host work stays overlapped with
+        the GPU; and it is never re-recorded, since a newer event would also
+        cover every later forward.
+        """
+        published = []
+        for request_id, (req, ready) in list(self._unpublished_gen_receives.items()):
+            if req.state not in (
+                LlmRequestState.DISAGG_GENERATION_INIT,
+                LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            ):
+                # Failed or finished before publication; nothing to start.
+                del self._unpublished_gen_receives[request_id]
+                continue
+            if ready is not None and not ready.query():
+                continue
+            del self._unpublished_gen_receives[request_id]
+            self._transceiver.request_and_receive_async(req)
+            published.append(req)
+        self._stamp_gen_transfer_start(published)
+
+    def _stamp_gen_transfer_start(self, requests: List[LlmRequest]) -> None:
+        """Start the transfer-timeout clock of each receive now in flight."""
+        if self._transceiver.kv_transfer_timeout_ms is None:
+            return
+        for req in requests:
+            if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                req.py_kv_transfer_start_time = time.monotonic()
 
     def poll_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
@@ -966,6 +1042,7 @@ class DisaggTransferCoordinator:
         self._dkv_transfer_events.pop(request_id, None)
         self._dkv_send_errors.pop(request_id, None)
         self._dkv_stalled_request_ids.discard(request_id)
+        self._unpublished_gen_receives.pop(request_id, None)
 
     @nvtx_range("cancel_timed_out_gen_transfers")
     def _cancel_timed_out_gen_transfers(self) -> None:
