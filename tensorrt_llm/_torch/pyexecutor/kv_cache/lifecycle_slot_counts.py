@@ -396,6 +396,19 @@ def solve_lifecycle_slot_counts(
 
     if allgather is not None:
         gathered = list(allgather((signature, counts)))
+        keys_by_rank = [set(entry[0][0]) for entry in gathered]
+        every_key = set().union(*keys_by_rank)
+        lacking = [
+            (rank, sorted(every_key - keys))
+            for rank, keys in enumerate(keys_by_rank)
+            if keys != every_key
+        ]
+        if lacking:
+            raise ValueError(
+                "lifecycle_slot_counts needs every rank to hold layers of every KV life cycle: "
+                + "; ".join(f"rank {rank} has no layer of {missing}" for rank, missing in lacking)
+                + ". With dkv_config layer_split, use a smaller attention-DP group."
+            )
         if any(entry[0] != signature for entry in gathered):
             raise ValueError(
                 "lifecycle_slot_counts needs every rank to hold the same life cycles and cache "

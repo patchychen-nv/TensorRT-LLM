@@ -360,7 +360,7 @@ def test_group_rejects_ranks_with_different_life_cycles() -> None:
     # A rank that holds only heavily compressed layers has no window-8 life cycle.
     configs[2] = v4_like_config(["hca"] * 3, gpu_quota=24 * MIB, typical_step=typical_batch(4, 96))
     group = LockstepTpGroup(len(configs))
-    with pytest.raises(ValueError, match="same life cycles"):
+    with pytest.raises(ValueError, match="rank 2 has no layer of .*smaller attention-DP group"):
         group.run(
             lambda dist: solve_lifecycle_slot_counts(
                 configs[dist.tp_rank], allgather=dist.tp_allgather
