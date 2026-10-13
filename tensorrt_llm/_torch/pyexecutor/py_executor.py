@@ -6755,21 +6755,20 @@ class PyExecutor:
     def _validate_dkv_layer_split_runtime(self) -> None:
         """Validate what the layer-split layout needs beyond the replicated one.
 
-        The cache manager must be DeepSeek-V4's, whose KV layout the staging
-        buffers mirror, on a GPU whose attention op reads it directly. Every
-        rank must be able to own layers of all life cycles (K1). The data plane
-        owns the only NCCL traffic that runs during a forward pass, so the MoE
-        layers must not communicate through NCCL themselves.
+        The cache manager must be a V2 one: the data plane and the working cache
+        take everything they move from what it publishes, whatever the model. The
+        layout runs on SM100 and SM103 only, the GPUs it is tested on. Every rank
+        must be able to own layers of all life cycles (K1). The data plane owns
+        the only NCCL traffic that runs during a forward pass, so the MoE layers
+        must not communicate through NCCL themselves.
         """
-        from ..attention.backends.sparse.deepseek_v4.cache_manager import \
-            DeepseekV4CacheManager
         from ..moe.fused_moe.communication import AllGatherReduceScatter, NcclEP
 
         suffix = "is not supported with dkv_config layer_split yet"
         manager = self.kv_cache_manager
-        if type(manager) is not DeepseekV4CacheManager:
-            raise ValueError(f"{type(manager).__name__} {suffix}; use "
-                             "DeepseekV4CacheManager.")
+        if not isinstance(manager, KVCacheManagerV2):
+            raise ValueError(f"{type(manager).__name__} {suffix}; the layer "
+                             "split needs a KVCacheManagerV2.")
         mapping = self.dist.mapping
         if mapping.world_size != mapping.tp_size:
             raise ValueError(

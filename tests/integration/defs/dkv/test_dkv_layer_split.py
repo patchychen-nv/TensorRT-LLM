@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek-V4 on the layer-split layout: each rank keeps the KV of the layers it owns only.
+"""The layer-split layout: each rank keeps the KV of the layers it owns only.
 
 With ``kv_layout="layer_split"`` the cache manager of a rank holds the pages of its own layers. The
 rank that computes a request fetches the cached pages of every other layer from the rank that owns
 it before the layer runs, and writes the pages the new tokens touch back after it. These tests run
-the suites of the replicated layout on it and judge it against the replicated group, within the
-run-to-run noise of the model.
+the suites of the replicated layout on it, mostly on DeepSeek-V4, and judge it against the
+replicated group, within the run-to-run noise of the model. Since the data plane derives what it
+moves from the cache manager alone, a dense MLA model and a dense Llama run on it as well.
 """
 
 import dataclasses
@@ -26,7 +27,9 @@ from tensorrt_llm._torch.pyexecutor.dkv import compute_ownership
 from tensorrt_llm.scheduling_params import SchedulingParams
 
 from .dkv_models import (
+    DEEPSEEK_V3_LITE,
     DEEPSEEK_V4,
+    TINY_LLAMA,
     DkvModel,
     PromptTokenizer,
     available_gpus,
@@ -182,6 +185,47 @@ def test_the_layer_split_answers_chunked_prompts_like_the_replicated_group(
     assess_prompt_separation(control, result["mean_adp_self_tv"], model.precision)
     assert_known_answers(split, answers, tokenizer.decode, "DKV layer split, chunked")
     print(f"layer split precision, chunked prompts: {result}")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_the_layer_split_of_a_dense_mla_model_answers_exactly_like_the_replicated_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The data plane takes what it moves from the cache manager, so it serves any model.
+
+    DeepSeek-V3-Lite keeps the latent KV of each layer in the plain V2 cache manager, and its
+    replicated group reproduces itself bit for bit, so the layer split has to give exactly its
+    tokens and logits. The working pages are overwritten with NaN before every fetch.
+    """
+    model = DEEPSEEK_V3_LITE
+    _require(model)
+    tokenizer = PromptTokenizer(model.path())
+    prompts, answers = build_precision_prompts(tokenizer.encode, model.tokens_per_block)
+    control, replay = run_precision_passes(
+        model, dkv_enabled=True, prompts=prompts, passes=2, group_size=_GROUP_SIZE
+    )
+    _layer_split(monkeypatch, "nan")
+    (split,) = run_precision_passes(
+        model, dkv_enabled=True, prompts=prompts, passes=1, group_size=_GROUP_SIZE
+    )
+
+    result = compare_precision_runs(control, replay, split, model.precision)
+    assess_prompt_separation(control, result["mean_adp_self_tv"], model.precision)
+    assert_known_answers(split, answers, tokenizer.decode, "DKV layer split")
+    print(f"layer split precision on {model.pytest_id}: {result}")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_the_layer_split_of_a_dense_llama_answers_every_request_of_a_burst_once(
+    monkeypatch: pytest.MonkeyPatch, capfd
+) -> None:
+    """TinyLlama serves the burst of the replicated layout on the layer split.
+
+    The K and V of each of its layers are two buffers of the plain V2 cache manager. Its outputs are
+    no numerical oracle, so the burst judges the answers and the pages only.
+    """
+    _layer_split(monkeypatch)
+    run_burst(monkeypatch, capfd, TINY_LLAMA, next(b for b in _BURSTS if b.pytest_id == "g2"))
 
 
 @pytest.mark.threadleak(enabled=False)

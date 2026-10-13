@@ -3923,16 +3923,25 @@ class TestDkvRuntimeValidation:
             executor._validate_dkv_runtime()
         assert any("reuse is disabled" in call.args[0] for call in warning.call_args_list)
 
-    def test_layer_split_rejects_a_cache_manager_that_is_not_deepseek_v4s(self):
+    def test_layer_split_accepts_the_v2_cache_manager_of_any_model(self):
+        """The data plane takes what it moves from the V2 cache manager, so the manager of a model
+        whose every layer keeps its whole history serves the layout as DeepSeek-V4's does."""
         from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         executor = self._make_layer_split_executor(KVCacheManagerV2)
+        executor.kv_cache_manager._model_attention_windows = [None] * 43
+        with patch(self._SM, return_value=103):
+            executor._validate_dkv_runtime()
+
+    def test_layer_split_rejects_a_cache_manager_that_is_not_a_v2_one(self):
+        executor = self._make_layer_split_executor()
+        executor.kv_cache_manager = types.SimpleNamespace()
         with patch(self._SM, return_value=103):
             with pytest.raises(
                 ValueError,
-                match="KVCacheManagerV2 is not supported with dkv_config layer_split yet",
+                match="SimpleNamespace is not supported with dkv_config layer_split yet",
             ):
-                executor._validate_dkv_runtime()
+                executor._validate_dkv_layer_split_runtime()
 
     def test_layer_split_rejects_a_world_larger_than_the_group(self):
         executor = self._make_layer_split_executor(tp_size=4, world_size=8)
@@ -3948,7 +3957,7 @@ class TestDkvRuntimeValidation:
                 executor._validate_dkv_runtime()
 
     @pytest.mark.parametrize("sm_version", [80, 90, 120])
-    def test_layer_split_rejects_gpus_whose_attention_reads_the_cache_differently(self, sm_version):
+    def test_layer_split_rejects_gpus_it_has_not_run_on(self, sm_version):
         executor = self._make_layer_split_executor()
         with patch(self._SM, return_value=sm_version):
             with pytest.raises(

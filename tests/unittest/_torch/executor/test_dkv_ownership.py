@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.dkv import (
     validate_ownership,
 )
 from tensorrt_llm._torch.pyexecutor.dkv_types import LifecycleKey
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 pytestmark = pytest.mark.cpu_only
 
@@ -176,6 +177,19 @@ def test_a_rank_without_layers_is_rejected() -> None:
     keys = _life_cycle_keys([_CSA] * 3)
     with pytest.raises(ValueError, match=r"rank 3 would own layers \[\]"):
         validate_ownership(compute_ownership(3, 4), keys, 4)
+
+
+def test_a_v2_manager_keeps_every_layer_in_the_life_cycle_of_its_window() -> None:
+    """The keys of the base V2 cache manager: one life cycle per model layer, the window of the
+    layer (0: the whole history), also for the layers another rank holds. Here the layers alternate
+    a window of 512 tokens and the whole history."""
+    manager = types.SimpleNamespace(_model_attention_windows=[512, None] * 3)
+    keys = KVCacheManagerV2.get_layer_life_cycle_keys(manager)
+    assert keys == [frozenset({_key(512)}), frozenset({_key(0)})] * 3
+    # Contiguous halves hold both life cycles; a rank of a single layer holds one of them only.
+    validate_ownership(compute_ownership(6, 2), keys, 2)
+    with pytest.raises(ValueError, match=r"rank 0 would own layers \[0\]"):
+        validate_ownership(compute_ownership(6, 6), keys, 6)
 
 
 def test_a_model_without_compression_is_covered_by_any_split() -> None:

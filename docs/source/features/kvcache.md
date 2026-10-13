@@ -700,30 +700,30 @@ model. Multi-turn runs on it are listed as invalid by the no-eviction check, bec
 blocks are also removed as a conversation grows; the number of capacity-dropped
 pages, which stays zero, shows that nothing was evicted.
 
-**Staging loopback (DeepSeek-V4).** The layer-split layout runs the attention of a layer on
-a staging area and not on the pages of the cache manager: before the layer, its cached
-pages are copied into its slot of the staging area, and after the layer the pages the new
-tokens wrote are copied back. `TRTLLM_DKV_STAGING_LOOPBACK=1` runs the replicated layout
-through that path, with every rank owning every layer, so the staging path is judged alone
-and without any transfer between ranks. It needs the DeepSeek-V4 cache manager, an FP8 or
-BF16 KV cache (not `fp8_ds_mla` or NVFP4) and `cuda_graph_config: null`. The slots hold the
-cached and the new tokens of one iteration: `TRTLLM_DKV_STAGING_TOKENS` bounds their sum
-over the requests of a rank, and the scheduler admits a request to an iteration only while
-the sum fits. By default it is every request of the batch at `max_seq_len`, so that the staging
-area never holds a request back, as long as the pages that grow with it, those of the
-compressed history, take at most 1 GiB in the slots and message buffers of a rank; beyond that
-it is as many tokens as fit, but never fewer than a request of `max_seq_len` next to a full
-chunk. A value below `max_seq_len` is rejected, since a request of that length would never be
-admitted. `TRTLLM_DKV_STAGING_DEPTH` sets how many
-layers of a kind can use the staging area at once (default 2).
-`TRTLLM_DKV_STAGING_FILL=nan` overwrites the slots of a layer with NaN before its pages are
-fetched, so a page that the layer reads without it having been fetched or written turns the
-output into NaN. The ranks compare these switches when they start. The loopback gates run
-DeepSeek-V4 with and without it and judge the two groups by the rules above, and a
-layer-level test runs the attention layers on the cache manager and on its staged view and
-requires the same outputs and pages.
+**Staging loopback.** The layer-split layout runs the attention of every layer in a *working
+cache* and not in the pages of the cache manager: a second instance of the cache manager's class
+that covers every layer and holds pages only for the requests a rank computes in an iteration.
+Before a layer, its cached pages are copied into the working cache, and after the layer the pages
+the new tokens wrote are copied back. `TRTLLM_DKV_STAGING_LOOPBACK=1` runs the replicated layout
+through that path, with every rank owning every layer, so the staging path is judged alone and
+without any transfer between ranks. It needs the V2 KV cache manager, an FP8 or BF16 KV cache
+(not `fp8_ds_mla` or NVFP4) and `cuda_graph_config: null`. The working cache holds the cached and
+the new tokens of one iteration: `TRTLLM_DKV_STAGING_TOKENS` bounds their sum over the requests of
+a rank, and the scheduler admits a request to an iteration only while the sum fits. By default it
+is every request of the batch at `max_seq_len`, so that the working cache never holds a request
+back, as long as the pages that grow with it, those of the layers that keep their whole history,
+take at most 1 GiB in the working cache and the message buffers of a rank; beyond that it is as
+many tokens as fit, but never fewer than a request of `max_seq_len` next to a full chunk. A value
+below `max_seq_len` is rejected, since a request of that length would never be admitted.
+`TRTLLM_DKV_STAGING_DEPTH` sets how many layers ahead of its attention a layer is fetched, plus
+one (default 2). `TRTLLM_DKV_STAGING_FILL=nan` overwrites the working pages of a layer with NaN
+before its pages are fetched, so a page that the layer reads without it having been fetched or
+written turns the output into NaN. The ranks compare these switches when they start. The
+loopback gates run DeepSeek-V4 with and without it and judge the two groups by the rules above,
+and a layer-level test runs the attention layers of DeepSeek-V4 on the cache manager and in a
+working cache and requires the same outputs and pages.
 
-**Layer split (DeepSeek-V4).** With `kv_layout: layer_split` the model's layers are divided
+**Layer split.** With `kv_layout: layer_split` the model's layers are divided
 into contiguous ranges over the ranks of the group, and the cache manager of a rank holds the
 KV of the layers it owns only, so a group stores one copy of the KV of every request instead
 of one per rank. The request is still computed on its compute rank: around the attention of
@@ -735,8 +735,14 @@ Both run on a data stream of their own over NCCL point-to-point messages, in an 
 every rank derives from the replicated scheduling state, so no rank exchanges the plan; the
 host waits for the data stream at the end of every iteration, before a page can be freed or
 moved. The ranks agree on the number of pages of every KV life cycle, since the layers they
-hold differ in bytes. The layout needs DeepSeek-V4 on SM100 or SM103, `cuda_graph_config: null`,
-no `torch_compile_config` and every rank to own layers of every KV life cycle, which limits the
+hold differ in bytes. What moves is derived from the cache manager alone: the buffers of
+every layer from its layer configs, the blocks a request moves from their KV life cycles and
+the address of every page from its page tables, so the data plane knows nothing about the
+model. The attention of a layer announces the layer through its metadata before it touches
+the KV cache, and the model runner opens the pages of a batch in the working cache before it
+prepares the metadata. The layout needs the V2 KV cache manager, attention layers without
+recurrent state or attention sinks, SM100 or SM103, `cuda_graph_config: null`, no
+`torch_compile_config` and every rank to own layers of every KV life cycle, which limits the
 group size. As the context worker of a disaggregated deployment, every rank sends the layers it
 owns of every request. The group is published to the generation workers as one tensor-parallel
 rank of a pipeline with as many stages as the group has ranks, so a generation worker is
@@ -777,8 +783,12 @@ context group that hands its KV to an ordinary generation worker, with a timeout
 cancellation, with prefix reuse, and with the KV that all ranks or one rank send corrupted), the
 multi-GPU probe `tests/unittest/_torch/multi_gpu/test_dkv_dataplane_tp.py`,
 which runs the data plane between real ranks without a model and compares every page with a
-pattern (`DKV_DATAPLANE_SOAK=<iterations>` turns on a long run), and CPU tests that run every
-rank's streamer on threads (`tests/unittest/_torch/executor/test_dkv_streamer.py`).
+pattern (`DKV_DATAPLANE_SOAK=<iterations>` turns on a long run), CPU tests that run every
+rank's streamer on threads over a host-memory cache manager
+(`tests/unittest/_torch/executor/test_dkv_streamer.py`) and check what is derived from the
+cache manager (`tests/unittest/_torch/executor/test_dkv_working.py`), and GPU tests that hold
+that derivation against the DeepSeek-V4 cache manager
+(`tests/unittest/_torch/attention/sparse/deepseek_v4/test_dkv_working_cache.py`).
 
 **Consistency checks.** The checker always rejects inconsistent enable flags and
 inconsistent process-level settings (the dual-ledger switch, `TLLM_METRICS_ALL_RANKS`,

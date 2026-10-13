@@ -2097,7 +2097,8 @@ class DkvConfig(StrictBaseModel):
         "without its output being valid (a measurement layout). "
         "'layer_split': each rank keeps only the KV of the layers it owns and "
         "the compute rank fetches and writes back the rest per layer. It "
-        "needs DeepSeek-V4 on SM100 or SM103 and no CUDA graphs; as a "
+        "needs the V2 KV cache manager, attention layers without recurrent "
+        "state or attention sinks, SM100 or SM103 and no CUDA graphs; as a "
         "disaggregated context worker every rank sends the layers it owns.")
 
     @model_validator(mode='after')

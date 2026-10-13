@@ -109,6 +109,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
 from ..dkv_metrics import DkvMeasurementCounters
+from ..dkv_types import LifecycleKey
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -1666,6 +1667,19 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache_config.enable_block_reuse and self.reuse_match_backoff:
             self.max_attention_window_vec = _extend_swa_windows_for_reuse(
                 self.max_attention_window_vec,
+                self.reuse_match_backoff,
+                max_seq_len,
+            )
+        # The same for every layer of the model, also those another rank holds: the life cycles
+        # of the whole model, which the DKV layer split checks its layer ownership against.
+        self._model_attention_windows = _resolve_v2_max_attention_window_vec(
+            kv_cache_config.max_attention_window,
+            max_seq_len,
+            range(self.num_layers),
+        )
+        if kv_cache_config.enable_block_reuse and self.reuse_match_backoff:
+            self._model_attention_windows = _extend_swa_windows_for_reuse(
+                self._model_attention_windows,
                 self.reuse_match_backoff,
                 max_seq_len,
             )
@@ -5170,6 +5184,19 @@ class KVCacheManagerV2(BaseResourceManager):
             f"{len(statistics)} pool groups at cache level {level} for {len(keys)} life cycles"
         )
         return sorted(zip(keys, statistics), key=lambda pair: pair[0])
+
+    def get_layer_life_cycle_keys(self) -> List[frozenset[LifecycleKey]]:
+        """For every model layer, the semantic life cycles its KV lives in.
+
+        A layer of this manager keeps all its KV in one life cycle, the window of the layer; a
+        subclass that gives a model layer several life cycles overrides this. Ranks that own
+        different layers number their life cycles differently, so layer ownership is validated
+        against these keys.
+        """
+        return [
+            frozenset({LifecycleKey(False, int(window) if window else 0, 0, False)})
+            for window in self._model_attention_windows
+        ]
 
     def dkv_model_layer_of(self, layer_id: int, role: DataRole) -> int:
         """The model layer whose KV the buffer ``(layer_id, role)`` of this manager holds.
