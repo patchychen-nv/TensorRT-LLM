@@ -531,7 +531,7 @@ def test_a_writeback_that_arrives_damaged_at_its_owner_fails_the_group_and_is_na
             )
     message = _failure_text(caught.value)
     print(f"the group failed with: {message}")
-    assert f"W({layer})/" in message and "checksums differ" in message, message
+    assert f"W({layer}) of requests" in message and "checksums differ" in message, message
     assert "owner rank 1, compute rank 0" in message, message
 
 
@@ -610,7 +610,7 @@ def test_a_fetch_that_arrives_damaged_at_the_compute_rank_fails_the_group_and_is
         options, tmp_path / "group.log", "checksums differ"
     )
     assert "DKV_GROUP_CHILD_DONE" not in output, "the group served the damaged fetch"
-    assert f"F({layer})/" in output and "checksums differ" in output, output[-4000:]
+    assert f"F({layer}) of requests" in output and "checksums differ" in output, output[-4000:]
     assert "owner rank 1, compute rank 0" in output, output[-4000:]
 
 
