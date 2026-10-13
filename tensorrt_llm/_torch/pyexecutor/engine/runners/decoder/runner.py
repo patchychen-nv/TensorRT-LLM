@@ -2717,6 +2717,25 @@ class DecoderRunner(ScheduledModelRunner):
                 return view
         return kv_cache_manager
 
+    def _begin_staged_batch(self, attn_metadata) -> None:
+        """Give the requests of a staged forward pass their pages before the metadata is prepared.
+
+        The working cache of the DKV layer split holds pages only for the requests of the pass, and
+        the metadata builds its block tables from them.
+        """
+        if not self.dkv_staging:
+            return
+        manager = attn_metadata.kv_cache_manager
+        if not isinstance(manager, KVCacheManagerV2):
+            return
+        num_staged = attn_metadata.num_contexts + attn_metadata.num_generations
+        manager.begin_staged_batch(
+            attn_metadata.request_ids,
+            [int(n) for n in attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:num_staged]],
+            attn_metadata.seq_lens[:num_staged].tolist(),
+            attn_metadata.num_contexts,
+        )
+
     def _end_staged_forward(self, inputs: dict[str, Any]) -> None:
         """Return the pages of the last layer to the cache manager after a staged forward pass."""
         attn_metadata = inputs.get("attn_metadata", None)
@@ -3136,6 +3155,7 @@ class DecoderRunner(ScheduledModelRunner):
         attn_metadata.kv_cache_manager = self._attention_cache_manager(kv_cache_manager)
         if hasattr(self.model.model_config.pretrained_config, "chunk_size"):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
+        self._begin_staged_batch(attn_metadata)
         with nvtx_range("steady_gen_metadata_prepare"):
             attn_metadata.prepare()
 
@@ -4220,6 +4240,7 @@ class DecoderRunner(ScheduledModelRunner):
                     self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
                 ),
             )
+        self._begin_staged_batch(attn_metadata)
         attn_metadata.prepare()
         extra_model_inputs = extra_inputs.build(attn_metadata, resource_manager)
 

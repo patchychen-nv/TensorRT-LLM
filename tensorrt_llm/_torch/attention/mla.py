@@ -957,6 +957,7 @@ class MLA(nn.Module):
         latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the dense or sparse implementation of the shared MLA module."""
+        attn_metadata.begin_layer(self.layer_idx)
         if self.sparse_attn_hooks is not None:
             self.sparse_attn_hooks.forward(
                 self,

@@ -5188,14 +5188,24 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         """Give the requests of a forward pass the pages they compute in.
 
-        The attention metadata calls this before it builds the block tables of a pass. It does
-        something only when this manager is the working cache of the DKV layer split
+        The model runner calls this before the attention metadata builds the block tables of a
+        pass. It does something only when this manager is the working cache of the DKV layer split
         (``dkv_working_session`` is set): then every request gets a cache with ``history_tokens``
         cached and ``new_tokens`` new tokens, and the data plane learns where they are.
         """
         session = self.dkv_working_session
         if session is not None:
             session.begin_batch(request_ids, history_tokens, new_tokens)
+
+    def begin_layer(self, layer_idx: int) -> None:
+        """Called by the attention of a layer before it reads or writes the KV of the layer.
+
+        In the working cache of the DKV layer split, the data plane brings the KV of the layer in
+        first; any other manager does nothing.
+        """
+        streamer = self.dkv_streamer
+        if streamer is not None:
+            streamer.on_layer(layer_idx)
 
     def dkv_open_cache(self, request_id: int, history_length: int, capacity: int) -> bool:
         """Give ``request_id`` pages for ``capacity`` tokens of which the first ``history_length``

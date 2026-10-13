@@ -918,6 +918,7 @@ class Attention(nn.Module):
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
     ):
+        attn_metadata.begin_layer(self.layer_idx)
         num_tokens = attn_metadata.num_tokens
 
         q = q[:num_tokens, :]

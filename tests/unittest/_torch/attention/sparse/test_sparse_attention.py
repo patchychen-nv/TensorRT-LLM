@@ -138,17 +138,21 @@ def test_mla_backend_only_forward_uses_default_path() -> None:
     mla = MLA.__new__(MLA)
     torch.nn.Module.__init__(mla)
     mla.sparse_attn_hooks = hooks
+    mla.layer_idx = 3
     default_forward = Mock()
     mla._forward_impl = default_forward
     hidden_states = torch.empty(0)
     attn_output = [torch.empty(0)]
+    attn_metadata = Mock()
 
-    MLA.forward_impl(mla, None, hidden_states, None, attn_output)
+    MLA.forward_impl(mla, None, hidden_states, attn_metadata, attn_output)
 
+    # The layer is announced to the cache manager before its KV is touched.
+    attn_metadata.begin_layer.assert_called_once_with(3)
     default_forward.assert_called_once_with(
         None,
         hidden_states,
-        None,
+        attn_metadata,
         attn_output[0],
         latent_cache_gen=None,
     )

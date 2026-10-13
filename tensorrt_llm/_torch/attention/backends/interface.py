@@ -343,6 +343,16 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def begin_layer(self, layer_idx: int) -> None:
+        """Called by the attention of a layer before it reads or writes the KV cache of the layer.
+
+        A KV cache manager that brings the KV of a layer in only when the layer runs, as the
+        working cache of the DKV layer split does, does it now; any other manager does nothing.
+        """
+        begin_layer = getattr(self.kv_cache_manager, "begin_layer", None)
+        if begin_layer is not None:
+            begin_layer(layer_idx)
+
     def prepare_encoder_only(self) -> None:
         """Hook for encoder-only (no-KV-cache) forward setup.
 

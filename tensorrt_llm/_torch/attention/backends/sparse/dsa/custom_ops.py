@@ -122,6 +122,8 @@ def mla_dsa_attn_inplace(
     attention. This op is excluded from CUDA graph capture.
     """
     metadata, mla_layer = _extract_extra_attrs(layer_idx)
+    # The registered path skips MLA.forward_impl, which announces the layer otherwise.
+    metadata.begin_layer(mla_layer.layer_idx)
     _forward_dsa_attn(
         mla_layer,
         q,

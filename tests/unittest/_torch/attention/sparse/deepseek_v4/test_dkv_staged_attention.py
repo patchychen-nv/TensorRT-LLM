@@ -375,6 +375,9 @@ class _Flow:
         extra_attrs["attention_metadata"] = weakref.ref(metadata)
         outputs = []
         with torch.inference_mode(), model_extra_attrs(extra_attrs):
+            if self.working is not None:
+                # What the model runner does before it prepares the metadata of a staged pass.
+                self.working.begin_staged_batch(order, history, new_tokens, len(step.contexts))
             metadata.prepare()
             for layer_index, layer in enumerate(model.layers):
                 generator = torch.Generator(device="cuda").manual_seed(
