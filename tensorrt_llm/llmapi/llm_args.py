@@ -7053,9 +7053,9 @@ class TorchLlmArgs(BaseLlmArgs):
         """Reject what the layer-split data plane cannot host.
 
         The data plane is planned on the host and enqueued layer by layer, so
-        it cannot run inside a replayed CUDA graph or a compiled region. Its
-        staging buffers and its page budget follow the DeepSeek-V4 cache
-        layout that thop.attention reads on SM100/SM103.
+        it cannot run inside a replayed CUDA graph or a compiled region. The
+        quantized KV cache dtypes and the KV cache offload of sparse attention
+        have not been run with it.
         """
         suffix = "is not supported with dkv_config layer_split yet"
         if self.cuda_graph_config is not None:
