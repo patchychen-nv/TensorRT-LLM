@@ -6426,14 +6426,16 @@ class PyExecutor:
         """Validate the resolved model, resource managers and runtime features."""
         from ..attention.backends.sparse.deepseek_v4.cache_manager import \
             DeepseekV4CacheManager
+        from ..attention.backends.sparse.dsa import DSACacheManagerV2
         from ..disaggregation.transceiver import KvCacheTransceiverV2
 
         if type(self.kv_cache_manager) not in (KVCacheManagerV2,
-                                               DeepseekV4CacheManager):
+                                               DeepseekV4CacheManager,
+                                               DSACacheManagerV2):
             raise ValueError(
                 f"{type(self.kv_cache_manager).__name__} is not supported with "
-                "dkv_config yet; use KVCacheManagerV2 or DeepseekV4CacheManager."
-            )
+                "dkv_config yet; use KVCacheManagerV2, DeepseekV4CacheManager "
+                "or DSACacheManagerV2.")
         if self.is_encoder_decoder:
             raise ValueError(
                 "Encoder-decoder models are not supported with dkv_config yet.")

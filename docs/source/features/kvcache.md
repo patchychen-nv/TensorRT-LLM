@@ -490,8 +490,9 @@ resolves to `PYTHON` under DKV. Pipelined transfer and the FP4 MLA ownership
 bridge are unsupported. Pipeline/context parallelism, speculative and guided
 decoding, LoRA, KV connectors, attention-DP balancing and cache-aware routing,
 SWA scratch reuse, pool rebalancing, and disk prefetch are also unsupported.
-The runtime accepts the base V2 manager and the DeepSeek-V4 manager; other V2
-subclasses have additional state that is not covered by this prototype.
+The runtime accepts the base V2 manager, the DeepSeek-V4 manager and the DSA
+manager of DeepSeek sparse attention models such as GLM-5.3; other V2 subclasses
+have additional state that is not covered by this prototype.
 
 **Disaggregated context worker.** Add this configuration on the context worker,
 and configure a generation worker without `dkv_config` using the matching model
@@ -788,7 +789,12 @@ rank's streamer on threads over a host-memory cache manager
 (`tests/unittest/_torch/executor/test_dkv_streamer.py`) and check what is derived from the
 cache manager (`tests/unittest/_torch/executor/test_dkv_working.py`), and GPU tests that hold
 that derivation against the DeepSeek-V4 cache manager
-(`tests/unittest/_torch/attention/sparse/deepseek_v4/test_dkv_working_cache.py`).
+(`tests/unittest/_torch/attention/sparse/deepseek_v4/test_dkv_working_cache.py`) and run the
+data plane on the DSA cache manager of GLM-5.3, with its indexer K cache
+(`tests/unittest/_torch/attention/sparse/dsa/test_dkv_dsa_data_plane.py`).
+`tests/integration/defs/dkv/test_dkv_glm5.py` runs GLM-5.3 on four ranks, with the checkpoint
+in `DKV_GLM5_PATH`: both layouts against an attention-DP group, and the layer split with and
+without the checksums and with prompts chunked one block at a time.
 
 **Consistency checks.** The checker always rejects inconsistent enable flags and
 inconsistent process-level settings (the dual-ledger switch, `TLLM_METRICS_ALL_RANKS`,

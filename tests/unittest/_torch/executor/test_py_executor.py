@@ -3794,6 +3794,11 @@ class TestDkvRuntimeValidation:
 
         self._make_executor(DeepseekV4CacheManager)._validate_dkv_runtime()
 
+    def test_accepts_dsa_manager(self):
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
+
+        self._make_executor(DSACacheManagerV2)._validate_dkv_runtime()
+
     def test_rejects_v1_manager(self):
         with pytest.raises(ValueError, match="not supported with dkv_config yet"):
             self._make_executor(types.SimpleNamespace)._validate_dkv_runtime()

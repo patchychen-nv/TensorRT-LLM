@@ -78,6 +78,15 @@ DEEPSEEK_V4 = DkvModel(
     # Its blocks span several cache groups; 2 GiB dropped part of the spilled prefixes.
     host_cache_bytes=64 << 30,
 )
+# GLM-5.3 (DSA sparse MLA, 78 layers, FP8 block-scaled weights, about 700 GB) runs only in the suite
+# that names it, test_dkv_glm5.py: one build takes minutes and needs four Blackwell GPUs.
+GLM_5 = DkvModel(
+    "glm-5.3",
+    "GLM-5.3",
+    64,
+    precision=NOISY_POLICY,
+    path_env="DKV_GLM5_PATH",
+)
 MODELS = (TINY_LLAMA, DEEPSEEK_V3_LITE, DEEPSEEK_V4)
 MODEL_IDS = [model.pytest_id for model in MODELS]
 PRECISION_MODELS = [model for model in MODELS if model.precision is not None]
