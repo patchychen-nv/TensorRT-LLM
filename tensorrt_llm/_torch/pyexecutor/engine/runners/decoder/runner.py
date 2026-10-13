@@ -2708,7 +2708,7 @@ class DecoderRunner(ScheduledModelRunner):
     def _attention_cache_manager(self, kv_cache_manager):
         """The cache manager the attention metadata reads.
 
-        It is the staged view of the manager when DKV stages the layers' KV, the manager itself
+        It is the working cache of the manager when DKV stages the layers' KV, the manager itself
         otherwise.
         """
         if self.dkv_staging and isinstance(kv_cache_manager, KVCacheManagerV2):

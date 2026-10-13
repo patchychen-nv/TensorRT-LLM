@@ -32,12 +32,7 @@ from dkv_test_utils import LockstepTpGroup, make_request
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.dkv import DkvInvariantChecker, compute_ownership
-from tensorrt_llm._torch.pyexecutor.dkv_plan import (
-    PageCost,
-    build_dkv_plan,
-    layer_types_from_compress_ratios,
-    plan_fingerprint,
-)
+from tensorrt_llm._torch.pyexecutor.dkv_plan import PageCost, build_dkv_plan, plan_fingerprint
 from tensorrt_llm._torch.pyexecutor.llm_request import FinishReason, LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
@@ -179,9 +174,14 @@ class LoopScript:
 
 
 class _PageCosts:
-    """A plan cost model of invented sizes: some pages to fetch, some to write back."""
+    """A plan cost model of invented buffers and sizes: some pages to fetch, some to write back."""
 
-    def page_cost(self, layer: int, kind, history: int, chunk: int) -> PageCost:
+    _BUFFERS = (("kv",), ("compressed", "kv", "state"), ("kv", "state"))
+
+    def buffers_of(self, layer: int) -> tuple[str, ...]:
+        return self._BUFFERS[layer % len(self._BUFFERS)]
+
+    def page_cost(self, layer: int, buffer: str, history: int, chunk: int) -> PageCost:
         return PageCost(512, history // 4 % 3, 1 + chunk // 4)
 
 
@@ -200,7 +200,6 @@ class PlanStreamer:
         self._skip_drain = skip_drain
         self._drained = True
         self._owners = compute_ownership(self.NUM_LAYERS, group_size)
-        self._layer_types = layer_types_from_compress_ratios([1, 4, 128] * 2)
         self.plans: list = []
         self.planned: list = []
         self.last_plan = None
@@ -211,12 +210,7 @@ class PlanStreamer:
             requests = requests[1:]
         self.planned.append(requests)
         return build_dkv_plan(
-            requests,
-            self._owners,
-            self._layer_types,
-            _PageCosts(),
-            group_size=self._group_size,
-            ring_depth=2,
+            requests, self._owners, _PageCosts(), group_size=self._group_size, ring_depth=2
         )
 
     def set_plan(self, plan, iteration: int = 0) -> None:

@@ -1412,9 +1412,16 @@ class KVCacheManagerV2(BaseResourceManager):
     _dkv_lifecycle_keys: list | None = None
     _dkv_trace_enabled = False
     _dkv_measurement: DkvMeasurementCounters | None = None
-    # What the attention backend reads instead of this manager when DKV stages the layers' KV
-    # (``DkvStagedKvView``); the executor sets it.
+    # What the attention backend reads instead of this manager when DKV stages the layers' KV:
+    # the working cache of the layer split, a second manager that covers every layer. The executor
+    # sets it.
     dkv_staged_view = None
+    # Set on the working cache of the DKV layer split: opens the caches of the requests of every
+    # forward pass (``begin_staged_batch``).
+    dkv_working_session = None
+    # Set on the working cache of the DKV layer split: the data plane, whose hooks the attention
+    # calls at every layer.
+    dkv_streamer = None
     # A subclass whose pools are not all addressed at `tokens_per_block` token
     # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
     #
@@ -5163,6 +5170,68 @@ class KVCacheManagerV2(BaseResourceManager):
             f"{len(statistics)} pool groups at cache level {level} for {len(keys)} life cycles"
         )
         return sorted(zip(keys, statistics), key=lambda pair: pair[0])
+
+    def dkv_model_layer_of(self, layer_id: int, role: DataRole) -> int:
+        """The model layer whose KV the buffer ``(layer_id, role)`` of this manager holds.
+
+        A manager that gives a model layer several V2 layers, one per group of its cache roles,
+        overrides this.
+        """
+        return self.pp_layers[int(layer_id)]
+
+    def begin_staged_batch(
+        self,
+        request_ids: Sequence[int],
+        history_tokens: Sequence[int],
+        new_tokens: Sequence[int],
+        num_contexts: int,
+    ) -> None:
+        """Give the requests of a forward pass the pages they compute in.
+
+        The attention metadata calls this before it builds the block tables of a pass. It does
+        something only when this manager is the working cache of the DKV layer split
+        (``dkv_working_session`` is set): then every request gets a cache with ``history_tokens``
+        cached and ``new_tokens`` new tokens, and the data plane learns where they are.
+        """
+        session = self.dkv_working_session
+        if session is not None:
+            session.begin_batch(request_ids, history_tokens, new_tokens)
+
+    def dkv_open_cache(self, request_id: int, history_length: int, capacity: int) -> bool:
+        """Give ``request_id`` pages for ``capacity`` tokens of which the first ``history_length``
+        count as already cached.
+
+        The cache holds a page for every block that its life cycles keep at that history: the
+        whole history of a full-attention life cycle, the blocks still inside the window of a
+        sliding-window one. Its base page indices go to the host tables the attention metadata
+        reads, like those of any request. The working cache of the DKV layer split opens one per
+        request a rank computes in an iteration and closes it at the end of the iteration.
+
+        Returns:
+            False when the pages do not fit; the request then holds nothing.
+        """
+        kv_cache = self._create_kv_cache(request_id, None, None, is_dummy=True)
+        if kv_cache is None:
+            return False
+        if not self._resume_and_restore(request_id, kv_cache) or not kv_cache.resize(
+            capacity, history_length
+        ):
+            self.dkv_close_cache(request_id)
+            return False
+        return True
+
+    def dkv_close_cache(self, request_id: int) -> None:
+        """Release the cache ``dkv_open_cache`` gave ``request_id``, if it has one."""
+        kv_cache = self.kv_cache_map.pop(request_id, None)
+        if kv_cache is None:
+            return
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
+            self.sparse_metadata_batch.remove(kv_cache)
+        kv_cache.discard_pending_stats()
+        kv_cache.close()
+        self.impl.clear_stats_excluded(request_id)
+        self.index_mapper.remove_sequence(request_id)
 
     def get_dkv_startup_settings(self) -> dict[str, object]:
         """Process-level choices that every rank of a DKV group must make identically."""

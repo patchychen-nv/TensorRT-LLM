@@ -22,17 +22,11 @@ import torch
 from dkv_test_utils import LockstepTpGroup, make_request
 
 from tensorrt_llm._torch.pyexecutor.dkv import DkvControlResult, DkvInvariantChecker
-from tensorrt_llm._torch.pyexecutor.dkv_staging import (
-    DEFAULT_STAGING_HISTORY_BYTES,
-    StagingGeometry,
-    StagingLayout,
-)
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import ExecutorRequest, LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import merge_requests_to_llm_requests
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests, SchedulerOutput
-from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.llmapi import DisaggScheduleStyle
@@ -347,7 +341,6 @@ def _staging_executor(
     group_size: int = 4,
     layer_split: bool = True,
 ) -> PyExecutor:
-    """An executor whose cache manager has the geometry of DeepSeek-V4-Pro, BF16 KV, FP4 indexer."""
     executor = PyExecutor.__new__(PyExecutor)
     executor.model_engine = None
     executor.draft_model_engine = None
@@ -358,77 +351,14 @@ def _staging_executor(
         max_seq_len=max_seq_len,
         max_num_tokens=max_num_tokens,
         num_layers=43,
-        _compress_ratios=(1, 1) + tuple(4 if layer % 2 == 0 else 128 for layer in range(41)),
-        tokens_per_block=128,
-        head_dim=512,
-        index_head_dim=128,
-        dtype=DataType.BF16,
-        _indexer_k_dtype="fp4",
-        _swa_window_size=128,
-        _max_draft_len=0,
     )
     return executor
 
 
-def _history_bytes(manager, staging_tokens: int, slot_copies: int) -> int:
-    """What the pages of the kinds that keep the history take in ``slot_copies`` slots."""
-    layout = StagingLayout(
-        StagingGeometry.from_cache_manager(manager, max_staging_tokens=staging_tokens)
-    )
-    return slot_copies * sum(
-        layout.slot_pages(kind) * layout.kind_page_bytes(kind)
-        for kind in layout.kinds
-        if layout.window(kind) is None
-    )
-
-
-def _default_staging_tokens(monkeypatch, executor: PyExecutor) -> int:
+def test_the_staged_tokens_are_left_to_the_working_cache_unless_set(monkeypatch) -> None:
+    """Without the setting the working cache decides them from its layers (``WorkingCacheSizing``)."""
     monkeypatch.delenv("TRTLLM_DKV_STAGING_TOKENS", raising=False)
-    monkeypatch.delenv("TRTLLM_DKV_STAGING_DEPTH", raising=False)
-    return executor._dkv_staging_settings()["staging_tokens"]
-
-
-@pytest.mark.parametrize(
-    "shape,staging_tokens",
-    [
-        # Every request of the batch at max_seq_len.
-        ((4, 1000, 300), 4000),
-        ((8, 4096, 4096), 32768),
-        # A batch of one request.
-        ((1, 1000, 300), 1000),
-        # At least one full chunk.
-        ((1, 100, 300), 300),
-    ],
-)
-def test_the_default_staging_area_holds_every_request_of_the_batch_at_max_seq_len(
-    monkeypatch, shape, staging_tokens
-) -> None:
-    assert _default_staging_tokens(monkeypatch, _staging_executor(*shape)) == staging_tokens
-
-
-@pytest.mark.parametrize("group_size", [2, 4, 8])
-def test_a_long_max_seq_len_stages_as_many_tokens_as_the_history_budget_holds(
-    monkeypatch, group_size: int
-) -> None:
-    """The budget covers the ring of the staging area and a slot per peer in each message arena."""
-    executor = _staging_executor(8, 131072, 4096, group_size=group_size)
-    tokens = _default_staging_tokens(monkeypatch, executor)
-    assert tokens < 8 * 131072
-    slot_copies = 2 + 2 * (group_size - 1)
-    manager = executor.kv_cache_manager
-    assert _history_bytes(manager, tokens, slot_copies) <= DEFAULT_STAGING_HISTORY_BYTES
-    assert _history_bytes(manager, tokens + 1, slot_copies) > DEFAULT_STAGING_HISTORY_BYTES
-
-
-def test_the_default_staging_area_still_holds_a_long_request_next_to_a_chunk(monkeypatch) -> None:
-    executor = _staging_executor(8, 1 << 20, 4096)
-    assert _default_staging_tokens(monkeypatch, executor) == (1 << 20) + 4096
-
-
-def test_the_staging_loopback_budgets_only_the_ring_of_its_slots(monkeypatch) -> None:
-    """Without the message arenas of the layer split the history budget holds the whole batch."""
-    executor = _staging_executor(8, 131072, 4096, layer_split=False)
-    assert _default_staging_tokens(monkeypatch, executor) == 8 * 131072
+    assert _staging_executor()._dkv_staging_settings()["staging_tokens"] is None
 
 
 def test_a_staging_area_below_one_request_of_max_seq_len_is_rejected(monkeypatch) -> None:
@@ -450,18 +380,6 @@ def test_the_messages_of_a_step_go_out_as_one_nccl_group_unless_turned_off(
     else:
         monkeypatch.setenv("TRTLLM_DKV_P2P_GROUPS", value)
     assert _staging_executor()._dkv_layer_split_settings()["p2p_groups"] is grouped
-
-
-@pytest.mark.parametrize("value,native", [(None, True), ("1", True), ("0", False)])
-def test_the_cpp_executor_carries_out_the_data_plane_unless_turned_off(
-    monkeypatch, value, native: bool
-) -> None:
-    monkeypatch.delenv("TRTLLM_DKV_STAGING_TOKENS", raising=False)
-    if value is None:
-        monkeypatch.delenv("TRTLLM_DKV_NATIVE", raising=False)
-    else:
-        monkeypatch.setenv("TRTLLM_DKV_NATIVE", value)
-    assert _staging_executor()._dkv_layer_split_settings()["native_data_plane"] is native
 
 
 @pytest.mark.parametrize("checks", [False, True])
@@ -487,12 +405,23 @@ def test_the_plan_is_fingerprinted_only_when_the_checks_are_on(monkeypatch, chec
     assert checked == ([(3, "data plane plan", "fingerprint")] if checks else [])
 
 
-def test_the_staged_view_publishes_its_token_budget_to_the_scheduler() -> None:
+def test_the_working_cache_serves_the_attention_and_publishes_its_budget_to_the_scheduler() -> None:
     executor = _staging_executor()
-    executor.model_engine = SimpleNamespace()
-    executor._install_dkv_staged_view("view", {"staging_tokens": 1300})
-    assert executor.kv_cache_manager.dkv_staged_view == "view"
+    executor.model_engine = SimpleNamespace(attn_metadata="built on the owner's cache")
+    working = SimpleNamespace(dkv_close_cache=Mock())
+    streamer = SimpleNamespace()
+    executor._install_dkv_working_cache(working, streamer, {"staging_tokens": 1300})
+    assert executor.kv_cache_manager.dkv_staged_view is working
     assert executor.kv_cache_manager.dkv_max_staging_tokens == 1300
+    assert executor.model_engine.attn_metadata is None and executor.model_engine.dkv_staging
+    assert executor.dkv_streamer is streamer and working.dkv_streamer is streamer
+    session = working.dkv_working_session
+    assert session.manager is working and session.streamer is streamer
+    # The pages of an iteration go back once the data plane is drained.
+    session._open.extend([5, 6])
+    executor._end_dkv_working_batch()
+    assert [call.args for call in working.dkv_close_cache.call_args_list] == [(5,), (6,)]
+    assert session.request_ids == ()
 
 
 def _scheduled_executor(dist, *, trace, requests, checker_enabled=True) -> PyExecutor:

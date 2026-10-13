@@ -411,6 +411,10 @@ class PyExecutor:
     # The data plane that moves the KV of the layers between their owners and the ranks that compute
     # them under the layer-split layout; ``None`` otherwise.
     dkv_streamer = None
+    # The working cache the attention of every layer runs in when the KV is staged, and whether
+    # this rank stages only its own layers (``TRTLLM_DKV_STAGING_LOOPBACK``).
+    _dkv_working = None
+    _dkv_loopback: bool = False
     _dkv_control_plane_stats: _DkvControlPlaneStats | None = None
 
     def __init__(
@@ -872,7 +876,7 @@ class PyExecutor:
                     "Speculative decoding with CUDA graph is not supported "
                     "for encoder-decoder models.")
 
-        # The warm-up forward passes already read the staged view of the cache.
+        # The warm-up forward passes already run in the working cache.
         self._initialize_dkv_staging()
 
         # Synchronize all ranks before warmup. This prevents a PP
@@ -1915,6 +1919,12 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        working = getattr(self, "_dkv_working", None)
+        if working is not None:
+            # The working cache of the DKV layer split is not a resource manager of the executor.
+            working.dkv_working_session.end()
+            working.shutdown()
+            self._dkv_working = None
         # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
         # also invoked mid-init by configure_kv_cache_capacity() in
         # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
@@ -5171,8 +5181,12 @@ class PyExecutor:
                     if self.dkv_streamer is not None:
                         # The pages of the batch are allocated; the data plane
                         # of the iteration starts with the first layer.
-                        self.dkv_streamer.set_plan(
-                            self._dkv_plan(scheduled_batch), self.iter_counter)
+                        if self._dkv_loopback:
+                            self.dkv_streamer.set_staged_plan(self.iter_counter)
+                        else:
+                            self.dkv_streamer.set_plan(
+                                self._dkv_plan(scheduled_batch),
+                                self.iter_counter)
                     with self._step_scope(forward_batch):
                         if scheduled_batch.encoder_requests:
                             self._submit_encoder_step(
@@ -5239,6 +5253,7 @@ class PyExecutor:
                                 self.dkv_streamer.drain(
                                     self.dkv_staging_settings[
                                         "transport_timeout_s"]))
+                            self._end_dkv_working_batch()
 
                     if self._is_kv_manager_v2:
                         # Finalize V2 context KV before disagg transfer/response
@@ -6475,27 +6490,31 @@ class PyExecutor:
             self._validate_dkv_layer_split_runtime()
 
     def _initialize_dkv_staging(self) -> None:
-        """Stage the KV of the layers for the attention backend, when DKV asks for it.
+        """Run the attention of every layer in a working cache, when DKV asks for it.
 
-        ``TRTLLM_DKV_STAGING_LOOPBACK=1`` runs the replicated layout through the staging area:
-        every rank owns every layer, so each layer's cached pages are copied from the rank's own
-        cache manager into the staging slot before its attention and the pages the new tokens
-        wrote are copied back. It exists to prove the staging path on its own, without any
-        transfer between ranks. ``TRTLLM_DKV_STAGING_DEPTH`` sets the ring depth,
-        ``TRTLLM_DKV_STAGING_TOKENS`` the cached and new tokens, summed over its requests, that one
-        rank may stage in an iteration (default: see ``_default_dkv_staging_tokens``)
-        and ``TRTLLM_DKV_STAGING_FILL=nan`` overwrites the slots of a layer with NaN before its
-        pages are fetched, so a page that is read without having been fetched or written turns
-        the output into NaN.
+        Under ``kv_layout="layer_split"`` the cache manager of a rank holds only the layers it owns.
+        The attention of every layer runs in the *working cache*, a second instance of the
+        manager's class that covers every layer and holds pages only for the requests the rank
+        computes in an iteration, and a ``DkvStreamer`` moves the pages of each layer between the
+        owners and the working caches of the ranks that compute (see
+        ``_initialize_dkv_layer_split``).
 
-        Under ``kv_layout="layer_split"`` the same staging area serves the real layout: the cache
-        manager of a rank holds only the layers it owns and a ``DkvStreamer`` moves the pages
-        between the owners and the ranks that compute (see ``_initialize_dkv_layer_split``).
-        ``TRTLLM_DKV_TRANSPORT_TIMEOUT_S`` bounds how long the host waits for the data plane at
-        the end of an iteration.
+        ``TRTLLM_DKV_STAGING_LOOPBACK=1`` runs the replicated layout the same way: every rank owns
+        every layer, so the pages of a layer are copied from the rank's own cache into the working
+        cache before its attention and the pages the new tokens wrote are copied back. It exists to
+        prove the working cache on its own, without any transfer between ranks.
+        ``TRTLLM_DKV_STAGING_DEPTH`` sets how many layers ahead of its attention a layer is fetched,
+        plus one, ``TRTLLM_DKV_STAGING_TOKENS`` the cached and new tokens, summed over its requests,
+        that one rank may stage in an iteration (default: see ``WorkingCacheSizing``) and
+        ``TRTLLM_DKV_STAGING_FILL=nan`` overwrites the working pages of a layer with NaN before its
+        pages are fetched, so a page that is read without having been fetched or written turns the
+        output into NaN. ``TRTLLM_DKV_TRANSPORT_TIMEOUT_S`` bounds how long the host waits for the
+        data plane at the end of an iteration.
         """
         self.dkv_staging_settings: dict[str, object] = {}
         self.dkv_streamer = None
+        self._dkv_working = None
+        self._dkv_loopback = False
         if getattr(self, "dkv_layer_split", False) is True:
             self._initialize_dkv_layer_split()
             return
@@ -6505,105 +6524,117 @@ class PyExecutor:
             logger.warning(
                 "TRTLLM_DKV_STAGING_LOOPBACK is ignored without dkv_config")
             return
-        from ..attention.backends.sparse.deepseek_v4.cache_manager import \
-            DeepseekV4CacheManager
-        from .dkv_streamer import LoopbackStreamer
-
-        manager = self.kv_cache_manager
-        if type(manager) is not DeepseekV4CacheManager:
-            raise ValueError(
-                "TRTLLM_DKV_STAGING_LOOPBACK is not supported with "
-                f"{type(manager).__name__}; use DeepseekV4CacheManager.")
         if self.llm_args.cuda_graph_config is not None:
             raise ValueError(
                 "TRTLLM_DKV_STAGING_LOOPBACK is not supported with CUDA graphs; "
                 "set cuda_graph_config to null")
+        from .dkv_streamer import DkvStreamer
+
+        manager = self.kv_cache_manager
         settings = {"staging_loopback": True, **self._dkv_staging_settings()}
-        pool, view = self._create_dkv_staged_view(settings)
-        view.dkv_streamer = LoopbackStreamer(manager,
-                                             view,
-                                             fill=settings["staging_fill"])
-        self._install_dkv_staged_view(view, settings)
+        working = self._create_dkv_working_cache(settings, arena_copies=0)
+        # Every layer is this rank's own: a group of one rank, every step a local copy.
+        streamer = DkvStreamer(manager,
+                               working,
+                               None, (0, ) * manager.num_layers,
+                               0,
+                               group_size=1,
+                               ring_depth=settings["staging_depth"],
+                               fill=settings["staging_fill"])
+        self._dkv_loopback = True
+        self._install_dkv_working_cache(working, streamer, settings)
         logger.info(
-            f"DKV staging loopback: {pool.bytes_reserved / (1 << 20):.0f} MiB, "
-            f"ring depth {settings['staging_depth']}, "
-            f"{settings['staging_tokens']} staged tokens per iteration")
+            f"DKV staging loopback: working cache of {settings['staging_tokens']} staged "
+            f"tokens per iteration in {self._dkv_working_memory(working, streamer)}, "
+            f"fetched {settings['staging_depth'] - 1} layer(s) ahead")
+
+    @staticmethod
+    def _dkv_working_memory(working, streamer) -> str:
+        """What the working cache and the message buffers of the data plane take on the GPU."""
+        from .dkv_working import working_cache_bytes
+
+        pages = working_cache_bytes(working.kv_cache_manager_py_config)
+        return (
+            f"{pages / (1 << 20):.0f} MiB of pages and "
+            f"{streamer.message_bytes / (1 << 20):.0f} MiB of message buffers")
 
     def _dkv_staging_settings(self) -> dict[str, object]:
-        """What the ranks must agree on to build the same staging area.
+        """What the ranks must agree on to build the same working cache.
 
-        The slots hold the cached and the new tokens of the requests a rank schedules in one
-        iteration, and the scheduler admits requests only while their sum fits. A request of
-        ``max_seq_len`` must fit alone.
+        The working cache holds the cached and the new tokens of the requests a rank schedules in
+        one iteration, and the scheduler admits requests only while their sum fits. A request of
+        ``max_seq_len`` must fit alone. Without ``TRTLLM_DKV_STAGING_TOKENS`` the sum is decided
+        when the working cache is built (``WorkingCacheSizing``).
         """
         manager = self.kv_cache_manager
         staging_depth = int(os.environ.get("TRTLLM_DKV_STAGING_DEPTH", "2"))
         staging_tokens = os.environ.get("TRTLLM_DKV_STAGING_TOKENS")
-        staging_tokens = (int(staging_tokens) if staging_tokens is not None else
-                          self._default_dkv_staging_tokens(staging_depth))
-        if staging_tokens < manager.max_seq_len:
+        staging_tokens = int(
+            staging_tokens) if staging_tokens is not None else None
+        if staging_tokens is not None and staging_tokens < manager.max_seq_len:
             raise ValueError(
                 f"TRTLLM_DKV_STAGING_TOKENS ({staging_tokens}) must hold one "
                 f"request of max_seq_len ({manager.max_seq_len} tokens)")
         return {
-            "staging_depth": staging_depth,
-            "staging_tokens": staging_tokens,
-            "staging_fill": os.environ.get("TRTLLM_DKV_STAGING_FILL", ""),
+            "staging_depth":
+            staging_depth,
+            "staging_tokens":
+            staging_tokens,
+            "staging_fill":
+            os.environ.get("TRTLLM_DKV_STAGING_FILL", ""),
+            "transport_timeout_s":
+            float(os.environ.get("TRTLLM_DKV_TRANSPORT_TIMEOUT_S", "60")),
         }
 
-    def _default_dkv_staging_tokens(self, staging_depth: int) -> int:
-        """The tokens a rank stages per iteration when ``TRTLLM_DKV_STAGING_TOKENS`` is not set.
+    def _create_dkv_working_cache(self, settings: dict[str, object], *,
+                                  arena_copies: int):
+        """The working cache: the cache manager's class over every layer, for one rank's batch.
 
-        Every request of the batch at ``max_seq_len``, so that the staging area never holds a
-        request back, unless the history pages of that many tokens would take more than
-        ``DEFAULT_STAGING_HISTORY_BYTES`` in the slots of the rank. Then it is the most tokens
-        that fit, but never fewer than a request of ``max_seq_len`` next to a full chunk, as far
-        as the batch holds that much, nor than one full chunk.
+        ``arena_copies`` are the message buffers of the data plane that hold one layer's pages
+        each; the default staged tokens keep the history pages of the cache and of those buffers
+        within ``DEFAULT_STAGING_HISTORY_BYTES``. Sets ``settings["staging_tokens"]``.
         """
-        from .dkv_staging import (DEFAULT_STAGING_HISTORY_BYTES,
-                                  StagingGeometry, StagingLayout)
-        from .dkv_streamer import arena_peers
+        from .dkv_working import (DEFAULT_STAGING_HISTORY_BYTES,
+                                  WorkingCacheSizing)
 
         manager = self.kv_cache_manager
-        full_batch = manager.max_batch_size * manager.max_seq_len
-        least = max(
-            min(full_batch, manager.max_seq_len + manager.max_num_tokens),
-            manager.max_num_tokens)
-        layout = StagingLayout(
-            StagingGeometry.from_cache_manager(manager,
-                                               max_staging_tokens=least,
-                                               ring_depth=staging_depth))
-        slot_copies = staging_depth
-        if getattr(self, "dkv_layer_split", False) is True:
-            # The send and the receive arena of the data plane hold a slot for every peer.
-            slot_copies += 2 * arena_peers(self.dist.tp_size)
-        within = layout.max_tokens_within(DEFAULT_STAGING_HISTORY_BYTES,
-                                          slot_copies)
-        return max(least,
-                   full_batch if within is None else min(full_batch, within))
+        factory = getattr(manager, "dkv_working_cache_factory", None)
+        if factory is None:
+            raise RuntimeError(
+                f"{type(manager).__name__} was not built with the factory of the "
+                "DKV working cache")
+        sizing = WorkingCacheSizing(max_batch_size=manager.max_batch_size,
+                                    max_num_tokens=manager.max_num_tokens,
+                                    max_seq_len=manager.max_seq_len,
+                                    staging_tokens=settings["staging_tokens"],
+                                    history_bytes=DEFAULT_STAGING_HISTORY_BYTES,
+                                    arena_copies=arena_copies)
+        working = factory(dkv_lifecycle_slot_counts=sizing)
+        settings["staging_tokens"] = sizing.staging_tokens
+        return working
 
-    def _create_dkv_staged_view(self, settings: dict[str, object]):
-        """The staging buffers of this rank and the cache manager the attention backend sees."""
-        from .dkv_staging import (DkvStagedKvView, StagingGeometry,
-                                  StagingLayout, StagingPool)
+    def _install_dkv_working_cache(self, working, streamer,
+                                   settings: dict[str, object]) -> None:
+        """Make the attention layers read and write their KV in ``working``."""
+        from .dkv_working import DkvWorkingSession
 
-        geometry = StagingGeometry.from_cache_manager(
-            self.kv_cache_manager,
-            max_staging_tokens=settings["staging_tokens"],
-            ring_depth=settings["staging_depth"])
-        pool = StagingPool(StagingLayout(geometry), device=self.device_id)
-        return pool, DkvStagedKvView(self.kv_cache_manager, pool)
-
-    def _install_dkv_staged_view(self, view, settings: dict[str, object]):
-        """Make the attention layers read their KV through ``view``."""
-        self.kv_cache_manager.dkv_staged_view = view
+        working.dkv_streamer = streamer
+        working.dkv_working_session = DkvWorkingSession(working, streamer)
+        self._dkv_working = working
+        self.dkv_streamer = streamer
+        self.kv_cache_manager.dkv_staged_view = working
         # The scheduler admits requests to an iteration only while their attended KV fits.
         self.kv_cache_manager.dkv_max_staging_tokens = settings[
             "staging_tokens"]
-        # Metadata built on the real manager earlier would not read the view.
+        # Metadata built on the real manager earlier would not read the working cache.
         self.model_engine.attn_metadata = None
         self.model_engine.dkv_staging = True
         self.dkv_staging_settings = settings
+
+    def _end_dkv_working_batch(self) -> None:
+        """Release the working pages of the iteration once the data plane is drained."""
+        if self._dkv_working is not None:
+            self._dkv_working.dkv_working_session.end()
 
     def _dkv_layer_split_settings(self) -> dict[str, object]:
         """What the ranks of a layer-split group must agree on to run the same data plane."""
@@ -6611,22 +6642,16 @@ class PyExecutor:
             "layer_split":
             True,
             **self._dkv_staging_settings(),
-            "transport_timeout_s":
-            float(os.environ.get("TRTLLM_DKV_TRANSPORT_TIMEOUT_S", "60")),
             "fault":
             os.environ.get("TRTLLM_DKV_FAULT", ""),
             # The messages a rank sends or receives in one step go out as one NCCL group, one
             # kernel for all of them; 0 issues them one by one.
             "p2p_groups":
             os.environ.get("TRTLLM_DKV_P2P_GROUPS", "1") == "1",
-            # The C++ executor carries out the program of an iteration, one call per hook; 0
-            # issues the steps from Python.
-            "native_data_plane":
-            os.environ.get("TRTLLM_DKV_NATIVE", "1") == "1",
         }
 
     def _initialize_dkv_layer_split(self) -> None:
-        """Run the layers of this rank on the staging area and connect it to the other ranks.
+        """Run the layers of this rank in the working cache and connect it to the other ranks.
 
         The communicator of the data plane is created here, by every rank at the same time, before
         the first forward pass and before any other communicator is active on the device. The
@@ -6634,7 +6659,7 @@ class PyExecutor:
         lazily in the middle of a forward pass.
         """
         from .dkv_streamer import (DataPlaneFault, DeviceDataPlaneDebug,
-                                   DkvStreamer)
+                                   DkvStreamer, arena_peers)
         from .dkv_transport import nccl_p2p_transport
 
         self._validate_dkv_layer_split_runtime()
@@ -6648,33 +6673,35 @@ class PyExecutor:
             raise ValueError(
                 "TRTLLM_DKV_FAULT needs TRTLLM_DKV_DEBUG=1: only the checksums "
                 "of the debug checks notice a damaged message")
-        pool, view = self._create_dkv_staged_view(settings)
+        # The send and the receive arena of the data plane hold one layer's pages for every peer.
+        working = self._create_dkv_working_cache(settings,
+                                                 arena_copies=2 *
+                                                 arena_peers(group_size))
         with torch.cuda.device(self.device_id):
             transport = nccl_p2p_transport(group_size, rank)
             data_stream = torch.cuda.Stream()
             transport.warmup(data_stream)
-        view.dkv_streamer = self.dkv_streamer = DkvStreamer(
-            manager,
-            view,
-            transport,
-            compute_ownership(manager.num_layers, group_size),
-            rank,
-            group_size=group_size,
-            data_stream=data_stream,
-            fill=settings["staging_fill"],
-            debug=(DeviceDataPlaneDebug(data_stream)
-                   if dkv_debug_enabled() else None),
-            fault=fault,
-            group_messages=settings["p2p_groups"],
-            native=settings["native_data_plane"])
-        self._install_dkv_staged_view(view, settings)
+        streamer = DkvStreamer(manager,
+                               working,
+                               transport,
+                               compute_ownership(manager.num_layers,
+                                                 group_size),
+                               rank,
+                               group_size=group_size,
+                               ring_depth=settings["staging_depth"],
+                               data_stream=data_stream,
+                               fill=settings["staging_fill"],
+                               debug=(DeviceDataPlaneDebug(data_stream)
+                                      if dkv_debug_enabled() else None),
+                               fault=fault,
+                               group_messages=settings["p2p_groups"])
+        self._install_dkv_working_cache(working, streamer, settings)
         logger.info(
-            f"DKV layer split: staging {pool.bytes_reserved / (1 << 20):.0f} MiB, "
-            f"ring depth {settings['staging_depth']}, "
-            f"{settings['staging_tokens']} staged tokens per iteration, "
-            f"rank {rank} owns {len(manager.pp_layers)} of {manager.num_layers} layers, "
-            f"{'C++' if self.dkv_streamer.uses_native else 'Python'} data plane"
-        )
+            f"DKV layer split: working cache of {settings['staging_tokens']} staged tokens per "
+            f"iteration in {self._dkv_working_memory(working, streamer)}, fetched "
+            f"{settings['staging_depth'] - 1} layer(s) ahead, rank {rank} owns "
+            f"{len(manager.pp_layers)} of {manager.num_layers} layers, "
+            f"{'C++' if streamer.uses_native else 'Python'} data plane")
 
     def _check_dkv_data_plane(self, records) -> None:
         """Compare the checksums of the messages of the iteration across the ranks (debug).

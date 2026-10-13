@@ -1976,6 +1976,28 @@ class KvCacheCreator:
             dkv_group_size=self._dkv_group_size,
             **self._dkv_layer_split_kwargs(model_engine),
         )
+        if self._dkv_group_size is not None and isinstance(
+                kv_cache_manager, KVCacheManagerV2):
+            # The working cache of the DKV layer split: the same manager class over every layer,
+            # for the requests one rank computes; the executor gives it its page counts.
+            kv_cache_manager.dkv_working_cache_factory = functools.partial(
+                _create_kv_cache_manager,
+                model_engine=model_engine,
+                kv_cache_manager_cls=kv_cache_manager_cls,
+                mapping=mapping,
+                kv_cache_config=_dkv_working_cache_config(kv_cache_config),
+                tokens_per_block=self._tokens_per_block,
+                max_seq_len=kv_cache_manager.max_seq_len,
+                max_batch_size=self._max_batch_size,
+                spec_config=self._speculative_config,
+                sparse_attention_config=self._sparse_attention_config,
+                max_num_tokens=self._max_num_tokens,
+                max_beam_width=self._max_beam_width,
+                kv_connector_manager=None,
+                execution_stream=self._execution_stream,
+                layer_mask=spec_dec_layer_mask,
+                disable_overlap_scheduler=self._disable_overlap_scheduler,
+            )
 
         if not self._skip_est:
             # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
@@ -3096,6 +3118,24 @@ def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
         ple_layer_mask=params.ple_layer_mask + [False] *
         (total_layers - num_target_layers),
     )
+
+
+def _dkv_working_cache_config(kv_cache_config: KvCacheConfig) -> KvCacheConfig:
+    """The cache config of the working cache of the DKV layer split.
+
+    GPU pages only: every request of an iteration gets a cache with exactly the blocks it reads and
+    writes, so there is no block reuse, no host or disk tier to spill to, no event to publish and no
+    sliding-window scratch reuse.
+    """
+    return kv_cache_config.model_copy(
+        update={
+            "enable_block_reuse": False,
+            "enable_partial_reuse": False,
+            "enable_swa_scratch_reuse": False,
+            "event_buffer_max_size": 0,
+            "host_cache_size": 0,
+            "disk_cache_size": None,
+        })
 
 
 def _create_kv_cache_manager(

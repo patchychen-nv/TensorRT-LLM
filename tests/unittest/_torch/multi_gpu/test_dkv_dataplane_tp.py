@@ -14,19 +14,21 @@
 # limitations under the License.
 """The data plane of the layer-split layout between real ranks, without a model.
 
-Every rank holds a DeepSeek-V4 cache manager that stores only the layers it owns, a staging area and
-a ``DkvStreamer`` that moves pages over NCCL. Instead of the attention of a layer, a kernel reads
-the pages the streamer fetched into the slot of the layer, checks them against a pattern that
-depends on the request, the layer, the cache role and the block, and writes the pattern into the
-pages the new tokens touch. Prompts are prefilled in chunks over several iterations, so every
-iteration but the first fetches what an earlier one wrote back. When the prompt of a request is
-done, the pages in the cache manager of the owner of each layer must hold the pattern; then the
-request is freed and its pages are free to be taken by the requests that come next.
+Every rank holds a DeepSeek-V4 cache manager that stores only the layers it owns, a working cache of
+every layer and a ``DkvStreamer`` that moves pages over NCCL. Instead of the attention of a layer,
+the test reads the pages the streamer fetched into the working cache, where the attention of
+DeepSeek-V4 reads them, checks them against a pattern that depends on the request, the layer, the
+cache role and the block, and writes the pattern into the pages the new tokens touch. Prompts are
+prefilled in chunks over several iterations, so every iteration but the first fetches what an
+earlier one wrote back. When the prompt of a request is done, the pages in the cache manager of
+the owner of each layer must hold the pattern; then the request is freed and its pages are free to
+be taken by the requests that come next.
 
 ``DKV_DATAPLANE_SOAK=<iterations>`` runs the long test: requests arrive and leave on every
 iteration for that many iterations on four ranks.
 """
 
+import functools
 import os
 import pickle
 import sys
@@ -45,15 +47,12 @@ from tensorrt_llm import Mapping
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
     DeepseekV4CacheManager,
 )
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+    DeepseekV4AttentionType,
+    compress_ratio_has_attention,
+)
 from tensorrt_llm._torch.pyexecutor.dkv import compute_ownership, owned_layers
 from tensorrt_llm._torch.pyexecutor.dkv_plan import PlanRequest
-from tensorrt_llm._torch.pyexecutor.dkv_staging import (
-    BAD_PAGE_INDEX,
-    DkvStagedKvView,
-    StagingGeometry,
-    StagingLayout,
-    StagingPool,
-)
 from tensorrt_llm._torch.pyexecutor.dkv_streamer import (
     DataPlaneFault,
     DeviceDataPlaneDebug,
@@ -61,12 +60,20 @@ from tensorrt_llm._torch.pyexecutor.dkv_streamer import (
     find_data_plane_mismatches,
 )
 from tensorrt_llm._torch.pyexecutor.dkv_transport import nccl_p2p_transport
+from tensorrt_llm._torch.pyexecutor.dkv_working import (
+    DkvWorkingSession,
+    fetch_blocks,
+    manager_buffers,
+    working_slot_counts,
+    writeback_blocks,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
@@ -75,6 +82,8 @@ pytestmark = [pytest.mark.threadleak(enabled=False), skip_pre_blackwell]
 _RATIOS = [4, 128, 1] * 4
 _CHUNK = 128
 _TOKENS_PER_BLOCK = 128
+_MAX_BATCH_SIZE = 8
+_MAX_NUM_TOKENS = 1024
 _TIMEOUT = 120.0
 # The most errors a rank reports; a fault that corrupts one page tends to corrupt many.
 _MAX_ERRORS = 20
@@ -100,9 +109,6 @@ class Scenario:
     # Issue the messages of a step as one NCCL group, as the executor does by default; False
     # issues them one by one.
     grouped: bool = True
-    # Carry out the program with the C++ executor, as the executor does by default; it takes over
-    # only without the checksums of debug and with grouped messages.
-    native: bool = True
 
     @classmethod
     def soak(cls, group_size: int, ring_depth: int, iterations: int) -> "Scenario":
@@ -146,8 +152,9 @@ class Scenario:
         return max(self._schedule) + 1
 
 
-def _pattern(request_id: int, layer: int, index: int, blocks: list[int], nbytes: int):
+def _pattern(request_id: int, layer: int, attn_type, blocks: list[int], nbytes: int):
     """The bytes of the pages of ``blocks``, one row per block, on the device."""
+    index = list(DeepseekV4AttentionType).index(attn_type)
     seeds = torch.tensor(
         [(request_id * 131 + layer * 31 + index * 7 + block * 13) % 251 + 1 for block in blocks],
         dtype=torch.int64,
@@ -157,15 +164,14 @@ def _pattern(request_id: int, layer: int, index: int, blocks: list[int], nbytes:
     return ((positions[None, :] * 7 + seeds[:, None]) % 251).to(torch.uint8)
 
 
-def _manager(
-    owned: tuple[int, ...], rank: int, group_size: int, ratios: tuple[int, ...]
-) -> DeepseekV4CacheManager:
+def _manager(rank: int, group_size: int, ratios: tuple[int, ...], **kwargs):
     return DeepseekV4CacheManager(
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             enable_swa_scratch_reuse=False,
             max_tokens=16384,
             event_buffer_max_size=0,
+            host_cache_size=0,
         ),
         kv_cache_type=CacheType.SELFKONLY,
         num_layers=len(ratios),
@@ -173,7 +179,7 @@ def _manager(
         head_dim=512,
         tokens_per_block=_TOKENS_PER_BLOCK,
         max_seq_len=4096,
-        max_batch_size=8,
+        max_batch_size=_MAX_BATCH_SIZE,
         max_input_len=4096,
         mapping=Mapping(
             world_size=group_size, rank=rank, tp_size=group_size, enable_attention_dp=True
@@ -181,86 +187,92 @@ def _manager(
         dtype=DataType.FP8,
         compressor_dtype=DataType.FLOAT,
         vocab_size=129280,
-        max_num_tokens=1024,
+        max_num_tokens=_MAX_NUM_TOKENS,
         sparse_attn_config=DeepSeekV4SparseAttentionConfig(
             index_head_dim=128, window_size=128, compress_ratios=list(ratios), indexer_k_dtype="fp8"
         ),
-        owned_layers=owned,
+        **kwargs,
     )
 
 
-def _staged_pages(pool, layout, layer, component, span):
-    return pool.slot(layer, component).view(-1, layout.page_bytes(component))[
-        span.page_offset : span.page_offset + span.num_pages
+def _attention_types(ratio: int) -> list[DeepseekV4AttentionType]:
+    return [
+        attn_type
+        for attn_type in DeepseekV4AttentionType
+        if compress_ratio_has_attention(ratio, attn_type)
     ]
 
 
-def _attention(layer, local, spans, layout, pool, checks):
+def _pages(manager, request_id: int, layer: int, attn_type, blocks) -> list[torch.Tensor]:
+    """The pages of ``blocks`` of a request in a layer, where the attention reads them."""
+    buffer = manager.get_buffers(layer, attn_type)
+    indices = manager.get_cache_indices(request_id, layer, attn_type)
+    pages = []
+    for block in blocks:
+        if block >= len(indices) or indices[block] == BAD_PAGE_INDEX:
+            raise AssertionError(f"block {block} of request {request_id} has no page")
+        pages.append(buffer[indices[block]].view(torch.uint8).reshape(-1))
+    return pages
+
+
+def _attention(layer, ratio, local, working, keys, checks):
     """Stand-in for the attention of a layer: check what was fetched, write the new pages."""
-    for index, request in enumerate(local):
+    for request in local:
         history, chunk = request.context_current_position, request.context_chunk_size
-        for kind in layout.kinds:
-            if layer not in layout.layers_of(kind):
-                continue
-            span = spans[kind][index]
-            for component in layout.components_of(kind):
-                slot = layout.components.index(component)
-                nbytes = layout.page_bytes(component)
-                pages = _staged_pages(pool, layout, layer, component, span)
-                first, count = layout.fetch_range(kind, history, chunk)
-                if count:
-                    blocks = list(range(first, first + count))
-                    rows = pages[first - span.first_block : first - span.first_block + count]
-                    wrong = (rows != _pattern(request.request_id, layer, slot, blocks, nbytes)).any(
-                        dim=1
-                    )
-                    checks.append((layer, request.request_id, component, blocks, wrong))
-                first, count = layout.writeback_range(kind, history, chunk)
-                if count:
-                    blocks = list(range(first, first + count))
-                    pages[first - span.first_block : first - span.first_block + count] = _pattern(
-                        request.request_id, layer, slot, blocks, nbytes
-                    )
+        for attn_type in _attention_types(ratio):
+            key = keys[layer, attn_type]
+            first, count = fetch_blocks(key, history, chunk, _TOKENS_PER_BLOCK)
+            if count:
+                blocks = list(range(first, first + count))
+                pages = torch.stack(_pages(working, request.request_id, layer, attn_type, blocks))
+                expected = _pattern(request.request_id, layer, attn_type, blocks, pages.shape[1])
+                checks.append(
+                    (layer, request.request_id, attn_type, blocks, (pages != expected).any(dim=1))
+                )
+            first, count = writeback_blocks(key, history, chunk, _TOKENS_PER_BLOCK)
+            if count:
+                blocks = list(range(first, first + count))
+                pages = _pages(working, request.request_id, layer, attn_type, blocks)
+                patterns = _pattern(request.request_id, layer, attn_type, blocks, pages[0].numel())
+                for page, pattern in zip(pages, patterns):
+                    page.copy_(pattern)
 
 
-def _record_writes(written, batch, layout, manager) -> None:
-    """Note the pages that the iteration writes back into the cache manager of this rank."""
+def _record_writes(written, batch, owned, ratios, keys) -> None:
+    """Note the pages that the iteration writes back into the cache manager of this rank, which
+    holds the layers ``owned``."""
     for request in batch:
         history, chunk = request.context_current_position, request.context_chunk_size
-        for kind in layout.kinds:
-            first, count = layout.writeback_range(kind, history, chunk)
-            for component in layout.components_of(kind):
-                for layer in layout.layers_of(kind):
-                    if (layer, component.attention_type) in manager._layer_attn_to_layer_id:
-                        pages = written.setdefault(request.request_id, {})
-                        pages.setdefault((layer, component.attention_type), set()).update(
-                            range(first, first + count)
-                        )
+        for layer in owned:
+            for attn_type in _attention_types(ratios[layer]):
+                first, count = writeback_blocks(
+                    keys[layer, attn_type], history, chunk, _TOKENS_PER_BLOCK
+                )
+                pages = written.setdefault(request.request_id, {})
+                pages.setdefault((layer, attn_type), set()).update(range(first, first + count))
 
 
-def _check_request_pages(rank, layout, manager, request_id, written) -> list[str]:
+def _check_request_pages(rank, manager, request_id, written) -> list[str]:
     """The pages of a request in the cache manager of this rank hold what the compute ranks wrote."""
     problems = []
-    for (layer, attention_type), blocks in sorted(
+    for (layer, attn_type), blocks in sorted(
         written.items(), key=lambda item: (item[0][0], item[0][1].value)
     ):
-        component = next(
-            c
-            for c in layout.components
-            if c.attention_type is attention_type and layer in layout.layers_of(c.kind)
-        )
-        slot = layout.components.index(component)
-        indices = manager.get_cache_indices(request_id, layer, attention_type)
-        buffer = manager.get_buffers(layer, attention_type)
-        for block in sorted(blocks):
-            if block >= len(indices) or indices[block] == BAD_PAGE_INDEX:
-                continue
-            page = buffer[indices[block]].view(torch.uint8).reshape(-1)
-            expected = _pattern(request_id, layer, slot, [block], layout.page_bytes(component))[0]
-            if not torch.equal(page, expected):
+        indices = manager.get_cache_indices(request_id, layer, attn_type)
+        alive = [
+            block
+            for block in sorted(blocks)
+            if block < len(indices) and indices[block] != BAD_PAGE_INDEX
+        ]
+        if not alive:
+            continue
+        pages = _pages(manager, request_id, layer, attn_type, alive)
+        expected = _pattern(request_id, layer, attn_type, alive, pages[0].numel())
+        for block, page, pattern in zip(alive, pages, expected):
+            if not torch.equal(page, pattern):
                 problems.append(
                     f"rank {rank}: block {block} of request {request_id} in layer {layer} "
-                    f"({attention_type.name}) was not written back"
+                    f"({attn_type.name}) was not written back"
                 )
     return problems
 
@@ -297,33 +309,46 @@ class _FlippingTransport:
 def _probe_rank(scenario: Scenario) -> dict:
     rank = tensorrt_llm.mpi_rank()
     group_size = scenario.group_size
+    ratios = scenario.ratios
     torch.cuda.set_device(rank % torch.cuda.device_count())
-    owners = compute_ownership(len(scenario.ratios), group_size)
+    owners = compute_ownership(len(ratios), group_size)
+    owned = owned_layers(owners, rank)
     transport = nccl_p2p_transport(group_size, rank)
-    manager = _manager(owned_layers(owners, rank), rank, group_size, scenario.ratios)
-    geometry = StagingGeometry.from_cache_manager(
-        manager, max_staging_tokens=8192, ring_depth=scenario.ring_depth
+    manager = _manager(rank, group_size, ratios, owned_layers=owned)
+    working = _manager(
+        rank,
+        group_size,
+        ratios,
+        lifecycle_slot_counts=functools.partial(
+            working_slot_counts,
+            max_batch_size=_MAX_BATCH_SIZE,
+            max_num_tokens=_MAX_NUM_TOKENS,
+            staging_tokens=8192,
+        ),
     )
-    layout = StagingLayout(geometry)
-    pool = StagingPool(layout)
-    view = DkvStagedKvView(manager, pool)
+    keys = {
+        (layer, attn_type): entry.buffer.key
+        for (layer, role), entry in manager_buffers(working).items()
+        for attn_type in DeepseekV4AttentionType
+        if str(attn_type.role) == role
+    }
     data_stream = torch.cuda.Stream()
     transport.warmup(data_stream)
     flipping = scenario.flip[0] == rank
     streamer = DkvStreamer(
         manager,
-        view,
+        working,
         _FlippingTransport(transport, scenario.flip[1]) if flipping else transport,
         owners,
         rank,
         group_size=group_size,
+        ring_depth=scenario.ring_depth,
         data_stream=data_stream,
         debug=DeviceDataPlaneDebug(data_stream) if scenario.debug else None,
         fault=DataPlaneFault.parse(scenario.fault) if scenario.fault else None,
         group_messages=scenario.grouped,
-        native=scenario.native,
     )
-    view.dkv_streamer = streamer
+    session = DkvWorkingSession(working, streamer)
     requests: dict[int, LlmRequest] = {}
     errors: list[str] = []
     written: dict[int, dict] = {}
@@ -349,21 +374,19 @@ def _probe_rank(scenario: Scenario) -> dict:
             manager.prepare_resources(scheduled)
             local = [request for request in real if request.compute_rank == rank]
             streamer.set_plan(streamer.plan_for(batch))
-            view.begin_staged_batch(
+            session.begin_batch(
                 [r.request_id for r in local],
                 [r.context_current_position for r in local],
                 [r.context_chunk_size for r in local],
-                len(local),
             )
-            placement = [(r.context_current_position, r.context_chunk_size) for r in local]
-            spans = {kind: layout.request_spans(kind, placement) for kind in layout.kinds}
             checks: list = []
-            for layer in range(len(scenario.ratios)):
+            for layer, ratio in enumerate(ratios):
                 streamer.on_layer(layer)
-                _attention(layer, local, spans, layout, pool, checks)
-            _record_writes(written, real, layout, manager)
+                _attention(layer, ratio, local, working, keys, checks)
+            _record_writes(written, real, owned, ratios, keys)
             streamer.end_forward()
             records = streamer.drain(_TIMEOUT)
+            session.end()
             torch.cuda.synchronize()
             if scenario.debug:
                 # The compare is a collective, so every rank takes part in every iteration.
@@ -371,13 +394,12 @@ def _probe_rank(scenario: Scenario) -> dict:
                     mpi_comm().allgather(records), streamer.last_plan
                 )[: _MAX_ERRORS - len(errors)]:
                     errors.append(f"iteration {iteration}: checksums: {problem}")
-            for layer, request_id, component, blocks, wrong in checks:
+            for layer, request_id, attn_type, blocks, wrong in checks:
                 for block, bad in zip(blocks, wrong.tolist()):
                     if bad and len(errors) < _MAX_ERRORS:
                         errors.append(
                             f"rank {rank}, iteration {iteration}: block {block} of request "
-                            f"{request_id} in layer {layer} ({component.attention_type.name}) was "
-                            "not fetched"
+                            f"{request_id} in layer {layer} ({attn_type.name}) was not fetched"
                         )
             for plan_request in real:
                 request = requests[plan_request.request_id]
@@ -391,11 +413,7 @@ def _probe_rank(scenario: Scenario) -> dict:
                 if request.context_remaining_length == 0:
                     errors.extend(
                         _check_request_pages(
-                            rank,
-                            layout,
-                            manager,
-                            request.py_request_id,
-                            written.pop(request.py_request_id),
+                            rank, manager, request.py_request_id, written.pop(request.py_request_id)
                         )[: _MAX_ERRORS - len(errors)]
                     )
                     manager.free_resources(request)
@@ -407,12 +425,13 @@ def _probe_rank(scenario: Scenario) -> dict:
             "bytes_received": stats.bytes_received,
             "bytes_local": stats.bytes_local,
             "iterations": stats.iterations,
-            "native": streamer.uses_native,
         }
     finally:
+        session.end()
         for request in requests.values():
             if request.py_request_id in manager.kv_cache_map:
                 manager.free_resources(request)
+        working.shutdown()
         manager.shutdown()
 
 
@@ -451,33 +470,20 @@ def test_the_pages_of_every_layer_reach_the_compute_rank_and_come_back(
     assert sum(r["bytes_sent"] for r in results) > 0
 
 
-def _has_native_data_plane() -> bool:
-    try:
-        torch.classes.trtllm.DkvDataPlane
-    except (AttributeError, RuntimeError):
-        return False
-    return True
-
-
-@pytest.mark.parametrize("ring_depth", [1, 2, 3])
 @pytest.mark.parametrize("placement", ["spread", "one_rank"])
 @pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
-def test_the_cpp_executor_moves_the_pages_of_every_layer(
-    mpi_pool_executor: MPIPoolExecutor, placement: str, ring_depth: int
+def test_the_pages_of_every_layer_move_without_the_checksums(
+    mpi_pool_executor: MPIPoolExecutor, placement: str
 ) -> None:
-    """Without the checksums of debug the C++ executor carries out the program; the stand-in of the
-    attention and the pages written back check every page it moved."""
+    """The stand-in of the attention and the pages written back check every page that moved."""
     group_size = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < group_size:
         pytest.skip(f"Requires {group_size} GPUs")
-    if not _has_native_data_plane():
-        pytest.skip("the native build has no trtllm.DkvDataPlane")
     ranks = _spread(group_size, _PROMPTS) if placement == "spread" else {rid: 0 for rid in _PROMPTS}
-    scenario = Scenario(group_size, ring_depth, _PROMPTS, ranks, arrival={4: 1, 5: 2})
+    scenario = Scenario(group_size, 2, _PROMPTS, ranks, arrival={4: 1, 5: 2})
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * group_size, timeout=900))
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"
-        assert result["native"], f"rank {rank}"
         assert result["iterations"] == scenario.iterations
     assert sum(r["bytes_sent"] for r in results) == sum(r["bytes_received"] for r in results)
     assert sum(r["bytes_sent"] for r in results) > 0
@@ -519,7 +525,7 @@ def test_a_writeback_that_arrives_damaged_at_an_owner_is_named_by_the_checksums(
     )
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * group_size, timeout=900))
     errors = [error for result in results for error in result["errors"]]
-    named = [error for error in errors if "checksums" in error and f"W({layer})/" in error]
+    named = [error for error in errors if "checksums" in error and f"W({layer}) of" in error]
     assert named, errors
     assert all(f"rank {owner} has" in error for error in named), named
 
@@ -537,7 +543,6 @@ def test_a_soak_of_requests_that_come_and_go_neither_hangs_nor_corrupts(
     results = list(mpi_pool_executor.map(_probe_rank, [scenario] * 4, timeout=7200))
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"
-        assert result["native"] == _has_native_data_plane(), f"rank {rank}"
         assert result["iterations"] == scenario.iterations
 
 
@@ -545,11 +550,9 @@ def test_a_soak_of_requests_that_come_and_go_neither_hangs_nor_corrupts(
     MPI.COMM_WORLD.Get_size() != 8,
     reason="needs a job of eight MPI ranks, with one task per GPU on two nodes",
 )
-@pytest.mark.parametrize("native", [False, True])
-def test_the_pages_of_every_layer_reach_the_compute_rank_between_two_nodes(native: bool) -> None:
-    """Every task of the job is a rank of the group, so half of the messages cross the nodes.
-
-    The Python steps run with the checksums of debug, the C++ executor without them."""
+@pytest.mark.parametrize("debug", [False, True])
+def test_the_pages_of_every_layer_reach_the_compute_rank_between_two_nodes(debug: bool) -> None:
+    """Every task of the job is a rank of the group, so half of the messages cross the nodes."""
     group_size = 8
     # One request per rank: a cache manager has room for eight requests at a time.
     lengths = (90, 300, 150, 700, 1000, 520, 260, 130)
@@ -560,14 +563,12 @@ def test_the_pages_of_every_layer_reach_the_compute_rank_between_two_nodes(nativ
         prompts,
         _spread(group_size, prompts),
         arrival={5: 1, 6: 2, 7: 3},
-        debug=not native,
+        debug=debug,
         ratios=tuple(_RATIOS) * 2,
-        native=native,
     )
     results = mpi_comm().allgather(_probe_rank(scenario))
     for rank, result in enumerate(results):
         assert result["errors"] == [], f"rank {rank}"
-        assert result["native"] == (native and _has_native_data_plane()), f"rank {rank}"
         assert result["iterations"] == scenario.iterations
         assert result["bytes_sent"] > 0 and result["bytes_received"] > 0, f"rank {rank}"
     assert sum(r["bytes_sent"] for r in results) == sum(r["bytes_received"] for r in results)

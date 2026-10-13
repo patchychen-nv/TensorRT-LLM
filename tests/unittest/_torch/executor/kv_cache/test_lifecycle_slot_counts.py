@@ -37,13 +37,13 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.lifecycle_slot_counts import (
     MAX_SLOT_COUNT,
     LifecycleKey,
-    _stale_range,
     gpu_granularity,
     lifecycle_layouts,
     lifecycle_page_need,
     slots_for_batch,
     slots_from_constraints,
     solve_lifecycle_slot_counts,
+    stale_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
@@ -151,7 +151,7 @@ def test_stale_ranges_match_the_native_ones(
     assert key.num_sink_blocks == native.num_sink_blocks
     for history_length in range(0, 400):
         stale = native.get_stale_range(history_length, tokens_per_block)
-        beg, end = _stale_range(key, history_length, tokens_per_block)
+        beg, end = stale_range(key, history_length, tokens_per_block)
         assert (beg, max(beg, end)) == (stale.beg, max(stale.beg, stale.end)), history_length
 
 

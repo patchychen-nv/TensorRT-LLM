@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek-V4 on the staging area of the layer-split layout, with every rank owning every layer.
+"""DeepSeek-V4 on the working cache of the layer-split layout, with every rank owning every layer.
 
-``TRTLLM_DKV_STAGING_LOOPBACK=1`` makes each rank of a replicated DKV group run the attention of a
-layer on the staging area: the cached pages of the layer are copied from the rank's own cache manager
-into its slot before the layer, and the pages the new tokens wrote are copied back after it. Nothing
-crosses a rank, so these tests judge the staging path alone, against the same group without it.
+``TRTLLM_DKV_STAGING_LOOPBACK=1`` makes each rank of a replicated DKV group run the attention of
+every layer in a working cache: the cached pages of the layer are copied from the rank's own cache
+manager into the working cache before the layer, and the pages the new tokens wrote are copied back
+after it. Nothing crosses a rank, so these tests judge the staging path alone, against the same
+group without it.
 """
 
 from pathlib import Path
@@ -168,7 +169,7 @@ def test_the_staged_path_keeps_the_aggregate_lifetime_of_a_request(
     assert result["forward_iterations"] >= 1000
     logs = "".join(capfd.readouterr())
     assert "DKV invariant violation" not in logs
-    assert "StagingOverflow" not in logs
+    assert "WorkingCacheOverflow" not in logs
 
 
 @pytest.mark.threadleak(enabled=False)

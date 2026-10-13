@@ -91,26 +91,30 @@ def _c_div(numerator: int, denominator: int) -> int:
     return quotient if (numerator >= 0) == (denominator > 0) else -quotient
 
 
+def lifecycle_key(layer: Any, tokens_per_block: int) -> LifecycleKey:
+    """The semantic key of the life cycle of a layer config of the V2 cache manager."""
+    if isinstance(layer, SsmLayerConfig):
+        return LifecycleKey(True, 0, 0, False)
+    if isinstance(layer, AttentionLayerConfig):
+        window = layer.sliding_window_size
+        sink_tokens = layer.num_sink_tokens or 0
+        is_sparse = bool(layer.buffers) and bool(layer.buffers[0].is_sparse)
+        return LifecycleKey(
+            False,
+            int(window) if window else 0,
+            _div_up(int(sink_tokens), tokens_per_block),
+            is_sparse,
+        )
+    raise ValueError(f"Unsupported layer config {type(layer).__name__}")
+
+
 def lifecycle_layouts(config: Any) -> list[LifecycleLayout]:
     """Life cycles of ``config`` in life cycle id order, which is the order layers first use them."""
     tokens_per_block = int(config.tokens_per_block)
     keys: list[LifecycleKey] = []
     sizes_by_key: dict[LifecycleKey, dict[int, int]] = {}
     for layer in config.layers:
-        if isinstance(layer, SsmLayerConfig):
-            key = LifecycleKey(True, 0, 0, False)
-        elif isinstance(layer, AttentionLayerConfig):
-            window = layer.sliding_window_size
-            sink_tokens = layer.num_sink_tokens or 0
-            is_sparse = bool(layer.buffers) and bool(layer.buffers[0].is_sparse)
-            key = LifecycleKey(
-                False,
-                int(window) if window else 0,
-                _div_up(int(sink_tokens), tokens_per_block),
-                is_sparse,
-            )
-        else:
-            raise ValueError(f"Unsupported layer config {type(layer).__name__}")
+        key = lifecycle_key(layer, tokens_per_block)
         if key not in sizes_by_key:
             keys.append(key)
             sizes_by_key[key] = {}
@@ -131,7 +135,7 @@ def lifecycle_layouts(config: Any) -> list[LifecycleLayout]:
     ]
 
 
-def _stale_range(key: LifecycleKey, history_length: int, tokens_per_block: int) -> tuple[int, int]:
+def stale_range(key: LifecycleKey, history_length: int, tokens_per_block: int) -> tuple[int, int]:
     """Blocks of a request with ``history_length`` tokens that no longer hold live pages."""
     if key.is_ssm:
         return 0, history_length // tokens_per_block
@@ -165,10 +169,10 @@ def slots_for_batch(
             continue
         shared = system_range
         for cache in caches:
-            shared = _intersect(shared, _stale_range(key, cache.history_length, tokens_per_block))
+            shared = _intersect(shared, stale_range(key, cache.history_length, tokens_per_block))
         count = system_blocks - _length(shared)
         for cache in caches:
-            stale = _stale_range(key, cache.history_length, tokens_per_block)
+            stale = stale_range(key, cache.history_length, tokens_per_block)
             non_stale = _div_up(cache.capacity, tokens_per_block) - _length(stale)
             non_stale_system = system_blocks - _length(_intersect(stale, system_range))
             count += max(0, non_stale - non_stale_system)

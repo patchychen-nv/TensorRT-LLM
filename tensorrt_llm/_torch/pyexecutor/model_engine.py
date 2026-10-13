@@ -828,7 +828,7 @@ class PyTorchModelEngine(ModelEngine):
     def dkv_staging(self) -> bool:
         """Whether DKV stages the KV of the layers.
 
-        The attention metadata then reads the staged view of the cache manager. The executor
+        The attention metadata then reads the working cache of the cache manager. The executor
         switches it on before the first forward pass.
         """
         return isinstance(self._runner,

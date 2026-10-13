@@ -534,6 +534,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             f"{super()._format_kv_cache_pool_lifecycle_entry(layer_id, role)}"
         )
 
+    def dkv_model_layer_of(self, layer_id: int, role: DataRole) -> int:
+        return self._manager_layer_id_to_layer_attn[LayerId(layer_id), role][0]
+
     def get_buffers(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> torch.Tensor:
         """
         Get the buffers for a specific layer and attention type.

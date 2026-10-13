@@ -300,7 +300,7 @@ def _check_data_plane(group_size: int, records_of, *, enabled: bool = True):
     return LockstepTpGroup(group_size).run(rank_main)
 
 
-_MESSAGE = (1, 4, 0, 0, 1)  # the writeback of layer 4 for the state, from rank 1 to the owner 0
+_MESSAGE = (1, 4, 0, 1)  # the writeback of layer 4, from rank 1 to the owner 0
 
 
 def _records(rank: int, damaged_stored: bool = False) -> list:
@@ -316,7 +316,7 @@ def test_the_executor_accepts_checksums_that_agree_across_the_ranks() -> None:
 def test_the_executor_names_the_message_whose_checksums_differ() -> None:
     with pytest.raises(RuntimeError, match=r"checksums differ at iteration 7") as caught:
         _check_data_plane(2, lambda rank: _records(rank, damaged_stored=True))
-    assert "W(4)/state" in str(caught.value) and "rank 0 has stored 0x6, not 0x5" in str(
+    assert "W(4) of requests" in str(caught.value) and "rank 0 has stored 0x6, not 0x5" in str(
         caught.value
     )
 

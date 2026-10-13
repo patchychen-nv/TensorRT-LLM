@@ -854,8 +854,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Bound what the context requests of one compute rank attend to in an iteration.
 
         The sum of their attended KV lengths is bounded by the MLA workspace, which the first
-        request of the rank is exempt from so that it makes progress, and by the staging area of
-        the layer-split layout. No request may exceed the staging area alone, since it would never
+        request of the rank is exempt from so that it makes progress, and by the working cache of
+        the layer-split layout. No request may exceed the working cache alone, since it would never
         be admitted.
         """
         rank = req.py_dkv_compute_rank
@@ -869,7 +869,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             if attended > staging_cap:
                 raise RuntimeError(
                     f"DKV invariant violation: request {req.py_request_id} attends {attended} "
-                    f"tokens, more than the {staging_cap} that the staging area holds"
+                    f"tokens, more than the {staging_cap} that the working cache holds"
                 )
             if cumulative > staging_cap:
                 return False

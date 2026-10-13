@@ -436,9 +436,9 @@ def test_staging_cap_counts_the_history_of_a_chunk(dual_ledger, staging_cap, adm
 def test_a_request_that_alone_exceeds_the_staging_area_is_an_invariant_violation(
     dual_ledger,
 ) -> None:
-    # The MLA cap exempts the first request of a rank; the staging area is not one it may overflow.
+    # The MLA cap exempts the first request of a rank; the working cache is not one it may overflow.
     scheduler = _scheduler(_PageManager(staging_cap=64, cap=0))
-    with pytest.raises(RuntimeError, match="more than the 64 that the staging area holds"):
+    with pytest.raises(RuntimeError, match="more than the 64 that the working cache holds"):
         scheduler.schedule_request(_contexts([(0, 0, 128)]), set())
 
 

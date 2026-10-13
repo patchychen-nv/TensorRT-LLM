@@ -12,20 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Moves the KV of a layer between the cache manager and the staging area around its attention.
+"""Moves the KV of a layer between the owners' caches and the working cache around its attention.
 
-The attention backend calls ``on_layer(l)`` at the top of every layer and ``end_forward()`` after
-the last one. ``LoopbackStreamer`` serves a rank that owns every layer: the cached pages of the
-layer are copied into the slot before its attention runs and the pages the new tokens wrote are
-copied back after it, all on the stream of the forward pass, so the copies are ordered with the
-kernels and need no events.
+``DkvStreamer`` serves the ``layer_split`` layout, where the KV of a layer lives in the cache
+manager of the rank that owns the layer and is computed in the working cache (``dkv_working``) of
+the rank that runs the request. It carries out a ``DkvPlan`` on a data stream of its own: it packs
+the pages of a message, sends it, receives the messages of its peers and unpacks them, in the order
+the plan fixes for every rank, and it orders the data stream with the stream of the forward pass by
+events. The plan is resolved to device addresses once per iteration, when the working caches of the
+batch are open, so that the hooks of the forward pass only enqueue work.
 
-``DkvStreamer`` serves the ``layer_split`` layout, where the KV of a layer lives on the rank that
-owns the layer and is computed on another. It carries out a ``DkvPlan`` on a data stream of its own:
-it packs the pages of a message, sends it, receives the messages of its peers and unpacks them, in
-the order the plan fixes for every rank, and it orders the data stream with the stream of the
-forward pass by events. The plan is resolved to device addresses once per iteration, when the
-staged batch is known, so that the hooks of the forward pass only enqueue work.
+Nothing here knows the model: the buffers of a layer, the blocks a request moves and the address of
+every page come from what both cache managers publish (``manager_buffers``, ``page_affine``).
 """
 
 import functools
@@ -39,216 +37,54 @@ import numpy as np
 import torch
 
 from .dkv_plan import (
-    DEADLINE_OF_KIND,
     ISSUE_AT_BEGIN,
-    DeadlineClass,
     Direction,
     DkvPlan,
     OpAction,
-    PageCost,
     PlanRequest,
     PlanStep,
     RankOp,
     Transfer,
     build_dkv_plan,
-    layer_types_from_compress_ratios,
     step_label,
 )
-from .dkv_staging import (
-    BAD_PAGE_INDEX,
-    DkvPageCopier,
-    DkvStagedKvView,
-    RequestSpan,
-    StagingComponent,
-    StagingKind,
-    StagingLayout,
-    pool_page_addresses,
-)
+from .dkv_staging import DkvPageCopier
 from .dkv_transport import DkvTransport
-
-
-class LoopbackStreamer:
-    """Fetches and writes back the pages of one layer at a time, between the staging area and the
-    cache manager of the same rank."""
-
-    def __init__(
-        self,
-        manager,
-        view: DkvStagedKvView,
-        copier: DkvPageCopier | None = None,
-        *,
-        fill: str = "",
-    ) -> None:
-        """``fill`` (``"zero"`` or ``"nan"``, empty: none) overwrites the slots of a layer before
-        its pages are fetched."""
-        self._manager = manager
-        self._fill = fill
-        self._view = view
-        self._layout = view.layout
-        self._pool = view.pool
-        self._copier = copier or DkvPageCopier()
-        self._request_ids: list[int] = []
-        self._history: list[int] = []
-        self._new: list[int] = []
-        self._spans: dict[StagingKind, tuple[RequestSpan, ...]] = {}
-        self._written_layer: int | None = None
-        self.bytes_fetched = 0
-        self.bytes_written_back = 0
-
-    def begin_iteration(
-        self,
-        request_ids: Sequence[int],
-        history: Sequence[int],
-        new: Sequence[int],
-        spans: dict[StagingKind, tuple[RequestSpan, ...]],
-    ) -> None:
-        """Remember the staged batch; its pages are copied layer by layer."""
-        self._request_ids = list(request_ids)
-        self._history = list(history)
-        self._new = list(new)
-        self._spans = spans
-        self._written_layer = None
-
-    def on_layer(self, layer: int) -> None:
-        """Called at the top of a layer: return the previous layer's pages, bring this layer's in."""
-        if self._written_layer is not None:
-            self._write_back(self._written_layer)
-        if self._fill:
-            self._pool.fill_layer(layer, self._fill)
-        self._fetch(layer)
-        self._written_layer = layer
-
-    def end_forward(self) -> None:
-        """Called after the last layer: return its pages."""
-        if self._written_layer is not None:
-            self._write_back(self._written_layer)
-            self._written_layer = None
-
-    def _pages(self, layer: int, fetch: bool) -> dict:
-        """The (pool address, staging address) pairs of every component of ``layer``."""
-        layout, pool, manager = self._layout, self._pool, self._manager
-        stream_pairs: dict = {}
-        for kind in layout.kinds:
-            if layer not in layout.layers_of(kind):
-                continue
-            components = [c for c in layout.components if c.kind is kind]
-            for index, request_id in enumerate(self._request_ids):
-                if request_id not in manager.kv_cache_map:
-                    continue
-                history, new = self._history[index], self._new[index]
-                span = self._spans[kind][index]
-                first, count = (layout.fetch_range if fetch else layout.writeback_range)(
-                    kind, history, new
-                )
-                if not count:
-                    continue
-                table = layout.block_table(kind, layer, span, first + count)
-                for component in components:
-                    indices = manager.get_cache_indices(request_id, layer, component.attention_type)
-                    addresses = pool_page_addresses(
-                        manager, layer, component.attention_type, indices
-                    )
-                    base = pool.layer_pointer(layer, component)
-                    page_bytes = layout.page_bytes(component)
-                    pairs = stream_pairs.setdefault(component, [])
-                    for block in range(first, first + count):
-                        if (
-                            table[block] == BAD_PAGE_INDEX
-                            or block >= len(addresses)
-                            or addresses[block] is None
-                        ):
-                            continue
-                        pairs.append((addresses[block], base + table[block] * page_bytes))
-        return stream_pairs
-
-    def _fetch(self, layer: int) -> None:
-        stream = torch.cuda.current_stream().cuda_stream
-        for component, pairs in self._pages(layer, fetch=True).items():
-            if pairs:
-                page_bytes = self._layout.page_bytes(component)
-                self._copier.gather(
-                    [pool for pool, _ in pairs],
-                    [staging for _, staging in pairs],
-                    page_bytes,
-                    stream,
-                )
-                self.bytes_fetched += page_bytes * len(pairs)
-
-    def _write_back(self, layer: int) -> None:
-        stream = torch.cuda.current_stream().cuda_stream
-        for component, pairs in self._pages(layer, fetch=False).items():
-            if pairs:
-                page_bytes = self._layout.page_bytes(component)
-                self._copier.scatter(
-                    [staging for _, staging in pairs],
-                    [pool for pool, _ in pairs],
-                    page_bytes,
-                    stream,
-                )
-                self.bytes_written_back += page_bytes * len(pairs)
-
-
-class LayoutCostModel:
-    """The sizes of the staging layout in the form the plan asks for them.
-
-    The cost of a kind depends on the history and the chunk of the request only, so the costs of
-    the requests of an iteration are computed once and looked up for every layer.
-    """
-
-    # Costs remembered before the table is emptied; a few per request and kind are in use.
-    _MAX_REMEMBERED = 4096
-
-    def __init__(self, layout: StagingLayout) -> None:
-        self._layout = layout
-        self._costs: dict[tuple[StagingKind, int, int], PageCost] = {}
-
-    def page_cost(self, layer: int, kind: StagingKind, history: int, chunk: int) -> PageCost:
-        key = (kind, history, chunk)
-        cost = self._costs.get(key)
-        if cost is None:
-            layout = self._layout
-            page_bytes = layout.kind_page_bytes(kind)
-            if chunk < 1:
-                cost = PageCost(page_bytes, 0, 0)
-            else:
-                cost = PageCost(
-                    page_bytes,
-                    layout.fetch_range(kind, history, chunk)[1],
-                    layout.writeback_range(kind, history, chunk)[1],
-                )
-            if len(self._costs) >= self._MAX_REMEMBERED:
-                self._costs.clear()
-            self._costs[key] = cost
-        return cost
-
-
-def max_message_bytes(layout: StagingLayout) -> int:
-    """An upper bound of the size of any message of an iteration.
-
-    A message holds pages of the kinds of one deadline class of the requests that one rank
-    computes, and those pages fit the slots of the kinds, so the slots of a class bound it.
-    """
-    per_deadline: dict = {}
-    for kind in layout.kinds:
-        deadline = DEADLINE_OF_KIND[kind]
-        per_deadline[deadline] = per_deadline.get(deadline, 0) + layout.slot_pages(
-            kind
-        ) * layout.kind_page_bytes(kind)
-    return max(per_deadline.values(), default=0)
-
-
-def max_peer_step_bytes(layout: StagingLayout) -> int:
-    """An upper bound of the bytes one rank exchanges with one peer in one step.
-
-    The messages of a step to one peer are the deadline classes of one layer, each at most once,
-    and their pages fit the slots of the kinds, so all the slots together bound them.
-    """
-    return sum(layout.slot_pages(kind) * layout.kind_page_bytes(kind) for kind in layout.kinds)
+from .dkv_working import (
+    BufferCostModel,
+    DkvBuffer,
+    PageAffine,
+    base_page_indices,
+    fetch_blocks,
+    manager_buffers,
+    page_affine,
+    staged_blocks,
+    writeback_blocks,
+)
 
 
 def arena_peers(group_size: int) -> int:
     """The peers that each of the two message arenas of a rank has room for, a step's worth each."""
     return max(group_size - 1, 1)
+
+
+def max_peer_step_bytes(working) -> int:
+    """An upper bound of the bytes one rank exchanges with one peer in one step.
+
+    The messages of a step to one peer hold the pages of one layer for the requests one rank
+    computes, and those pages fit the working cache: for every buffer of the layer, the pages of
+    its life cycle times the bytes of a page.
+    """
+    counts = working.kv_cache_manager_py_config.lifecycle_slot_counts
+    if counts is None:
+        raise ValueError("the working cache has no fixed page counts")
+    per_layer: dict[int, int] = {}
+    for entry in manager_buffers(working).values():
+        group = int(working.layer_to_pool_mapping_dict[entry.layer_id])
+        per_layer[entry.buffer.layer] = (
+            per_layer.get(entry.buffer.layer, 0) + int(counts[0][group]) * entry.buffer.page_bytes
+        )
+    return max(per_layer.values(), default=0)
 
 
 # Every message of a step starts at a multiple of this in the message arena.
@@ -309,13 +145,13 @@ def _timed_hook(method):
 
 
 class _Run(NamedTuple):
-    """The pages of a message that one buffer of a kind holds for one request.
+    """The pages of a message that one buffer holds for one request.
 
     The pages are the blocks ``first`` to ``first + count - 1`` of the request, and the message
     holds them back to back from byte ``offset``.
     """
 
-    component: StagingComponent
+    buffer: DkvBuffer
     request_id: int
     first: int
     count: int
@@ -332,12 +168,12 @@ class _CompiledOp(NamedTuple):
     """One operation of the data plane with its copies resolved to device addresses."""
 
     op: RankOp
-    key: tuple[int, int, int, int, int]
+    key: tuple[int, int, int, int]
     # The region of the message arena the message occupies; None for a local copy.
     message: torch.Tensor | None
     # The copies the operation issues, as the runs of ``DkvPageCopier.copy_runs``. A send packs
     # pages into its message, a receive unpacks its message into pages and a local copy moves
-    # pages between the cache manager and the staging area.
+    # pages between the owner's cache and the working cache.
     copies: list[int]
     runs: tuple[_Run, ...]
     # Where the pages of every run are on this rank, as copy sides, for the checksums of debug:
@@ -350,8 +186,8 @@ class _CompiledStep(NamedTuple):
     """What one rank does in one step, resolved to addresses and grouped by kind of operation."""
 
     step: PlanStep
-    # The layer whose slots are overwritten before its fetch (the debug fill), else None.
-    fill_layer: int | None
+    # The copies that overwrite the working pages of the layer before its fetch (the debug fill).
+    fill: list[int]
     local: tuple[_CompiledOp, ...]
     sends: tuple[_CompiledOp, ...]
     recvs: tuple[_CompiledOp, ...]
@@ -465,15 +301,9 @@ class DataPlaneFault:
             ) from None
 
 
-def message_key(transfer: Transfer) -> tuple[int, int, int, int, int]:
+def message_key(transfer: Transfer) -> tuple[int, int, int, int]:
     """What names a message in every iteration: the same on its two ends."""
-    return (
-        int(transfer.direction),
-        transfer.layer,
-        int(transfer.deadline),
-        transfer.owner,
-        transfer.compute,
-    )
+    return (int(transfer.direction), transfer.layer, transfer.owner, transfer.compute)
 
 
 def find_data_plane_mismatches(
@@ -498,8 +328,8 @@ def find_data_plane_mismatches(
                 segments[message_key(transfer)] = transfer
     problems = []
     for key, roles in sorted(roles_of.items()):
-        direction, layer, deadline, owner, compute = key
-        name = f"{step_label(Direction(direction), layer)}/{DeadlineClass(deadline).name.lower()}"
+        direction, layer, owner, compute = key
+        name = step_label(Direction(direction), layer)
         transfer = segments.get(key)
         requests = (
             sorted({segment.request_id for segment in transfer.segments}) if transfer else "?"
@@ -523,31 +353,35 @@ def find_data_plane_mismatches(
     return problems
 
 
+_FILL_BYTES = {"zero": 0x00, "nan": 0xFF}
+
+
 class DkvStreamer:
     """Carries out the data plane of the ``layer_split`` layout around the layers of a forward pass.
 
-    The rank computes the requests it was given and owns the layers ``owner_of_layer`` assigns to
-    it. For each iteration the executor builds a ``DkvPlan`` (``plan_for``) from the replicated
-    scheduling state and hands it over (``set_plan``). The attention backend then calls
-    ``begin_iteration`` (through the staged view), ``on_layer`` at the top of every layer and
-    ``end_forward`` after the last one, and the executor calls ``drain`` when the iteration ends.
+    The rank computes the requests it was given in its working cache and owns the layers
+    ``owner_of_layer`` assigns to it. For each iteration the executor builds a ``DkvPlan``
+    (``plan_for``) from the replicated scheduling state and hands it over (``set_plan``). Once the
+    working caches of the batch are open, ``begin_iteration`` is called, then ``on_layer`` at the
+    top of every layer and ``end_forward`` after the last one, and the executor calls ``drain`` when
+    the iteration ends.
 
-    When the staged batch is known the plan is compiled: every operation of this rank is resolved
-    to the device addresses of its pages and to its region of the message arena, step by step. The
-    hooks then only enqueue the work of their steps on ``data_stream``: the owner packs the pages
-    of its messages from its cache manager and sends them, the compute rank receives them and
-    unpacks them into the slot of the layer, and the other way round for the pages the new tokens
-    wrote. All the messages a rank sends or receives in one step are issued together when the
-    transport can group them. The data stream waits for the forward pass by events, and the
-    forward pass waits for the fetch of a layer:
+    When the batch is known the plan is compiled: every operation of this rank is resolved to the
+    device addresses of its pages and to its region of the message arena, step by step. The hooks
+    then only enqueue the work of their steps on ``data_stream``: the owner packs the pages of its
+    messages from its cache and sends them, the compute rank receives them and unpacks them into
+    its working cache, and the other way round for the pages the new tokens wrote. All the messages
+    a rank sends or receives in one step are issued together when the transport can group them.
+    The data stream waits for the forward pass by events, and the forward pass waits for the fetch
+    of a layer:
 
-    * the first operation of an iteration waits for the pages of the cache manager to be ready;
+    * the first operation of an iteration waits for the pages of the caches to be ready;
     * the operations at the top of layer ``l`` wait for the kernels of the layers before ``l``, so
-      the writeback sends what they produced and the prefetch may overwrite their slots; a rank
-      that computes nothing waits as well, which keeps it in step with the others;
+      the writeback sends what they produced and the prefetch may overwrite the pages they read; a
+      rank that computes nothing waits as well, which keeps it in step with the others;
     * the attention of layer ``l`` waits for the fetch of layer ``l``.
 
-    ``drain`` waits on the host for the data stream. After it returns the cache manager may free or
+    ``drain`` waits on the host for the data stream. After it returns the cache managers may free or
     move any page.
 
     No call blocks the host except ``drain`` (and the transport, if it has to). A rank without a
@@ -560,12 +394,13 @@ class DkvStreamer:
     def __init__(
         self,
         manager,
-        view: DkvStagedKvView,
-        transport: DkvTransport,
+        working,
+        transport: DkvTransport | None,
         owner_of_layer: Sequence[int],
         rank: int,
         *,
         group_size: int,
+        ring_depth: int = 2,
         copier: DkvPageCopier | None = None,
         data_stream=None,
         current_stream: Callable[[], object] | None = None,
@@ -574,21 +409,24 @@ class DkvStreamer:
         fault: DataPlaneFault | None = None,
         timing_event_factory: Callable[[], torch.cuda.Event] | None = None,
         group_messages: bool = True,
-        native: bool = True,
+        device: torch.device | None = None,
     ) -> None:
         """Build the streamer of ``rank``.
 
         Args:
             manager: The cache manager that holds the pages of the layers this rank owns.
-            view: The staged view whose pool holds the slots of the forward pass.
-            transport: Sends and receives the messages.
+            working: The working cache manager the attention of this rank reads, which covers
+                every layer.
+            transport: Sends and receives the messages; None for a group of one rank.
             owner_of_layer: The owner rank of every layer of the model.
             rank: This rank in the group.
             group_size: The number of ranks of the group.
+            ring_depth: How many layers ahead of its attention a layer is fetched, plus one.
             copier: Packs and unpacks the pages.
             data_stream: The CUDA stream of the data plane; a new one by default.
             current_stream: Returns the stream of the forward pass; the current stream by default.
-            fill: ``"zero"`` or ``"nan"`` overwrites a layer's slots before they are fetched.
+            fill: ``"zero"`` or ``"nan"`` overwrites the working pages of a layer before they are
+                fetched, so that a page that is read without having been fetched or written shows.
             debug: Checksums every message at both ends and the pages it came from or went to;
                 ``drain`` returns the records for the executor to compare across the ranks.
             fault: A message to damage after it was received; it needs ``debug``.
@@ -596,32 +434,67 @@ class DkvStreamer:
                 ``TRTLLM_DKV_WAIT_TIMING=1``; CUDA events by default.
             group_messages: Hand all the messages of a step to the transport in one call when it
                 has a ``group_send_recv`` method that is not None; else one message at a time.
-            native: Carry out the program with the C++ executor the transport makes with
-                ``native_data_plane``, if it has one: a hook of the forward pass is then one call.
-                Not with ``debug``, ``fault`` or ``fill``, which act on the messages and slots in
-                Python, nor without grouped messages or the affine page map of the cache manager.
+            device: Where the message buffers live, the device of both caches; the current CUDA
+                device by default.
         """
-        layout = view.layout
         owners = tuple(owner_of_layer)
-        if len(owners) != len(layout.geometry.compress_ratios):
-            raise ValueError(
-                f"the ownership table has {len(owners)} layers, the model "
-                f"{len(layout.geometry.compress_ratios)}"
-            )
         if not 0 <= rank < group_size:
             raise ValueError(f"rank {rank} is not in a group of {group_size} ranks")
         if fault is not None and debug is None:
             raise ValueError("a data plane fault is only noticed by the checksums of debug")
+        if fill and fill not in _FILL_BYTES:
+            raise ValueError(f"unknown staging fill {fill!r}: use 'zero' or 'nan'")
+        if transport is None and group_size != 1:
+            raise ValueError("a group of more than one rank needs a transport")
+        working_buffers = manager_buffers(working)
+        layers = sorted({name[0] for name in working_buffers})
+        if layers != list(range(len(owners))):
+            raise ValueError(
+                f"the ownership table has {len(owners)} layers, the working cache holds the "
+                f"layers {layers}"
+            )
         self._manager = manager
-        self._layout = layout
-        self._pool = view.pool
+        self._working = working
         self._transport = transport
         self._group_send_recv = (
-            getattr(transport, "group_send_recv", None) if group_messages else None
+            getattr(transport, "group_send_recv", None)
+            if group_messages and transport is not None
+            else None
         )
         self._owners = owners
         self._rank = rank
         self._group_size = group_size
+        self._ring_depth = ring_depth
+        self._costs = BufferCostModel(
+            [entry.buffer for entry in working_buffers.values()],
+            int(working.kv_cache_manager_py_config.tokens_per_block),
+        )
+        self._tokens_per_block = self._costs.tokens_per_block
+        self._working_affines: dict[tuple[int, str], PageAffine] = {
+            name: page_affine(working, entry.layer_id, entry.role)
+            for name, entry in working_buffers.items()
+        }
+        self._owner_affines: dict[tuple[int, str], PageAffine] = {}
+        for name, entry in manager_buffers(manager).items():
+            if owners[name[0]] != rank:
+                continue
+            reference = working_buffers.get(name)
+            if reference is None or reference.buffer != entry.buffer:
+                raise ValueError(
+                    f"the cache of rank {rank} holds {entry.buffer} of layer {name[0]}, the "
+                    f"working cache {None if reference is None else reference.buffer}"
+                )
+            self._owner_affines[name] = page_affine(manager, entry.layer_id, entry.role)
+        for layer, owner in enumerate(owners):
+            if owner != rank:
+                continue
+            missing = [
+                role
+                for role in self._costs.buffers_of(layer)
+                if (layer, role) not in self._owner_affines
+            ]
+            if missing:
+                raise ValueError(f"rank {rank} owns layer {layer} but holds no {missing} of it")
         self._copier = copier or DkvPageCopier()
         self._data_stream = data_stream if data_stream is not None else torch.cuda.Stream()
         self._current_stream = current_stream or torch.cuda.current_stream
@@ -631,73 +504,64 @@ class DkvStreamer:
         )
         self._fetch_wait_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._fill = fill
-        self._costs = LayoutCostModel(layout)
-        self._layer_types = layer_types_from_compress_ratios(layout.geometry.compress_ratios)
         # Every message of a step has its own region of the arena, so the messages of a step can
         # be packed first and issued together: a rank exchanges at most max_peer_step_bytes with
-        # each of its peers in a step, in at most one message per deadline class.
-        arena = arena_peers(group_size) * (
-            max_peer_step_bytes(layout) + len(DeadlineClass) * _MESSAGE_ALIGNMENT
-        )
-        device = view.pool.buffer.device
+        # each of its peers in a step, in one message.
+        step_bytes = max_peer_step_bytes(working)
+        arena = arena_peers(group_size) * (step_bytes + _MESSAGE_ALIGNMENT)
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         self._send_arena = torch.empty(arena, dtype=torch.uint8, device=device)
         self._recv_arena = torch.empty(arena, dtype=torch.uint8, device=device)
         self._debug = debug
         self._fault = fault
         # Where the pages of a message are read back to checksum them.
-        self._scratch = (
-            torch.empty(max_message_bytes(layout), dtype=torch.uint8, device=device)
-            if debug
+        self._scratch = torch.empty(step_bytes, dtype=torch.uint8, device=device) if debug else None
+        # The page the debug fill copies over the working pages of a layer.
+        largest_page = max((buffer.page_bytes for buffer in self._buffers()), default=16)
+        self._fill_page = (
+            torch.full((largest_page,), _FILL_BYTES[fill], dtype=torch.uint8, device=device)
+            if fill
             else None
         )
         self._iteration = 0
         self.last_plan: DkvPlan | None = None
         self.stats = DataPlaneStats()
         self._plan: DkvPlan | None = None
+        # The next forward pass carries out the plan of the batch it stages (``set_staged_plan``).
+        self._plan_staged_batch = False
         self._requests: dict[int, PlanRequest] = {}
         self._computes = False
         self._begun = False
         self._program: dict[int, list[_CompiledStep]] | None = None
-        self._local_index: dict[int, int] = {}
-        self._spans: dict[StagingKind, tuple[RequestSpan, ...]] = {}
         self._fetch_done: dict[int, object] = {}
         self._data_done = None
         # The events of the iteration, one per use, recorded again every iteration.
         self._events: dict[tuple, object] = {}
-        # A cache manager that maps blocks to pages by an affine function of their base page index
-        # gives the addresses of a run without a call per (request, layer, kind).
-        self._affine_pages = callable(
-            getattr(manager, "get_cache_index_affine", None)
-        ) and callable(getattr(manager, "get_base_page_indices", None))
-        self._affines: dict[tuple[int, object], tuple[int, int, int]] = {}
-        self._base_indices: dict[tuple[int, int], np.ndarray] = {}
-        self._indices: dict[tuple[int, int, object], np.ndarray] = {}
-        self._page_tables: dict[tuple[int, object], tuple[int, int]] = {}
-        make_native = getattr(transport, "native_data_plane", None) if native else None
-        self._native = (
-            make_native(len(owners), self._data_stream)
-            if make_native is not None
-            and debug is None
-            and fault is None
-            and not fill
-            and self._group_send_recv is not None
-            and self._affine_pages
-            else None
-        )
-        self._native_static = False
-        self._native_compiled = False
-        self._native_kinds: dict[StagingKind, int] = {}
-        self._native_components: dict[StagingComponent, int] = {}
-        self._native_groups = 0
-        # Per issue point: messages and bytes sent and received, local copies and their bytes.
-        self._native_counts: dict[int, list[int]] = {}
-        # The base page indices the executor reads while it builds the copies of the iteration.
-        self._native_indices: list[np.ndarray] = []
+        # Copies of the base page index tables the copies of the iteration read, by (owner side?,
+        # request, layer group): a manager's table is a view valid only until the next lifecycle
+        # operation of the request.
+        self._indices: dict[tuple[bool, int, int], np.ndarray] = {}
 
     @property
     def uses_native(self) -> bool:
-        """Whether the C++ executor carries out the program."""
-        return self._native is not None
+        """Whether a C++ executor carries out the program; this streamer issues from Python."""
+        return False
+
+    @property
+    def message_bytes(self) -> int:
+        """Bytes of the buffers that hold the messages of a step, sent and received."""
+        return self._send_arena.numel() + self._recv_arena.numel()
+
+    @property
+    def costs(self) -> BufferCostModel:
+        """The buffers of every layer and the pages a request moves of them."""
+        return self._costs
+
+    def _buffers(self) -> Iterable[DkvBuffer]:
+        for layer in range(len(self._owners)):
+            for role in self._costs.buffers_of(layer):
+                yield self._costs.buffer(layer, role)
 
     # ---- the plan -------------------------------------------------------------------------
 
@@ -706,10 +570,9 @@ class DkvStreamer:
         return build_dkv_plan(
             requests,
             self._owners,
-            self._layer_types,
             self._costs,
             group_size=self._group_size,
-            ring_depth=self._layout.geometry.ring_depth,
+            ring_depth=self._ring_depth,
         )
 
     def set_plan(self, plan: DkvPlan, iteration: int = 0) -> None:
@@ -724,14 +587,15 @@ class DkvStreamer:
         if (
             plan.group_size != self._group_size
             or plan.owner_of_layer != self._owners
-            or plan.ring_depth != self._layout.geometry.ring_depth
+            or plan.ring_depth != self._ring_depth
         ):
             raise RuntimeError(
                 f"the plan is for {plan.group_size} ranks, ring depth {plan.ring_depth} and "
                 f"owners {plan.owner_of_layer}, the streamer for {self._group_size} ranks, "
-                f"ring depth {self._layout.geometry.ring_depth} and owners {self._owners}"
+                f"ring depth {self._ring_depth} and owners {self._owners}"
             )
         self._plan = plan
+        self._plan_staged_batch = False
         self._iteration = iteration
         self._requests = {request.request_id: request for request in plan.requests}
         self._computes = any(
@@ -739,45 +603,63 @@ class DkvStreamer:
         )
         self._begun = False
         self._program = None
-        self._local_index = {}
-        self._spans = {}
         self._fetch_done = {}
-        self._base_indices = {}
         self._indices = {}
-        self._native_compiled = False
-        self._native_counts = {}
-        self._native_indices = []
+
+    def set_staged_plan(self, iteration: int = 0) -> None:
+        """Carry out, in the next forward pass, the plan of the batch the working cache stages for it.
+
+        Only for a group of one rank, which owns every layer and so needs no other rank to agree
+        on its plan: it is built from the requests and token counts that the attention stages,
+        whatever kind of request they are.
+
+        Raises:
+            RuntimeError: The group has more than one rank, or the previous plan has not been
+                carried out.
+        """
+        if self._group_size != 1:
+            raise RuntimeError("only a group of one rank plans the batch its working cache stages")
+        if self._plan is not None or self._plan_staged_batch:
+            raise RuntimeError("the plan of the previous forward pass was not carried out")
+        self._plan_staged_batch = True
+        self._iteration = iteration
 
     # ---- hooks of the forward pass --------------------------------------------------------
 
-    @_timed_hook
     def begin_iteration(
-        self,
-        request_ids: Sequence[int],
-        history: Sequence[int],
-        new: Sequence[int],
-        spans: dict[StagingKind, tuple[RequestSpan, ...]],
+        self, request_ids: Sequence[int], history: Sequence[int], new: Sequence[int]
     ) -> None:
-        """Called once the requests of the forward pass are placed in the slots."""
+        """Called once the working caches of the requests of the forward pass are open."""
+        if self._plan_staged_batch:
+            self.set_plan(
+                self.plan_for(
+                    PlanRequest(request_id, 0, cached, chunk)
+                    for request_id, cached, chunk in zip(request_ids, history, new)
+                ),
+                self._iteration,
+            )
+        self._begin_iteration(request_ids, history, new)
+
+    @_timed_hook
+    def _begin_iteration(
+        self, request_ids: Sequence[int], history: Sequence[int], new: Sequence[int]
+    ) -> None:
         plan = self._plan
         if plan is None:
             return
-        self._local_index = {request_id: index for index, request_id in enumerate(request_ids)}
-        self._spans = spans
+        local = {
+            request_id: (cached, chunk)
+            for request_id, cached, chunk in zip(request_ids, history, new)
+        }
         for request in plan.requests:
             if request.compute_rank != self._rank or request.is_dummy:
                 continue
-            index = self._local_index.get(request.request_id)
-            if (
-                index is None
-                or history[index] != request.context_current_position
-                or new[index] != request.context_chunk_size
-            ):
-                staged = None if index is None else (history[index], new[index])
+            staged = local.get(request.request_id)
+            if staged != (request.context_current_position, request.context_chunk_size):
                 raise RuntimeError(
                     f"rank {self._rank}: the plan has request {request.request_id} with "
                     f"{request.context_current_position} cached and {request.context_chunk_size} "
-                    f"new tokens, the staged batch has (cached, new) = {staged}"
+                    f"new tokens, the working cache has (cached, new) = {staged}"
                 )
         if not self._begun:
             self._begin()
@@ -790,9 +672,6 @@ class DkvStreamer:
             return
         if not self._begun:
             self._begin()
-        if self._native is not None:
-            self._run_native(layer)
-            return
         stream = self._current_stream()
         if layer >= 1:
             # Also on a rank that computes nothing: the host of an idle rank runs far ahead of its
@@ -817,17 +696,16 @@ class DkvStreamer:
     @_timed_hook
     def end_forward(self) -> None:
         """Called after the last layer: send back what the last layer produced."""
+        # A forward pass that staged no batch has nothing to plan.
+        self._plan_staged_batch = False
         plan = self._plan
         if plan is None:
             return
         if not self._begun:
             self._begin()
-        if self._native is not None:
-            self._run_native(plan.num_layers)
-        else:
-            self._data_stream.wait_event(self._record(self._current_stream(), ("end",)))
-            for compiled in self._program.get(plan.num_layers, ()):
-                self._issue(compiled)
+        self._data_stream.wait_event(self._record(self._current_stream(), ("end",)))
+        for compiled in self._program.get(plan.num_layers, ()):
+            self._issue(compiled)
         self._data_done = self._record(self._data_stream, ("done",))
         self.last_plan = plan
         self._plan = None
@@ -837,7 +715,7 @@ class DkvStreamer:
     def assert_idle(self, what: str) -> None:
         """Raise unless the data plane of the last iteration is done and no iteration is open.
 
-        A page may only be freed or moved by the cache manager while the data plane is idle.
+        A page may only be freed or moved by a cache manager while the data plane is idle.
 
         Raises:
             RuntimeError: ``what`` is about to happen while the data plane is still running.
@@ -874,10 +752,7 @@ class DkvStreamer:
             end.synchronize()
             self.stats.fetch_wait_seconds += start.elapsed_time(end) / 1000.0
         self._fetch_wait_events.clear()
-        if self._native is not None:
-            if self._wait_timing:
-                self.stats.fetch_wait_seconds += self._native.fetch_wait_ms() / 1000.0
-            self._native_indices = []
+        self._indices = {}
         return self._debug.collect() if self._debug is not None else []
 
     # ---- compiling the plan ---------------------------------------------------------------
@@ -888,13 +763,13 @@ class DkvStreamer:
         program: dict[int, list[_CompiledStep]] = {}
         for step in self._plan.steps:
             fetch = step.direction is Direction.FETCH
-            fill_layer = step.layer if fetch and self._computes and self._fill else None
+            fill = self._fill_copies(step.layer) if fetch and self._computes and self._fill else []
             # A rank that computes waits for the fetch of a layer also when the layer has nothing
-            # to fetch: the step follows the writeback of the layer whose slot this layer computes
-            # in, so the layer must not start before the data stream has got past it.
+            # to fetch: the step follows the writeback of the layer before, so the layer must not
+            # start before the data stream has got past it.
             record_fetch = fetch and self._computes
             ops = step.ops_for(self._rank)
-            if not ops and fill_layer is None and not record_fetch:
+            if not ops and not fill and not record_fetch:
                 continue
             local: list[_CompiledOp] = []
             sends: list[_CompiledOp] = []
@@ -910,9 +785,7 @@ class DkvStreamer:
                     compiled, recv_offset = self._compile_message(op, self._recv_arena, recv_offset)
                     recvs.append(compiled)
             program.setdefault(step.issue_point, []).append(
-                _CompiledStep(
-                    step, fill_layer, tuple(local), tuple(sends), tuple(recvs), record_fetch
-                )
+                _CompiledStep(step, fill, tuple(local), tuple(sends), tuple(recvs), record_fetch)
             )
         self._program = program
         self.stats.compile_seconds += time.perf_counter() - started
@@ -921,12 +794,12 @@ class DkvStreamer:
         transfer = op.transfer
         layer = transfer.layer
         runs = tuple(self._message_runs(transfer))
-        pool = tuple(self._pool_side(layer, run) for run in runs)
-        staging = tuple(self._staging_side(layer, run) for run in runs)
+        pool = tuple(self._owner_side(layer, run) for run in runs)
+        working = tuple(self._working_side(layer, run) for run in runs)
         if transfer.direction is Direction.FETCH:
-            sources, destinations = pool, staging
+            sources, destinations = pool, working
         else:
-            sources, destinations = staging, pool
+            sources, destinations = working, pool
         return _CompiledOp(
             op,
             message_key(transfer),
@@ -954,7 +827,7 @@ class DkvStreamer:
             )
         message = arena[offset:end]
         base = arena.data_ptr() + offset
-        side_of = self._pool_side if op.rank == transfer.owner else self._staging_side
+        side_of = self._owner_side if op.rank == transfer.owner else self._working_side
         pages = tuple(side_of(layer, run) for run in runs)
         in_message = tuple(self._message_side(base, run) for run in runs)
         if op.action is OpAction.SEND:
@@ -964,239 +837,33 @@ class DkvStreamer:
         compiled = _CompiledOp(op, message_key(transfer), message, copies, runs, (pages,))
         return compiled, -(-end // _MESSAGE_ALIGNMENT) * _MESSAGE_ALIGNMENT
 
-    # ---- compiling the plan for the C++ executor ------------------------------------------
-
-    def _set_native_static(self) -> None:
-        """Hand the executor the addresses that stay the same: pools, slots, page sizes."""
-        layout = self._layout
-        num_layers = len(self._owners)
-        self._native_kinds = {kind: index for index, kind in enumerate(layout.kinds)}
-        self._native_components = {
-            component: index for index, component in enumerate(layout.components)
-        }
-        attention_types = list(dict.fromkeys(c.attention_type for c in layout.components))
-        attention_index = {
-            attention_type: index for index, attention_type in enumerate(attention_types)
-        }
-        components = np.array(
-            [
-                [
-                    self._native_kinds[component.kind],
-                    attention_index[component.attention_type],
-                    layout.page_bytes(component),
-                ]
-                for component in layout.components
-            ],
-            dtype=np.int64,
-        ).reshape(len(layout.components), 3)
-        pool = np.zeros((num_layers, len(attention_types), 3), dtype=np.int64)
-        pool[:, :, 0] = -1
-        staging = np.zeros((num_layers, len(layout.components)), dtype=np.int64)
-        slots = np.zeros((num_layers, len(layout.kinds)), dtype=np.int64)
-        groups = 0
-        for component, index in self._native_components.items():
-            kind = self._native_kinds[component.kind]
-            for layer in layout.layers_of(component.kind):
-                staging[layer, index] = self._pool.layer_pointer(layer, component)
-                slots[layer, kind] = layout.slot_page_offset(layer, component.kind)
-                if self._owners[layer] == self._rank:
-                    group, step, origin = self._affine(layer, component.attention_type)
-                    pool[layer, attention_index[component.attention_type]] = (group, step, origin)
-                    groups = max(groups, group + 1)
-        self._native.set_static(
-            torch.from_numpy(components),
-            torch.from_numpy(pool),
-            torch.from_numpy(staging),
-            torch.from_numpy(slots),
-        )
-        self._native_groups = groups
-        self._native_static = True
-
-    def _compile_native(self) -> None:
-        """Compile the plan of the iteration into the tables of the C++ executor.
-
-        The runs of the messages of a transfer depend only on its direction, the layer type, the
-        deadline class and the compute rank, so they are built once per such template and placed
-        in a layer and a message by the operations of the steps. The executor resolves them to
-        addresses when it issues a step.
-        """
-        started = time.perf_counter()
-        if not self._native_static:
-            self._set_native_static()
-        plan = self._plan
-        layout = self._layout
-        slots: dict[int, int] = {}
-        requests: list[int] = []
-        indices: list[np.ndarray] = []
-        for request in plan.requests:
-            if request.is_dummy:
+    def _fill_copies(self, layer: int) -> list[int]:
+        """Copies of the fill page over every working page this rank's requests have in ``layer``."""
+        flat: list[int] = []
+        source = self._fill_page.data_ptr()
+        for request in self._plan.requests:
+            if request.compute_rank != self._rank or request.is_dummy:
                 continue
-            slots[request.request_id] = len(slots)
-            requests.append(request.request_id)
-            for group in range(self._native_groups):
-                # A copy: the manager's table is valid only until the next lifecycle operation.
-                table = np.array(
-                    self._manager.get_base_page_indices(request.request_id, group), dtype=np.int32
-                )
-                indices.append(table)
-                requests += (table.ctypes.data if len(table) else 0, len(table))
-            index = (
-                self._local_index.get(request.request_id)
-                if request.compute_rank == self._rank
-                else None
-            )
-            for kind in layout.kinds:
-                if index is None:
-                    requests += (-1, -1, -1)
-                else:
-                    span = self._spans[kind][index]
-                    requests += (span.first_block, span.page_offset, span.num_pages)
-        templates: dict[tuple, tuple[int, int]] = {}
-        offsets = [0]
-        runs: list[int] = []
-        steps: list[int] = []
-        ops: list[int] = []
-        counts: dict[int, list[int]] = {}
-        layer_types = self._layer_types
-        for step in plan.steps:
-            fetch = step.direction is Direction.FETCH
-            record_fetch = fetch and self._computes
-            step_ops = step.ops_for(self._rank)
-            if not step_ops and not record_fetch:
-                continue
-            first = len(ops) // 5
-            send_offset = recv_offset = 0
-            tally = counts.setdefault(step.issue_point, [0] * 8)
-            for op in step_ops:
-                transfer = op.transfer
-                key = (
-                    transfer.direction,
-                    layer_types[transfer.layer],
-                    transfer.deadline,
-                    transfer.compute,
-                )
-                template = templates.get(key)
-                if template is None:
-                    template = (len(templates), self._native_template(transfer, slots, runs))
-                    templates[key] = template
-                    offsets.append(len(runs) // 5)
-                nbytes = transfer.nbytes
-                if template[1] != nbytes:
-                    raise RuntimeError(
-                        f"rank {self._rank}: {transfer.label} has {nbytes} bytes in the plan, "
-                        f"other layers of its type {template[1]}"
-                    )
-                if op.action is OpAction.LOCAL:
-                    offset = 0
-                    tally[4] += 1
-                    tally[5] += nbytes
-                    tally[6 if fetch else 7] += nbytes
-                elif op.action is OpAction.SEND:
-                    offset = send_offset
-                    send_offset = self._next_message(send_offset, transfer, self._send_arena)
-                    tally[0] += 1
-                    tally[1] += nbytes
-                else:
-                    offset = recv_offset
-                    recv_offset = self._next_message(recv_offset, transfer, self._recv_arena)
-                    tally[2] += 1
-                    tally[3] += nbytes
-                ops += (int(op.action), template[0], op.peer, offset, nbytes)
-            steps += (
-                step.issue_point,
-                int(step.direction),
-                step.layer,
-                int(record_fetch),
-                first,
-                len(step_ops),
-            )
-        width = 1 + 2 * self._native_groups + 3 * len(layout.kinds)
-        self._native.set_iteration(
-            torch.from_numpy(np.array(requests, dtype=np.int64).reshape(-1, width)),
-            torch.from_numpy(np.array(offsets, dtype=np.int64)),
-            torch.from_numpy(np.array(runs, dtype=np.int64).reshape(-1, 5)),
-            torch.from_numpy(np.array(steps, dtype=np.int64).reshape(-1, 6)),
-            torch.from_numpy(np.array(ops, dtype=np.int64).reshape(-1, 5)),
-            self._send_arena.data_ptr(),
-            self._recv_arena.data_ptr(),
-        )
-        self._native_indices = indices
-        self._native_counts = counts
-        self._native_compiled = True
-        self.stats.compile_seconds += time.perf_counter() - started
-
-    def _native_template(self, transfer: Transfer, slots: dict[int, int], runs: list[int]) -> int:
-        """Append the runs of the messages of ``transfer`` to ``runs``; returns their bytes."""
-        layout = self._layout
-        span_of = (
-            layout.fetch_range if transfer.direction is Direction.FETCH else layout.writeback_range
-        )
-        offset = 0
-        for segment in transfer.segments:
-            request = self._requests[segment.request_id]
-            first, count = span_of(
-                segment.kind, request.context_current_position, request.context_chunk_size
-            )
-            if count != segment.pages:
-                raise RuntimeError(
-                    f"rank {self._rank}: {transfer.label} of request {segment.request_id} has "
-                    f"{segment.pages} {segment.kind.label} pages in the plan, the layout {count}"
-                )
-            if count == 0:
-                continue
-            slot = slots[segment.request_id]
-            for component in layout.components_of(segment.kind):
-                runs += (self._native_components[component], slot, first, count, offset)
-                offset += count * layout.page_bytes(component)
-        if offset != transfer.nbytes:
-            raise RuntimeError(
-                f"rank {self._rank}: {transfer.label} has {transfer.nbytes} bytes in the plan, "
-                f"the layout {offset}"
-            )
-        return offset
-
-    def _next_message(self, offset: int, transfer: Transfer, arena: torch.Tensor) -> int:
-        """Where the message after ``transfer``'s, which starts at ``offset``, starts."""
-        end = offset + transfer.nbytes
-        if end > arena.numel():
-            raise RuntimeError(
-                f"rank {self._rank}: the messages of "
-                f"{step_label(transfer.direction, transfer.layer)} need {end} bytes, the message "
-                f"arena has {arena.numel()}"
-            )
-        return -(-end // _MESSAGE_ALIGNMENT) * _MESSAGE_ALIGNMENT
-
-    def _run_native(self, issue_point: int) -> None:
-        """Enqueue the steps of ``issue_point`` with the C++ executor."""
-        started = time.perf_counter()
-        try:
-            self._native.run(issue_point, self._current_stream().cuda_stream, self._wait_timing)
-        except RuntimeError as error:
-            raise RuntimeError(
-                f"rank {self._rank}: the data plane at issue point {issue_point}: {error}"
-            ) from error
-        finally:
-            self.stats.native_seconds += time.perf_counter() - started
-        counts = self._native_counts.get(issue_point)
-        if counts is not None:
-            stats = self.stats
-            stats.messages_sent += counts[0]
-            stats.bytes_sent += counts[1]
-            stats.messages_received += counts[2]
-            stats.bytes_received += counts[3]
-            stats.local_copies += counts[4]
-            stats.bytes_local += counts[5]
-            stats.bytes_local_fetch += counts[6]
-            stats.bytes_local_writeback += counts[7]
+            history, chunk = request.context_current_position, request.context_chunk_size
+            for role in self._costs.buffers_of(layer):
+                buffer = self._costs.buffer(layer, role)
+                first, count = staged_blocks(buffer.key, history, chunk, self._tokens_per_block)
+                if not count:
+                    continue
+                run = _Run(buffer, request.request_id, first, count, 0)
+                flat.append(buffer.page_bytes)
+                flat.append(count)
+                flat.extend(self._working_side(layer, run))
+                flat.extend((source, 0, 0))
+        return flat
 
     def _copy_runs(
         self, runs: Sequence[_Run], destinations: Sequence[_Side], sources: Sequence[_Side]
     ) -> list[int]:
         """The runs of a copy from ``sources`` to ``destinations`` as ``copy_runs`` reads them."""
-        page_bytes = self._layout.page_bytes
         flat: list[int] = []
         for run, destination, source in zip(runs, destinations, sources):
-            flat.append(page_bytes(run.component))
+            flat.append(run.buffer.page_bytes)
             flat.append(run.count)
             flat.extend(destination)
             flat.extend(source)
@@ -1212,11 +879,6 @@ class DkvStreamer:
 
     def _begin(self) -> None:
         self._begun = True
-        if self._native is not None:
-            if not self._native_compiled:
-                self._compile_native()
-            self._run_native(ISSUE_AT_BEGIN)
-            return
         if self._program is None:
             self._compile()
         self._data_stream.wait_event(self._record(self._current_stream(), ("begin",)))
@@ -1225,10 +887,9 @@ class DkvStreamer:
 
     def _issue(self, compiled: _CompiledStep) -> None:
         """Enqueue the operations of one step on the data stream."""
-        if compiled.fill_layer is not None:
-            with torch.cuda.stream(self._data_stream):
-                self._pool.fill_layer(compiled.fill_layer, self._fill)
         stream = self._data_stream.cuda_stream
+        if compiled.fill:
+            self._copy(compiled.fill, stream, f"the fill of layer {compiled.step.layer}")
         debug = self._debug
         stats = self.stats
         for op in compiled.local:
@@ -1320,122 +981,69 @@ class DkvStreamer:
 
     def _message_runs(self, transfer: Transfer) -> list[_Run]:
         """The pages of a message in the order they are laid out, buffer by buffer in a segment."""
-        layout = self._layout
         fetch = transfer.direction is Direction.FETCH
-        span_of = layout.fetch_range if fetch else layout.writeback_range
+        blocks_of = fetch_blocks if fetch else writeback_blocks
         runs: list[_Run] = []
         offset = 0
         for segment in transfer.segments:
             request = self._requests[segment.request_id]
-            history, chunk = request.context_current_position, request.context_chunk_size
-            first, count = span_of(segment.kind, history, chunk)
+            buffer = self._costs.buffer(transfer.layer, segment.buffer)
+            first, count = blocks_of(
+                buffer.key,
+                request.context_current_position,
+                request.context_chunk_size,
+                self._tokens_per_block,
+            )
             if count != segment.pages:
                 raise RuntimeError(
                     f"rank {self._rank}: {transfer.label} of request {segment.request_id} has "
-                    f"{segment.pages} {segment.kind.label} pages in the plan, the layout {count}"
+                    f"{segment.pages} pages of {segment.buffer} in the plan, the rules {count}"
                 )
-            for component in layout.components_of(segment.kind):
-                runs.append(_Run(component, segment.request_id, first, count, offset))
-                offset += count * layout.page_bytes(component)
+            runs.append(_Run(buffer, segment.request_id, first, count, offset))
+            offset += count * buffer.page_bytes
         if offset != transfer.nbytes:
             raise RuntimeError(
                 f"rank {self._rank}: {transfer.label} has {transfer.nbytes} bytes in the plan, "
-                f"the layout {offset}"
+                f"the rules {offset}"
             )
         return runs
 
     def _message_side(self, base: int, run: _Run) -> _Side:
         """The pages of a run in a message buffer that starts at ``base``: back to back."""
-        return (base + run.offset, self._layout.page_bytes(run.component), 0)
+        return (base + run.offset, run.buffer.page_bytes, 0)
 
-    def _pool_side(self, layer: int, run: _Run) -> _Side:
-        """The pages of a run in the cache manager of this rank: through their page indices.
+    def _owner_side(self, layer: int, run: _Run) -> _Side:
+        """The pages of a run in the cache of this rank, the owner of ``layer``."""
+        affine = self._owner_affines[layer, run.buffer.role]
+        return self._indexed_side(self._manager, False, affine, layer, run, "the cache")
 
-        The copier reads the indices from the table of the cache manager itself (or from a copy of
-        the list an older manager gives) and reports a block without a page.
+    def _working_side(self, layer: int, run: _Run) -> _Side:
+        """The pages of a run in the working cache of this rank, which computes the request."""
+        affine = self._working_affines[layer, run.buffer.role]
+        return self._indexed_side(self._working, True, affine, layer, run, "the working cache")
+
+    def _indexed_side(
+        self, manager, working: bool, affine: PageAffine, layer: int, run: _Run, what: str
+    ) -> _Side:
+        """A copy side over the pages of a run that a manager's base page indices name.
+
+        The copier reads the indices from a copy of the manager's table, which stays alive until
+        the iteration is drained, and reports a block without a page.
         """
-        attention_type = run.component.attention_type
-        if self._affine_pages:
-            group, step, origin = self._affine(layer, attention_type)
-            indices = self._base_indices.get((run.request_id, group))
-            if indices is None:
-                # A copy: the manager's table is a view that is valid only until the next
-                # lifecycle operation of the request, and the copier reads the indices during
-                # the whole forward pass.
-                indices = np.array(
-                    self._manager.get_base_page_indices(run.request_id, group), dtype=np.int32
+        key = (working, run.request_id, affine.layer_group)
+        indices = self._indices.get(key)
+        if indices is None:
+            if run.request_id not in manager.kv_cache_map:
+                raise RuntimeError(
+                    f"rank {self._rank}: request {run.request_id} has no pages in {what}"
                 )
-                self._base_indices[run.request_id, group] = indices
-        else:
-            origin, step = self._page_table(layer, attention_type)
-            key = (run.request_id, layer, attention_type)
-            indices = self._indices.get(key)
-            if indices is None:
-                indices = np.asarray(
-                    self._manager.get_cache_indices(run.request_id, layer, attention_type),
-                    dtype=np.int32,
-                )
-                self._indices[key] = indices
+            indices = np.array(
+                base_page_indices(manager, run.request_id, affine.layer_group), dtype=np.int32
+            )
+            self._indices[key] = indices
         if len(indices) < run.first + run.count:
             raise RuntimeError(
-                f"rank {self._rank}: the cache manager has no page for block {len(indices)} of "
-                f"request {run.request_id} in layer {layer} ({attention_type.name}), which the "
-                "plan moves"
+                f"rank {self._rank}: {what} has no page for block {len(indices)} of request "
+                f"{run.request_id} in layer {layer} ({run.buffer.role}), which the plan moves"
             )
-        return (origin, step, indices.ctypes.data + 4 * run.first)
-
-    def _affine(self, layer: int, attention_type) -> tuple[int, int, int]:
-        """``(layer group, address step, address origin)`` of the pages of a buffer.
-
-        Block ``b`` of a request is at ``origin + base[b] * step`` where ``base`` is its base
-        page indices in the layer group. Looked up once per buffer.
-        """
-        key = (layer, attention_type)
-        affine = self._affines.get(key)
-        if affine is None:
-            group, scale, offset = self._manager.get_cache_index_affine(layer, attention_type)
-            base, stride = self._page_table(layer, attention_type)
-            affine = (group, scale * stride, base + offset * stride)
-            self._affines[key] = affine
-        return affine
-
-    def _page_table(self, layer: int, attention_type) -> tuple[int, int]:
-        """Where the pages of a buffer of the cache manager start and how far apart they are.
-
-        The pools of the cache manager are allocated once, so this is looked up once.
-        """
-        table = self._page_tables.get((layer, attention_type))
-        if table is None:
-            buffer = self._manager.get_buffers(layer, attention_type)
-            table = (buffer.data_ptr(), buffer.stride(0) * buffer.element_size())
-            self._page_tables[layer, attention_type] = table
-        return table
-
-    def _staging_side(self, layer: int, run: _Run) -> _Side:
-        """The pages of a run in the slot of ``layer`` of this rank: back to back."""
-        layout = self._layout
-        component = run.component
-        index = self._local_index.get(run.request_id)
-        if index is None:
-            raise RuntimeError(
-                f"rank {self._rank}: request {run.request_id} is not in the staged batch"
-            )
-        span = self._spans[component.kind][index]
-        if not (
-            span.first_block <= run.first
-            and run.first + run.count <= span.first_block + span.num_pages
-        ):
-            raise RuntimeError(
-                f"rank {self._rank}: blocks {run.first}..{run.first + run.count - 1} of request "
-                f"{run.request_id} are outside the staged blocks {span.first_block}.."
-                f"{span.first_block + span.num_pages - 1} of {component.kind.label}"
-            )
-        page_bytes = layout.page_bytes(component)
-        entry = (
-            layout.slot_page_offset(layer, component.kind)
-            + span.page_offset
-            + run.first
-            - span.first_block
-        )
-        begin = self._pool.layer_pointer(layer, component) + entry * page_bytes
-        return (begin, page_bytes, 0)
+        return (affine.base, affine.step, indices.ctypes.data + 4 * run.first)

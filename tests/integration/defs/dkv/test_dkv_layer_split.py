@@ -84,8 +84,7 @@ def _precision(model: DkvModel) -> PrecisionPolicy:
 def _layer_split(monkeypatch: pytest.MonkeyPatch, fill: str = "", checksums: bool = True) -> None:
     """Build the DKV LLMs of this test from now on with the layer-split layout.
 
-    Without ``checksums`` the ranks leave out the checksums of debug, so the C++ executor carries
-    out the data plane.
+    Without ``checksums`` the ranks leave out the checksums of debug, as a production group does.
     """
     monkeypatch.setenv("DKV_TEST_KV_LAYOUT", "layer_split")
     if fill:
@@ -119,8 +118,8 @@ def _replicated_unless_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
         "layer-split",
         "layer-split-nan",
         "layer-split-nan-g4",
-        "layer-split-cpp",
-        "layer-split-cpp-g4",
+        "layer-split-no-checksums",
+        "layer-split-no-checksums-g4",
     ],
 )
 def test_the_layer_split_answers_like_the_replicated_group(
@@ -131,7 +130,7 @@ def test_the_layer_split_answers_like_the_replicated_group(
     The two are compared within the run-to-run noise of the model. With ``fill="nan"`` the slots
     are overwritten with NaN before every layer's fetch, so a page that the layer reads without it
     having been fetched or written turns the logits into NaN, which the run rejects. Without the
-    checksums of debug the C++ executor carries out the data plane.
+    checksums of debug the data plane runs as in production.
     """
     model = DEEPSEEK_V4
     _require(model, group_size)
@@ -151,7 +150,7 @@ def test_the_layer_split_answers_like_the_replicated_group(
     assert_known_answers(split, answers, tokenizer.decode, "DKV layer split")
     print(
         f"layer split precision ({fill or 'no fill'}, "
-        f"{'checksums' if checksums else 'C++ executor'}): {result}"
+        f"{'checksums' if checksums else 'no checksums'}): {result}"
     )
 
 
@@ -186,14 +185,11 @@ def test_the_layer_split_answers_chunked_prompts_like_the_replicated_group(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("checksums", [True, False], ids=["checksums", "cpp"])
+@pytest.mark.parametrize("checksums", [True, False], ids=["checksums", "no-checksums"])
 def test_the_layer_split_keeps_the_aggregate_lifetime_of_a_request(
     monkeypatch: pytest.MonkeyPatch, capfd, checksums: bool
 ) -> None:
-    """One prefill per iteration for 1000 iterations: every request returns its pages.
-
-    Without the checksums of debug the C++ executor carries out the data plane on every rank.
-    """
+    """One prefill per iteration for 1000 iterations: every request returns its pages."""
     model = DEEPSEEK_V4
     _require(model)
     _layer_split(monkeypatch, checksums=checksums)
@@ -209,10 +205,9 @@ def test_the_layer_split_keeps_the_aggregate_lifetime_of_a_request(
         assert counters is not None, f"rank {rank} exported no data plane counters"
         assert counters["bytes_sent"] > 0 and counters["bytes_received"] > 0, (rank, counters)
         assert counters["iterations"] >= 1000, (rank, counters)
-        assert (counters["native_seconds"] > 0) == (not checksums), (rank, counters)
     logs = "".join(capfd.readouterr())
     assert "DKV invariant violation" not in logs
-    assert "StagingOverflow" not in logs
+    assert "WorkingCacheOverflow" not in logs
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -425,7 +420,7 @@ def test_the_layer_split_serves_conversations_across_ranks_with_reuse(
             assert result.cached_tokens == 0, result
     logs = "".join(capfd.readouterr())
     assert "DKV invariant violation" not in logs
-    assert "StagingOverflow" not in logs
+    assert "WorkingCacheOverflow" not in logs
 
 
 @pytest.mark.threadleak(enabled=False)

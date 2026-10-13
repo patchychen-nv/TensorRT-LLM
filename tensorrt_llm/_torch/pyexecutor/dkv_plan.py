@@ -27,23 +27,22 @@ agree only because ``build_dkv_plan`` is a pure function of
 
 * the global scheduled batch: for each request its id, compute rank, the number of history tokens
   already in the cache, the chunk size and whether it is a dummy;
-* the ownership table (the owner of every layer) and the type of every layer;
-* the staging cost model, which turns (layer, kind, history, chunk) into bytes and pages.
+* the ownership table (the owner of every layer);
+* the cost model, which names the buffers of every layer and turns (layer, buffer, history, chunk)
+  into bytes and pages.
 
 It reads no clock, environment or device state and iterates only sequences, never a set or mapping
 whose order could differ between processes. Requests are put in a canonical order, ascending
 compute rank and then request id, whatever order the caller lists them in. A dummy request adds
 nothing to the plan.
 
-Messages. The KV of a layer is held in several *kinds* (``StagingKind``): sliding-window KV,
-compressed KV, the indexer's compressed keys and the compressor and indexer states. A layer type
-holds a subset of them (``kinds_of_layer``). Kinds are grouped into three *deadline classes*
-(``DeadlineClass``) by the point at which the attention of the layer first needs them, and the unit
-of communication is one message per (step, compute rank, deadline class). It carries, back to back
-in request order, the segments of every request that is computed on that rank. A message that
-would carry no byte is not part of the plan. When the owner of a layer is also the compute rank of
-some requests, their part of a step is a local gather (fetch) or scatter (writeback) instead of a
-message.
+Messages. The KV of a layer is held in one or more *buffers* (a data role of the cache manager:
+key and value, compressed KV, a compressor state, ...), named by the cost model in an order every
+rank shares. The unit of communication is one message per (step, compute rank): it carries, back to
+back in request order and for each request in buffer order, the segments of every request that is
+computed on that rank. A message that would carry no byte is not part of the plan. When the owner
+of a layer is also the compute rank of some requests, their part of a step is a local gather (fetch)
+or scatter (writeback) instead of a message.
 
 Order. A rank issues the operations of its data stream one after another, and a send or receive
 blocks until its peer posts the matching operation. The ranks therefore have to agree on the order
@@ -56,38 +55,31 @@ global order (``global_step_order``) driven by hooks that run on all ranks:
   layers ahead, which reuses the staging slot of layer ``l - 1``;
 * after the last layer, ``W(L - 1)``.
 
-Inside a step the messages are ordered by ascending compute rank and then by deadline class. A rank
-derives its own operations by filtering the step for the messages it takes part in, so for every
-pair of ranks the sender and the receiver see the same messages in the same order. In one step a
-rank never both sends and receives: the owner only sends in a fetch and only receives in a
-writeback, every other rank does the opposite.
+Inside a step the messages are ordered by ascending compute rank. A rank derives its own operations
+by filtering the step for the messages it takes part in, so for every pair of ranks the sender and
+the receiver see the same messages in the same order. In one step a rank never both sends and
+receives: the owner only sends in a fetch and only receives in a writeback, every other rank does
+the opposite.
 
 Usage::
 
     from tensorrt_llm._torch.pyexecutor.dkv import compute_ownership
 
     owners = compute_ownership(num_layers, group_size)
-    layer_types = layer_types_from_compress_ratios(compress_ratios)
-    plan = build_dkv_plan(batch, owners, layer_types, costs, group_size=group_size, ring_depth=2)
+    plan = build_dkv_plan(batch, owners, costs, group_size=group_size, ring_depth=2)
     fingerprint = plan_fingerprint(plan)
 """
 
 import hashlib
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from enum import Enum, IntEnum
-from types import MappingProxyType
+from enum import IntEnum
 from typing import NamedTuple, Protocol
 
-from .dkv_types import StagingKind
-
 __all__ = [
-    "DEADLINE_OF_KIND",
     "ISSUE_AT_BEGIN",
-    "DeadlineClass",
     "Direction",
     "DkvPlan",
-    "LayerType",
     "OpAction",
     "PageCost",
     "PlanRequest",
@@ -95,14 +87,10 @@ __all__ = [
     "RankOp",
     "Segment",
     "StagingCostModel",
-    "StagingKind",
     "StepId",
     "Transfer",
     "build_dkv_plan",
-    "deadline_classes_of_layer",
     "global_step_order",
-    "kinds_of_layer",
-    "layer_types_from_compress_ratios",
     "plan_canonical_form",
     "plan_fingerprint",
     "step_label",
@@ -123,31 +111,6 @@ class Direction(IntEnum):
     WRITEBACK = 1
 
 
-class DeadlineClass(IntEnum):
-    """The point of a layer that needs the kinds of a message, in the order a step lists them.
-
-    ``STATE``: the compressor state, needed before the compressor reduces the chunk.
-    ``INDEXER``: the indexer state and the indexer's compressed keys, needed by the indexer.
-    ``ATTENTION_KV``: the sliding-window and compressed KV that the attention reads and appends to.
-    """
-
-    STATE = 0
-    INDEXER = 1
-    ATTENTION_KV = 2
-
-
-class LayerType(Enum):
-    """The KV structure of a DeepSeek-V4 layer.
-
-    ``SWA_ONLY`` has no compression, ``CSA`` is compressed 4x with an indexer and ``HCA`` is
-    compressed 128x.
-    """
-
-    SWA_ONLY = "swa_only"
-    CSA = "csa"
-    HCA = "hca"
-
-
 class OpAction(IntEnum):
     """What one rank does in a message: send it, receive it, or copy locally.
 
@@ -160,88 +123,12 @@ class OpAction(IntEnum):
     LOCAL = 2
 
 
-DEADLINE_OF_KIND: Mapping[StagingKind, DeadlineClass] = MappingProxyType(
-    {
-        StagingKind.STATE_CSA: DeadlineClass.STATE,
-        StagingKind.STATE_HCA: DeadlineClass.STATE,
-        StagingKind.STATE_INDEXER: DeadlineClass.INDEXER,
-        StagingKind.INDEXER_COMPRESS: DeadlineClass.INDEXER,
-        StagingKind.SWA: DeadlineClass.ATTENTION_KV,
-        StagingKind.COMPRESS_R4: DeadlineClass.ATTENTION_KV,
-        StagingKind.COMPRESS_R128: DeadlineClass.ATTENTION_KV,
-    }
-)
-
-_KINDS_OF_LAYER_TYPE: Mapping[LayerType, tuple[StagingKind, ...]] = MappingProxyType(
-    {
-        LayerType.SWA_ONLY: (StagingKind.SWA,),
-        LayerType.CSA: (
-            StagingKind.SWA,
-            StagingKind.COMPRESS_R4,
-            StagingKind.INDEXER_COMPRESS,
-            StagingKind.STATE_CSA,
-            StagingKind.STATE_INDEXER,
-        ),
-        LayerType.HCA: (
-            StagingKind.SWA,
-            StagingKind.COMPRESS_R128,
-            StagingKind.STATE_HCA,
-        ),
-    }
-)
-
-
-def _group_by_deadline(
-    kinds: tuple[StagingKind, ...],
-) -> tuple[tuple[DeadlineClass, tuple[StagingKind, ...]], ...]:
-    groups = []
-    for deadline in DeadlineClass:
-        members = tuple(kind for kind in kinds if DEADLINE_OF_KIND[kind] is deadline)
-        if members:
-            groups.append((deadline, members))
-    return tuple(groups)
-
-
-_DEADLINES_OF_LAYER_TYPE: Mapping[
-    LayerType, tuple[tuple[DeadlineClass, tuple[StagingKind, ...]], ...]
-] = MappingProxyType(
-    {layer_type: _group_by_deadline(kinds) for layer_type, kinds in _KINDS_OF_LAYER_TYPE.items()}
-)
-
-
-def kinds_of_layer(layer_type: LayerType) -> tuple[StagingKind, ...]:
-    """The kinds a layer of ``layer_type`` holds, in ascending ``StagingKind`` order."""
-    return tuple(sorted(_KINDS_OF_LAYER_TYPE[layer_type]))
-
-
-def deadline_classes_of_layer(layer_type: LayerType) -> tuple[DeadlineClass, ...]:
-    """The deadline classes that have a kind in a layer of ``layer_type``, in ascending order."""
-    return tuple(deadline for deadline, _ in _DEADLINES_OF_LAYER_TYPE[layer_type])
-
-
-def layer_types_from_compress_ratios(compress_ratios: Sequence[int]) -> tuple[LayerType, ...]:
-    """Layer types of a DeepSeek-V4 model from the compression ratio of each layer.
-
-    A ratio of at most 1 is a layer without compression, a ratio of 4 is a compressed sparse
-    attention layer with an indexer and any larger ratio is a heavily compressed layer.
-    """
-    layer_types = []
-    for ratio in compress_ratios:
-        if ratio <= 1:
-            layer_types.append(LayerType.SWA_ONLY)
-        elif ratio == 4:
-            layer_types.append(LayerType.CSA)
-        else:
-            layer_types.append(LayerType.HCA)
-    return tuple(layer_types)
-
-
 @dataclass(frozen=True, slots=True)
 class PageCost:
-    """The staging costs of one request's share of one kind in one layer.
+    """The staging costs of one request's share of one buffer in one layer.
 
     Attributes:
-        page_bytes: Bytes of one page of the kind, summed over all its blocks. Positive.
+        page_bytes: Bytes of one page of the buffer, one block's worth. Positive.
         fetch_pages: Pages the owner sends before the chunk is computed.
         writeback_pages: Pages the compute rank returns after the chunk was computed.
     """
@@ -252,28 +139,36 @@ class PageCost:
 
 
 class StagingCostModel(Protocol):
-    """Where the plan gets its sizes from; the staging layout implements it.
+    """Where the plan gets its buffers and sizes from.
 
-    The plan's logic only adds and orders what the cost model returns, so a different layout (page
-    size, cache dtype, indexer dtype) changes the numbers and nothing else.
+    The plan's logic only adds and orders what the cost model returns, so a different model (other
+    buffers, page sizes, windows) changes the numbers and nothing else.
     """
 
-    def page_cost(self, layer: int, kind: StagingKind, history: int, chunk: int) -> PageCost:
-        """The costs of a request's share of ``kind`` in ``layer``.
+    def buffers_of(self, layer: int) -> tuple[str, ...]:
+        """The buffers of ``layer``: distinct names, in the order the segments of a request list
+        them.
+
+        Must give the same answer on every rank.
+        """
+        ...
+
+    def page_cost(self, layer: int, buffer: str, history: int, chunk: int) -> PageCost:
+        """The costs of a request's share of ``buffer`` in ``layer``.
 
         The cost model must be a pure function of its arguments and give the same answer on every
-        rank. It is asked only for the kinds that the type of ``layer`` holds and only for requests
-        that are not dummies.
+        rank. It is asked only for the buffers ``buffers_of`` names and only for requests that are
+        not dummies.
 
         Args:
             layer: The model layer.
-            kind: A kind of ``layer``.
+            buffer: A buffer of ``layer``.
             history: Tokens of the request that are already in the cache.
             chunk: Tokens of the request that are computed in this iteration.
 
         Returns:
             The page size and the page counts of the two directions. A count of zero means the
-            request has nothing of this kind to move that way.
+            request has nothing of this buffer to move that way.
         """
         ...
 
@@ -300,17 +195,17 @@ class PlanRequest:
 
 @dataclass(frozen=True, slots=True)
 class Segment:
-    """The part of a message that belongs to one request and one kind.
+    """The part of a message that belongs to one request and one buffer.
 
     Attributes:
         request_id: The request the pages belong to.
-        kind: The kind of the pages.
+        buffer: The buffer of the pages.
         pages: Number of pages.
-        nbytes: Bytes of the segment, ``pages`` times the page size of the kind in that layer.
+        nbytes: Bytes of the segment, ``pages`` times the page size of the buffer in that layer.
     """
 
     request_id: int
-    kind: StagingKind
+    buffer: str
     pages: int
     nbytes: int
 
@@ -320,13 +215,12 @@ class Transfer:
     """One message, or one local copy when ``owner == compute``.
 
     A fetch moves ``segments`` from the owner to the compute rank, a writeback from the compute
-    rank to the owner. The segments are concatenated in this order, requests by ascending id and
-    the kinds of the deadline class in ascending ``StagingKind`` order.
+    rank to the owner. The segments are concatenated in this order: requests by ascending id and,
+    for each request, the buffers in the cost model's order.
 
     Attributes:
         direction: Fetch or writeback.
         layer: The layer the data belongs to.
-        deadline: The deadline class of all the segments.
         owner: The rank that owns the layer.
         compute: The rank that computes the requests of the segments.
         segments: What the message carries; never empty.
@@ -334,7 +228,6 @@ class Transfer:
 
     direction: Direction
     layer: int
-    deadline: DeadlineClass
     owner: int
     compute: int
     segments: tuple[Segment, ...]
@@ -356,8 +249,8 @@ class Transfer:
 
     @property
     def label(self) -> str:
-        """The step and deadline class, for example ``F(7)/attention_kv``."""
-        return f"{step_label(self.direction, self.layer)}/{self.deadline.name.lower()}"
+        """The step and the compute rank, for example ``F(7)->2``."""
+        return f"{step_label(self.direction, self.layer)}->{self.compute}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,7 +286,7 @@ class RankOp:
         return self.transfer.nbytes
 
     def describe(self) -> str:
-        """A short text for messages, for example ``send F(7)/state 4096 B to rank 2``."""
+        """A short text for messages, for example ``send F(7)->2 4096 B to rank 2``."""
         transfer = self.transfer
         text = f"{transfer.label} {transfer.nbytes} B"
         if self.action is OpAction.LOCAL:
@@ -414,7 +307,7 @@ class PlanStep:
         issue_point: The hook that enqueues the step on every rank: ``ISSUE_AT_BEGIN`` before the
             first layer, a layer index ``l`` at the top of layer ``l`` and the number of layers
             after the last layer.
-        transfers: The transfers ordered by ascending compute rank and then deadline class.
+        transfers: The transfers ordered by ascending compute rank.
     """
 
     direction: Direction
@@ -491,7 +384,6 @@ class DkvPlan:
         group_size: Number of ranks of the DKV group. Every rank runs the forward of every layer.
         ring_depth: Slots of the staging ring.
         owner_of_layer: The owner rank of every layer.
-        layer_types: The type of every layer.
         requests: The batch in canonical order (ascending compute rank, then request id),
             dummies included.
         steps: Every step, in the global order of ``global_step_order``, also those without a
@@ -501,7 +393,6 @@ class DkvPlan:
     group_size: int
     ring_depth: int
     owner_of_layer: tuple[int, ...]
-    layer_types: tuple[LayerType, ...]
     requests: tuple[PlanRequest, ...]
     steps: tuple[PlanStep, ...]
 
@@ -530,14 +421,9 @@ class DkvPlan:
             f"{step_label(direction, layer)} is not in a plan of {self.num_layers} layers"
         )
 
-    def transfers(
-        self, direction: Direction, layer: int, deadline: DeadlineClass | None = None
-    ) -> tuple[Transfer, ...]:
-        """The messages of one step, or of one deadline class of it, ordered by compute rank."""
-        transfers = self.step(direction, layer).transfers
-        if deadline is None:
-            return transfers
-        return tuple(transfer for transfer in transfers if transfer.deadline is deadline)
+    def transfers(self, direction: Direction, layer: int) -> tuple[Transfer, ...]:
+        """The messages of one step, ordered by compute rank."""
+        return self.step(direction, layer).transfers
 
     def steps_at(self, issue_point: int) -> tuple[PlanStep, ...]:
         """The steps that the hook ``issue_point`` enqueues, in the order to enqueue them."""
@@ -566,23 +452,13 @@ class DkvPlan:
         return tuple(op for step in self.steps for op in step.ops_for(rank))
 
 
-def _check_geometry(
-    owner_of_layer: tuple[int, ...],
-    layer_types: tuple[LayerType, ...],
-    group_size: int,
-    ring_depth: int,
-) -> None:
+def _check_geometry(owner_of_layer: tuple[int, ...], group_size: int, ring_depth: int) -> None:
     if group_size < 1 or ring_depth < 1:
         raise ValueError(
             f"group_size and ring_depth must be positive, got {group_size} and {ring_depth}"
         )
     if not owner_of_layer:
         raise ValueError("the ownership table has no layer")
-    if len(layer_types) != len(owner_of_layer):
-        raise ValueError(
-            f"the ownership table has {len(owner_of_layer)} layers, "
-            f"the layer types {len(layer_types)}"
-        )
     outside = sorted({owner for owner in owner_of_layer if not 0 <= owner < group_size})
     if outside:
         raise ValueError(f"ranks {outside} own layers but the group has {group_size} ranks")
@@ -610,38 +486,45 @@ def _canonical_requests(
     return ordered
 
 
-def _class_segments(
+def _check_buffers(layer: int, buffers: tuple[str, ...]) -> None:
+    if not all(isinstance(buffer, str) for buffer in buffers) or len(set(buffers)) < len(buffers):
+        raise ValueError(
+            f"the cost model names the buffers {buffers!r} for layer {layer}; "
+            "they must be distinct strings"
+        )
+
+
+def _segments(
     costs: StagingCostModel,
     layer: int,
-    kinds: tuple[StagingKind, ...],
+    buffers: tuple[str, ...],
     requests: Sequence[PlanRequest],
 ) -> tuple[list[Segment], list[Segment]]:
-    """The fetch and writeback segments of ``requests`` for the ``kinds`` of one deadline class."""
+    """The fetch and writeback segments of ``requests`` for the buffers of one layer."""
     fetch: list[Segment] = []
     writeback: list[Segment] = []
     for request in requests:
         history = request.context_current_position
         chunk = request.context_chunk_size
-        for kind in kinds:
-            cost = costs.page_cost(layer, kind, history, chunk)
+        for buffer in buffers:
+            cost = costs.page_cost(layer, buffer, history, chunk)
             if cost.page_bytes < 1 or cost.fetch_pages < 0 or cost.writeback_pages < 0:
                 raise ValueError(
-                    f"the cost model returned {cost} for layer {layer}, kind {kind.name}, "
+                    f"the cost model returned {cost} for layer {layer}, buffer {buffer}, "
                     f"history {history} and chunk {chunk}"
                 )
             if cost.fetch_pages:
                 nbytes = cost.fetch_pages * cost.page_bytes
-                fetch.append(Segment(request.request_id, kind, cost.fetch_pages, nbytes))
+                fetch.append(Segment(request.request_id, buffer, cost.fetch_pages, nbytes))
             if cost.writeback_pages:
                 nbytes = cost.writeback_pages * cost.page_bytes
-                writeback.append(Segment(request.request_id, kind, cost.writeback_pages, nbytes))
+                writeback.append(Segment(request.request_id, buffer, cost.writeback_pages, nbytes))
     return fetch, writeback
 
 
 def build_dkv_plan(
     requests: Iterable[PlanRequest],
     owner_of_layer: Sequence[int],
-    layer_types: Sequence[LayerType],
     costs: StagingCostModel,
     *,
     group_size: int,
@@ -656,23 +539,20 @@ def build_dkv_plan(
     Args:
         requests: The global scheduled batch of all ranks, dummies included.
         owner_of_layer: The owner rank of every layer, as ``compute_ownership`` returns it.
-        layer_types: The type of every layer.
-        costs: The staging layout's sizes.
+        costs: The buffers of every layer and their sizes.
         group_size: Number of ranks of the DKV group.
         ring_depth: Slots of the staging ring, at least 1.
 
     Returns:
-        The plan with one message per (step, compute rank, deadline class) that moves bytes.
+        The plan with one message per (step, compute rank) that moves bytes.
 
     Raises:
-        ValueError: The geometry or the batch is inconsistent: a rank outside the group, a table
-            whose length differs from the number of layers, a repeated request id, a negative
-            history or chunk, or a cost model that returns a non-positive page size or a negative
-            page count.
+        ValueError: The geometry or the batch is inconsistent: a rank outside the group, a repeated
+            request id, a negative history or chunk, or a cost model that names a buffer twice or
+            not by a string, or returns a non-positive page size or a negative page count.
     """
     owners = tuple(owner_of_layer)
-    types_by_layer = tuple(layer_types)
-    _check_geometry(owners, types_by_layer, group_size, ring_depth)
+    _check_geometry(owners, group_size, ring_depth)
     batch = _canonical_requests(requests, group_size)
 
     real_by_rank: list[list[PlanRequest]] = [[] for _ in range(group_size)]
@@ -683,30 +563,22 @@ def build_dkv_plan(
     fetches: list[tuple[Transfer, ...]] = []
     writebacks: list[tuple[Transfer, ...]] = []
     for layer, owner in enumerate(owners):
+        buffers = tuple(costs.buffers_of(layer))
+        _check_buffers(layer, buffers)
         layer_fetches: list[Transfer] = []
         layer_writebacks: list[Transfer] = []
         for compute, real in enumerate(real_by_rank):
             if not real:
                 continue
-            for deadline, kinds in _DEADLINES_OF_LAYER_TYPE[types_by_layer[layer]]:
-                fetch_segments, writeback_segments = _class_segments(costs, layer, kinds, real)
-                if fetch_segments:
-                    layer_fetches.append(
-                        Transfer(
-                            Direction.FETCH, layer, deadline, owner, compute, tuple(fetch_segments)
-                        )
-                    )
-                if writeback_segments:
-                    layer_writebacks.append(
-                        Transfer(
-                            Direction.WRITEBACK,
-                            layer,
-                            deadline,
-                            owner,
-                            compute,
-                            tuple(writeback_segments),
-                        )
-                    )
+            fetch_segments, writeback_segments = _segments(costs, layer, buffers, real)
+            if fetch_segments:
+                layer_fetches.append(
+                    Transfer(Direction.FETCH, layer, owner, compute, tuple(fetch_segments))
+                )
+            if writeback_segments:
+                layer_writebacks.append(
+                    Transfer(Direction.WRITEBACK, layer, owner, compute, tuple(writeback_segments))
+                )
         fetches.append(tuple(layer_fetches))
         writebacks.append(tuple(layer_writebacks))
 
@@ -719,7 +591,7 @@ def build_dkv_plan(
         )
         for step_id in global_step_order(len(owners), ring_depth)
     )
-    return DkvPlan(group_size, ring_depth, owners, types_by_layer, batch, steps)
+    return DkvPlan(group_size, ring_depth, owners, batch, steps)
 
 
 def plan_canonical_form(plan: DkvPlan) -> tuple[object, ...]:
@@ -734,7 +606,6 @@ def plan_canonical_form(plan: DkvPlan) -> tuple[object, ...]:
         plan.group_size,
         plan.ring_depth,
         plan.owner_of_layer,
-        tuple(layer_type.name for layer_type in plan.layer_types),
         tuple(
             (
                 request.request_id,
@@ -752,11 +623,10 @@ def plan_canonical_form(plan: DkvPlan) -> tuple[object, ...]:
                 step.issue_point,
                 tuple(
                     (
-                        transfer.deadline.name,
                         transfer.owner,
                         transfer.compute,
                         tuple(
-                            (segment.request_id, segment.kind.name, segment.pages, segment.nbytes)
+                            (segment.request_id, segment.buffer, segment.pages, segment.nbytes)
                             for segment in transfer.segments
                         ),
                     )

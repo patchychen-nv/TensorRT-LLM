@@ -19,7 +19,7 @@ plan into the per-rank operation sequences (``expand_plan``), adds the dependenc
 operations and checks three things:
 
 * pairing: the k-th send from rank a to rank b meets the k-th receive that b posts from a (first in,
-  first out per peer), and both describe the same step, deadline class and requests. A different
+  first out per peer), and both describe the same step, compute rank and requests. A different
   size hangs the transport or corrupts the data, and so does the same size with other content;
 * order: every rank issues the steps in the global order of ``global_step_order``, which the
   argument for deadlock freedom relies on;

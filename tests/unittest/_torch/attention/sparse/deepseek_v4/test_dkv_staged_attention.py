@@ -12,24 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A/B of the DeepSeek-V4 attention layers on the cache manager against its staged view.
+"""A/B of the DeepSeek-V4 attention layers on the cache manager against a working cache.
 
 Five attention layers (one with sliding-window attention only, two CSA and two HCA layers), each
 with weights of its own, run a schedule of iterations on two cache managers: a prefill, a chunked
 prefill on a cached prefix next to a decode step (a mixed batch) and a decode step of two requests.
-The layers read and write the pages of the first manager directly. The second manager is behind a
-``DkvStagedKvView``: a ``LoopbackStreamer`` copies the cached pages of a layer into its slot of the
-staging area before the layer runs and the pages the new tokens wrote back after it, so the kernels
-only ever see the staging area. The outputs of every layer and the pages of both managers must be
-the same after every iteration. The first manager is run twice, to know how much the layers differ
-from themselves.
+The layers read and write the pages of the first manager directly. The layers of the second run in
+a working cache, a second manager of the same class that holds pages only for the requests of the
+iteration: a ``DkvStreamer`` of a group of one rank copies the cached pages of a layer from the
+manager into the working cache before the layer runs and the pages the new tokens wrote back after
+it, so the kernels only ever see the working cache. The outputs of every layer and the pages of
+both managers must be the same after every iteration. The first manager is run twice, to know how
+much the layers differ from themselves.
 
-Three more checks show that the comparison is sensitive and that the kernels use the staging area
-alone. Bytes flipped in the staging area after the fetch must change the result, for every kind of
+Three more checks show that the comparison is sensitive and that the kernels use the working cache
+alone. Bytes flipped in the working cache after the fetch must change the result, for every kind of
 storage. And while a layer runs, the pages it has in the cache manager are poisoned: the result
 must not change, and the kernels must not write them.
 """
 
+import functools
 import weakref
 from dataclasses import dataclass
 from functools import lru_cache
@@ -42,21 +44,20 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import DeepseekV4AttentionType
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+    DeepseekV4AttentionType,
+    compress_ratio_has_attention,
+)
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4Attention
-from tensorrt_llm._torch.pyexecutor.dkv_staging import (
-    BAD_PAGE_INDEX,
-    DkvStagedKvView,
-    StagingGeometry,
-    StagingKind,
-    StagingLayout,
-    StagingPool,
-    attention_types,
+from tensorrt_llm._torch.pyexecutor.dkv_streamer import DkvStreamer
+from tensorrt_llm._torch.pyexecutor.dkv_working import (
+    DkvWorkingSession,
+    manager_buffers,
+    working_slot_counts,
 )
-from tensorrt_llm._torch.pyexecutor.dkv_streamer import LoopbackStreamer
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -66,6 +67,7 @@ from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCach
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 pytestmark = [skip_pre_blackwell, skip_blackwell_geforce]
 
@@ -208,7 +210,7 @@ def _model(indexer: str, fp8_kv: bool) -> _Model:
     return _Model(model_config, sparse, layers, fp8_kv)
 
 
-def _create_manager(model: _Model) -> DeepseekV4CacheManager:
+def _create_manager(model: _Model, **kwargs) -> DeepseekV4CacheManager:
     return DeepseekV4CacheManager(
         kv_cache_config=KvCacheConfig(
             dtype="fp8" if model.fp8_kv else "auto",
@@ -216,6 +218,7 @@ def _create_manager(model: _Model) -> DeepseekV4CacheManager:
             enable_swa_scratch_reuse=False,
             max_tokens=_MAX_SEQ_LEN * _MAX_BATCH_SIZE,
             event_buffer_max_size=0,
+            host_cache_size=0,
         ),
         kv_cache_type=CacheType.SELFKONLY,
         num_layers=len(_RATIOS),
@@ -231,7 +234,26 @@ def _create_manager(model: _Model) -> DeepseekV4CacheManager:
         max_num_tokens=_MAX_NUM_TOKENS,
         sparse_attn_config=model.sparse,
         model_config=model.config,
+        **kwargs,
     )
+
+
+def _attention_types(layer: int) -> list[DeepseekV4AttentionType]:
+    return [
+        attn_type
+        for attn_type in DeepseekV4AttentionType
+        if compress_ratio_has_attention(_RATIOS[layer], attn_type)
+    ]
+
+
+def _pages_of(manager, request_id: int, layer: int, attn_type) -> dict[int, torch.Tensor]:
+    """The pages of a request in a layer by block, where the attention reads them."""
+    buffer = manager.get_buffers(layer, attn_type)
+    return {
+        block: buffer[index].view(torch.uint8).reshape(-1)
+        for block, index in enumerate(manager.get_cache_indices(request_id, layer, attn_type))
+        if index != BAD_PAGE_INDEX
+    }
 
 
 @dataclass
@@ -241,24 +263,34 @@ class _Result:
 
 
 class _Flow:
-    """The schedule on one cache manager, directly or through a staged view of it."""
+    """The schedule on one cache manager, directly or through a working cache."""
 
     def __init__(self, model: _Model, workload: _Workload, *, make_streamer=None) -> None:
-        """``make_streamer(manager, view)`` returns the streamer that stages the layers; ``None``:
-        the layers use the pages of the manager."""
+        """``make_streamer(manager, working)`` returns the streamer that moves the pages between
+        the manager and the working cache the layers run in; ``None``: the layers use the pages of
+        the manager."""
         self.model = model
         self.workload = workload
         self.manager = _create_manager(model)
         # The pages start the same in every run, so that the bytes a request does not write compare.
         for layer, role in self.manager._layer_attn_to_layer_id:
             self.manager.get_buffers(layer, role).view(torch.uint8).zero_()
-        self.view = None
+        self.working = None
         self.streamer = None
         if make_streamer is not None:
-            geometry = StagingGeometry.from_cache_manager(self.manager, max_staging_tokens=8192)
-            self.view = DkvStagedKvView(self.manager, StagingPool(StagingLayout(geometry)))
-            self.streamer = make_streamer(self.manager, self.view)
-            self.view.dkv_streamer = self.streamer
+            self.working = _create_manager(
+                model,
+                lifecycle_slot_counts=functools.partial(
+                    working_slot_counts,
+                    max_batch_size=_MAX_BATCH_SIZE,
+                    max_num_tokens=_MAX_NUM_TOKENS,
+                    staging_tokens=_MAX_BATCH_SIZE * _MAX_SEQ_LEN,
+                ),
+            )
+            self.streamer = make_streamer(self.manager, self.working)
+            # What the executor installs: the attention stages its batch through the session.
+            self.working.dkv_streamer = self.streamer
+            self.working.dkv_working_session = DkvWorkingSession(self.working, self.streamer)
 
     def run(self) -> _Result:
         manager = self.manager
@@ -310,18 +342,23 @@ class _Flow:
             for request in requests:
                 if request.py_request_id in manager.kv_cache_map:
                     manager.free_resources(request)
+            if self.working is not None:
+                self.working.dkv_working_session.end()
+                self.working.shutdown()
             manager.shutdown()
         return result
 
     def _forward(self, iteration, step, history, new_tokens) -> list[torch.Tensor]:
         model = self.model
         order = [index for index, _ in step.contexts] + list(step.generations)
+        if self.streamer is not None:
+            self.streamer.set_staged_plan(iteration)
         metadata = DeepseekV4TrtllmAttentionMetadata(
             seq_lens=torch.tensor(new_tokens, dtype=torch.int32),
             num_contexts=len(step.contexts),
             max_num_requests=len(order),
             kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=history),
-            kv_cache_manager=self.view if self.view is not None else self.manager,
+            kv_cache_manager=self.working if self.working is not None else self.manager,
             request_ids=order,
             # The executor passes the tokens of the chunk for a context request.
             prompt_lens=[chunk for _, chunk in step.contexts]
@@ -356,6 +393,10 @@ class _Flow:
                 outputs.append(output.detach().clone())
             if self.streamer is not None:
                 self.streamer.end_forward()
+        if self.streamer is not None:
+            # What the executor does before anything may free a page of the iteration.
+            self.streamer.drain(60.0)
+            self.working.dkv_working_session.end()
         torch.cuda.synchronize()
         return outputs
 
@@ -364,11 +405,11 @@ class _Flow:
 
         The rows of the last page behind the end of the sequence hold whatever the kernels left
         there, which depends on memory they do not own, so they are not compared. Neither are the
-        pages that have left the window of their kind: the cache manager releases them before
-        anything reads them, and the staged path does not send them back.
+        pages that have left the window of their life cycle: the cache manager releases them before
+        anything reads them, and the working cache does not send them back.
         """
         manager = self.manager
-        layout = StagingLayout(StagingGeometry.from_cache_manager(manager, max_staging_tokens=8192))
+        buffers = manager_buffers(manager)
         pages = {}
         for request in requests:
             request_id = request.py_request_id
@@ -381,28 +422,19 @@ class _Flow:
                     DeepseekV4AttentionType.INDEXER_COMPRESS,
                 )
                 rows = _TOKENS_PER_BLOCK // ratio if compressed else _TOKENS_PER_BLOCK
-                kind = next(
-                    component.kind
-                    for component in layout.components
-                    if component.attention_type is role
-                    and layer in layout.layers_of(component.kind)
-                )
-                window = layout.window(kind)
+                window = buffers[layer, str(role.role)].buffer.key.window_size
                 first_alive = (
                     0
-                    if window is None
+                    if not window
                     else max(0, cached[request_id] + 1 - window) // _TOKENS_PER_BLOCK
                 )
-                indices = manager.get_cache_indices(request_id, layer, role)
-                buffer = manager.get_buffers(layer, role)
-                for block, index in enumerate(indices):
-                    if index == BAD_PAGE_INDEX or block < first_alive:
+                for block, page in _pages_of(manager, request_id, layer, role).items():
+                    if block < first_alive:
                         continue
                     tokens = min(
                         _TOKENS_PER_BLOCK, max(0, cached[request_id] - block * _TOKENS_PER_BLOCK)
                     )
                     valid_rows = tokens // ratio if compressed else tokens
-                    page = buffer[index].view(torch.uint8).reshape(-1)
                     pages[request_id, layer, role, block] = page[
                         : page.numel() // rows * valid_rows
                     ].clone()
@@ -412,103 +444,111 @@ class _Flow:
 # ---- streamers that misbehave on purpose -----------------------------------------------------
 
 
-def _loopback(manager, view):
-    return LoopbackStreamer(manager, view, fill="zero")
+def _streamer(manager, working, fill: str = "zero") -> DkvStreamer:
+    """A group of one rank, which owns every layer."""
+    return DkvStreamer(manager, working, None, (0,) * len(_RATIOS), 0, group_size=1, fill=fill)
 
 
-def _nan_loopback(manager, view):
-    return LoopbackStreamer(manager, view, fill="nan")
+def _nan_streamer(manager, working) -> DkvStreamer:
+    return _streamer(manager, working, fill="nan")
 
 
-class _FlipAfterFetch(LoopbackStreamer):
-    """A streamer whose fetch is followed by ``corrupt(streamer, layer)``, as a bad copy would be."""
+class _Staging(DkvStreamer):
+    """A streamer that remembers the batch it staged."""
 
-    def __init__(self, manager, view, corrupt) -> None:
-        super().__init__(manager, view, fill="zero")
+    def __init__(self, manager, working) -> None:
+        super().__init__(manager, working, None, (0,) * len(_RATIOS), 0, group_size=1, fill="zero")
+        self.owner = manager
+        self.working = working
+        self.staged: list[tuple[int, int, int]] = []
+
+    def begin_iteration(self, request_ids, history, new) -> None:
+        self.staged = list(zip(request_ids, history, new))
+        super().begin_iteration(request_ids, history, new)
+
+
+class _CorruptAfterFetch(_Staging):
+    """A streamer whose fetch of a layer is followed by ``corrupt(streamer, layer)``, as a bad copy
+    would be: on the stream of the forward pass, once the layer waited for its fetch."""
+
+    def __init__(self, manager, working, corrupt) -> None:
+        super().__init__(manager, working)
         self._corrupt = corrupt
 
-    def _fetch(self, layer: int) -> None:
-        super()._fetch(layer)
+    def on_layer(self, layer: int) -> None:
+        super().on_layer(layer)
         self._corrupt(self, layer)
 
 
-def _flip_kind(kind: StagingKind):
-    """Invert every byte of the slots the layers of ``kind`` have in the staging area."""
+def _flip_storage(roles: tuple, ratios: tuple):
+    """Invert every byte of the pages of ``roles`` that the layers of ``ratios`` have in the
+    working cache."""
 
-    def corrupt(streamer: LoopbackStreamer, layer: int) -> None:
-        layout = streamer._layout
-        for component in layout.components:
-            if component.kind is kind and layer in layout.layers_of(kind):
-                streamer._pool.slot(layer, component).bitwise_xor_(0xFF)
+    def corrupt(streamer: _Staging, layer: int) -> None:
+        if _RATIOS[layer] not in ratios:
+            return
+        for request_id, _, _ in streamer.staged:
+            for attn_type in roles:
+                for page in _pages_of(streamer.working, request_id, layer, attn_type).values():
+                    page.bitwise_xor_(0xFF)
 
     return corrupt
 
 
 def _flip_one_bit(layer: int):
     """Flip a bit of the exponent of one value in the sliding-window page that holds the last
-    cached token of the first request of the batch, in the slot of ``layer``."""
+    cached token of the first request of the batch, in ``layer`` of the working cache."""
 
-    def corrupt(streamer: LoopbackStreamer, current: int) -> None:
-        history = streamer._history[0]
+    def corrupt(streamer: _Staging, current: int) -> None:
+        request_id, history, _ = streamer.staged[0]
         if current != layer or not history:
             return
-        layout = streamer._layout
-        component = [c for c in layout.components if c.kind is StagingKind.SWA][0]
         block = (history - 1) // _TOKENS_PER_BLOCK
-        span = streamer._spans[StagingKind.SWA][0]
-        page = layout.block_table(StagingKind.SWA, layer, span, block + 1)[block]
-        row_bytes = layout.page_bytes(component) // _TOKENS_PER_BLOCK
+        page = _pages_of(streamer.working, request_id, layer, DeepseekV4AttentionType.SWA)[block]
+        row_bytes = page.numel() // _TOKENS_PER_BLOCK
         row = (history - 1) % _TOKENS_PER_BLOCK
-        streamer._pool.pages(component)[page, row * row_bytes + 1] ^= 0x40
+        page[row * row_bytes + 1] ^= 0x40
 
     return corrupt
 
 
-class _PoisonPages(LoopbackStreamer):
+class _PoisonPages(_Staging):
     """A streamer that poisons the pages of the layer in the cache manager while the layer runs.
 
-    The pages are saved after the fetch and overwritten with NaN bytes. Before the pages are
-    written back they must still be poisoned, which they are if no kernel wrote them, and they are
-    restored.
+    Once the layer waited for its fetch, its pages in the manager are saved and overwritten with
+    NaN bytes. Before the writeback of the layer is enqueued they must still be poisoned, which they
+    are if no kernel wrote them, and they are restored.
     """
 
-    def __init__(self, manager, view) -> None:
-        super().__init__(manager, view, fill="zero")
+    def __init__(self, manager, working) -> None:
+        super().__init__(manager, working)
         self._saved: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.poisoned_pages = 0
 
-    def _layer_pages(self, layer: int) -> list[torch.Tensor]:
-        manager, layout = self._manager, self._layout
-        pages = []
-        for component in layout.components:
-            if layer not in layout.layers_of(component.kind):
-                continue
-            for request_id in self._request_ids:
-                if request_id not in manager.kv_cache_map:
-                    continue
-                indices = manager.get_cache_indices(request_id, layer, component.attention_type)
-                buffer = manager.get_buffers(layer, component.attention_type)
-                pages += [
-                    buffer[index].view(torch.uint8).reshape(-1)
-                    for index in indices
-                    if index != BAD_PAGE_INDEX
-                ]
-        return pages
+    def _restore(self, layer: int) -> None:
+        for page, saved in self._saved:
+            assert (page == 0xFF).all(), f"a kernel wrote a page of layer {layer} of the manager"
+            page.copy_(saved)
+        self._saved = []
 
-    def _fetch(self, layer: int) -> None:
-        super()._fetch(layer)
-        pages = self._layer_pages(layer)
+    def on_layer(self, layer: int) -> None:
+        if layer:
+            self._restore(layer - 1)
+        super().on_layer(layer)
+        pages = [
+            page
+            for request_id, _, _ in self.staged
+            for attn_type in _attention_types(layer)
+            for page in _pages_of(self.owner, request_id, layer, attn_type).values()
+        ]
         self._saved = [(page, page.clone()) for page in pages]
         for page in pages:
             page.fill_(0xFF)
         self.poisoned_pages += len(pages)
 
-    def _write_back(self, layer: int) -> None:
-        for page, saved in self._saved:
-            assert (page == 0xFF).all(), f"a kernel wrote a page of layer {layer} of the manager"
-            page.copy_(saved)
-        self._saved = []
-        super()._write_back(layer)
+    def end_forward(self) -> None:
+        self._restore(len(_RATIOS) - 1)
+        super().end_forward()
 
 
 # ---- comparing runs ---------------------------------------------------------------------------
@@ -622,20 +662,20 @@ _VARIANTS = pytest.mark.parametrize(
 
 
 @_VARIANTS
-def test_the_staged_view_gives_the_outputs_and_pages_of_the_cache_manager(
+def test_the_working_cache_gives_the_outputs_and_pages_of_the_cache_manager(
     indexer: str, fp8_kv: bool, workload: _Workload
 ) -> None:
     reference = _reference(indexer, fp8_kv, workload)
-    staged = _Flow(_model(indexer, fp8_kv), workload, make_streamer=_loopback).run()
+    staged = _Flow(_model(indexer, fp8_kv), workload, make_streamer=_streamer).run()
     _assert_same(reference, staged)
 
 
 @_VARIANTS
-def test_what_the_staging_area_held_before_the_fetch_does_not_matter(
+def test_what_the_working_cache_held_before_the_fetch_does_not_matter(
     indexer: str, fp8_kv: bool, workload: _Workload
 ) -> None:
     reference = _reference(indexer, fp8_kv, workload)
-    filled = _Flow(_model(indexer, fp8_kv), workload, make_streamer=_nan_loopback).run()
+    filled = _Flow(_model(indexer, fp8_kv), workload, make_streamer=_nan_streamer).run()
     for step in filled.outputs:
         for output in step:
             assert not output.isnan().any()
@@ -658,25 +698,44 @@ def test_the_layers_reproduce_themselves_when_the_indexer_selects_everything() -
     assert noise == [0.0] * len(_RATIOS)
 
 
-def _roles(kind: StagingKind) -> tuple:
-    return attention_types(kind)
+_COMPRESSOR_STATE = (
+    DeepseekV4AttentionType.COMPRESSOR_KV,
+    DeepseekV4AttentionType.COMPRESSOR_SCORE,
+)
+# Every kind of storage of the layers: the roles of some layers, by their compression ratio.
+_STORAGES = {
+    "sliding_window": ((DeepseekV4AttentionType.SWA,), (1, 4, 128)),
+    "compressed_csa": ((DeepseekV4AttentionType.COMPRESS,), (4,)),
+    "compressed_hca": ((DeepseekV4AttentionType.COMPRESS,), (128,)),
+    "indexer_compressed": ((DeepseekV4AttentionType.INDEXER_COMPRESS,), (4,)),
+    "compressor_state_csa": (_COMPRESSOR_STATE, (4,)),
+    "compressor_state_hca": (_COMPRESSOR_STATE, (128,)),
+    "indexer_compressor_state": (
+        (
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+        ),
+        (4,),
+    ),
+}
 
 
-@pytest.mark.parametrize("kind", list(StagingKind), ids=lambda kind: kind.label)
-def test_a_corruption_of_every_kind_of_storage_in_the_staging_area_is_seen(
-    kind: StagingKind,
-) -> None:
+@pytest.mark.parametrize("storage", list(_STORAGES))
+def test_a_corruption_of_every_kind_of_storage_in_the_working_cache_is_seen(storage: str) -> None:
+    roles, ratios = _STORAGES[storage]
     reference = _reference("fp8", True, _SELECTS_SOME)
     corrupted = _Flow(
         _model("fp8", True),
         _SELECTS_SOME,
-        make_streamer=lambda manager, view: _FlipAfterFetch(manager, view, _flip_kind(kind)),
+        make_streamer=lambda manager, working: _CorruptAfterFetch(
+            manager, working, _flip_storage(roles, ratios)
+        ),
     ).run()
     # The corruption shows in the outputs, or, for what only feeds the kernels that fill the other
     # storages, in the pages of the other storages.
     seen = _differs(reference, corrupted)
     if not seen and not _pages_differ(*reference):
-        seen = _pages_differ(reference[0], corrupted, skip_roles=_roles(kind))
+        seen = _pages_differ(reference[0], corrupted, skip_roles=roles)
     assert seen
 
 
@@ -687,6 +746,8 @@ def test_a_flipped_bit_in_the_last_cached_token_of_a_sliding_window_page_changes
     corrupted = _Flow(
         _model("fp8", True),
         _SELECTS_ALL,
-        make_streamer=lambda manager, view: _FlipAfterFetch(manager, view, _flip_one_bit(layer=0)),
+        make_streamer=lambda manager, working: _CorruptAfterFetch(
+            manager, working, _flip_one_bit(layer=0)
+        ),
     ).run()
     assert _differs(reference, corrupted)

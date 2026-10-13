@@ -77,19 +77,13 @@ def _load_compute_ownership() -> Callable[[int, int], tuple[int, ...]]:
 plan_lib, simulator_lib = _import_plan_modules()
 compute_ownership = _load_compute_ownership()
 
-DEADLINE_OF_KIND = plan_lib.DEADLINE_OF_KIND
-DeadlineClass = plan_lib.DeadlineClass
 Direction = plan_lib.Direction
-LayerType = plan_lib.LayerType
 OpAction = plan_lib.OpAction
 PageCost = plan_lib.PageCost
 PlanRequest = plan_lib.PlanRequest
 RankOp = plan_lib.RankOp
-StagingKind = plan_lib.StagingKind
 build_dkv_plan = plan_lib.build_dkv_plan
 global_step_order = plan_lib.global_step_order
-kinds_of_layer = plan_lib.kinds_of_layer
-layer_types_from_compress_ratios = plan_lib.layer_types_from_compress_ratios
 plan_canonical_form = plan_lib.plan_canonical_form
 plan_fingerprint = plan_lib.plan_fingerprint
 step_label = plan_lib.step_label
@@ -98,13 +92,17 @@ expand_plan = simulator_lib.expand_plan
 simulate = simulator_lib.simulate
 
 FETCH, WRITEBACK = Direction.FETCH, Direction.WRITEBACK
-SWA_ONLY, CSA, HCA = LayerType.SWA_ONLY, LayerType.CSA, LayerType.HCA
 
 
-# A cost model in the shape of the DeepSeek-V4 layout. The numbers are not the real ones, but the
-# page counts follow the same rules: a kind stores one row per ``tokens_per_row`` tokens, a
-# windowed kind caches only the last window of rows, a fetch covers the cached rows and a
-# writeback the pages that the chunk's new rows touch.
+# A model in the shape of the DeepSeek-V4 layout: a layer is the tuple of the names of its buffers,
+# listed in an order that is not sorted, so that a plan which reorders the buffers is noticed. The
+# cost model's numbers are not the real ones, but the page counts follow the same rules: a buffer
+# stores one row per ``tokens_per_row`` tokens, a windowed buffer caches only the last window of
+# rows, a fetch covers the cached rows and a writeback the pages that the chunk's new rows touch.
+
+SWA_ONLY = ("swa",)
+CSA = ("swa", "compress_r4", "indexer_compress", "state_csa", "state_indexer")
+HCA = ("swa", "compress_r128", "state_hca")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,13 +114,13 @@ class _Geometry:
 
 
 _GEOMETRY = {
-    StagingKind.SWA: _Geometry(1, 128, 64 * 1024, 128),
-    StagingKind.COMPRESS_R4: _Geometry(4, 32, 16 * 1024, None),
-    StagingKind.COMPRESS_R128: _Geometry(128, 1, 2 * 1024, None),
-    StagingKind.INDEXER_COMPRESS: _Geometry(4, 32, 4 * 1024, None),
-    StagingKind.STATE_CSA: _Geometry(1, 8, 64 * 1024, 8),
-    StagingKind.STATE_HCA: _Geometry(1, 128, 256 * 1024, 128),
-    StagingKind.STATE_INDEXER: _Geometry(1, 8, 16 * 1024, 8),
+    "swa": _Geometry(1, 128, 64 * 1024, 128),
+    "compress_r4": _Geometry(4, 32, 16 * 1024, None),
+    "compress_r128": _Geometry(128, 1, 2 * 1024, None),
+    "indexer_compress": _Geometry(4, 32, 4 * 1024, None),
+    "state_csa": _Geometry(1, 8, 64 * 1024, 8),
+    "state_hca": _Geometry(1, 128, 256 * 1024, 128),
+    "state_indexer": _Geometry(1, 8, 16 * 1024, 8),
 }
 
 
@@ -132,18 +130,23 @@ def _pages_covering(first_row: int, end_row: int, rows_per_page: int) -> int:
     return (end_row - 1) // rows_per_page - first_row // rows_per_page + 1
 
 
-class _V4Costs:
-    """Page sizes and counts in the shape of the V4 layout.
+class _FakeCosts:
+    """The buffers of every layer and their page sizes and counts, in the shape of the V4 layout.
 
     ``scale_by_layer`` makes the page size differ from layer to layer, so that a plan that takes a
     size from the wrong layer is noticed.
     """
 
-    def __init__(self, *, scale_by_layer: bool = False) -> None:
+    def __init__(self, layers: Sequence[tuple[str, ...]], *, scale_by_layer: bool = False) -> None:
+        self.layers = tuple(layers)
         self.scale_by_layer = scale_by_layer
 
-    def page_cost(self, layer: int, kind: StagingKind, history: int, chunk: int) -> PageCost:
-        geometry = _GEOMETRY[kind]
+    def buffers_of(self, layer: int) -> tuple[str, ...]:
+        return self.layers[layer]
+
+    def page_cost(self, layer: int, buffer: str, history: int, chunk: int) -> PageCost:
+        assert buffer in self.layers[layer], f"layer {layer} has no buffer {buffer}"
+        geometry = _GEOMETRY[buffer]
         cached_rows = history // geometry.tokens_per_row
         first_cached = (
             0 if geometry.window_rows is None else max(0, cached_rows - geometry.window_rows)
@@ -155,19 +158,17 @@ class _V4Costs:
         return PageCost(geometry.page_bytes * scale, fetch, writeback)
 
 
-def _expected_bytes(
-    batch: Sequence, layer_types: Sequence, costs: _V4Costs, direction: Direction
-) -> list[int]:
+def _expected_bytes(batch: Sequence, costs: _FakeCosts, direction: Direction) -> list[int]:
     """The bytes of every layer that the cost model says the real requests move, without the
     plan."""
-    per_layer = [0] * len(layer_types)
+    per_layer = [0] * len(costs.layers)
     for request in batch:
         if request.is_dummy:
             continue
-        for layer, layer_type in enumerate(layer_types):
-            for kind in kinds_of_layer(layer_type):
+        for layer in range(len(costs.layers)):
+            for buffer in costs.buffers_of(layer):
                 cost = costs.page_cost(
-                    layer, kind, request.context_current_position, request.context_chunk_size
+                    layer, buffer, request.context_current_position, request.context_chunk_size
                 )
                 pages = cost.fetch_pages if direction is FETCH else cost.writeback_pages
                 per_layer[layer] += pages * cost.page_bytes
@@ -177,16 +178,15 @@ def _expected_bytes(
 # The models, batches and plans the tests use.
 
 
-def _alternating(num_layers: int) -> list[int]:
-    """The compression ratios of DeepSeek-V4-Pro: two layers without compression, then compressed
-    sparse (ratio 4) and heavily compressed (ratio 128) layers alternating."""
-    return [1, 1] + [4 if layer % 2 == 0 else 128 for layer in range(num_layers - 2)]
+def _alternating(num_layers: int) -> tuple[tuple[str, ...], ...]:
+    """The layers of DeepSeek-V4-Pro: two layers without compression, then compressed sparse
+    (ratio 4) and heavily compressed (ratio 128) layers alternating."""
+    return (SWA_ONLY, SWA_ONLY) + tuple(
+        CSA if layer % 2 == 0 else HCA for layer in range(num_layers - 2)
+    )
 
 
-_MODELS = {
-    "v4_43_layers": layer_types_from_compress_ratios(_alternating(43)),
-    "v4_61_layers": layer_types_from_compress_ratios(_alternating(61)),
-}
+_MODELS = {"v4_43_layers": _alternating(43), "v4_61_layers": _alternating(61)}
 _V4_43 = _MODELS["v4_43_layers"]
 _PLACEMENTS = [
     "single_rank",
@@ -239,91 +239,57 @@ def _batch(placement: str, group_size: int) -> list:
     return batch
 
 
-def _plan(batch, owners, layer_types, *, group_size, ring_depth=2, costs=None):
+def _plan(batch, owners, layers, *, group_size, ring_depth=2, costs=None):
     return build_dkv_plan(
         batch,
         owners,
-        layer_types,
-        costs or _V4Costs(),
+        costs or _FakeCosts(layers),
         group_size=group_size,
         ring_depth=ring_depth,
     )
 
 
-def _check_plan_invariants(plan, batch: Sequence, costs: _V4Costs) -> None:
-    """What every plan must satisfy, checked against the batch and the cost model."""
-    by_id = {request.request_id: request for request in batch}
-    real_ids: dict[int, set[int]] = {}
-    for request in batch:
+def _check_plan_invariants(plan, batch: Sequence, costs: _FakeCosts) -> None:
+    """What every plan must satisfy, checked against the batch and the cost model: the steps come
+    in the global order, and a step has one message per compute rank that moves bytes, which
+    carries, request by request in ascending id and for each request in the cost model's buffer
+    order, exactly the pages the cost model gives."""
+    real_by_rank: dict[int, list] = {}
+    for request in sorted(batch, key=lambda request: request.request_id):
         if not request.is_dummy:
-            real_ids.setdefault(request.compute_rank, set()).add(request.request_id)
+            real_by_rank.setdefault(request.compute_rank, []).append(request)
     assert [(s.direction, s.layer, s.issue_point) for s in plan.steps] == list(
         global_step_order(plan.num_layers, plan.ring_depth)
     )
     for step in plan.steps:
-        order = [(transfer.compute, transfer.deadline) for transfer in step.transfers]
-        assert order == sorted(order) and len(set(order)) == len(order)
+        expected = []
+        for compute in sorted(real_by_rank):
+            segments = []
+            for request in real_by_rank[compute]:
+                for buffer in costs.buffers_of(step.layer):
+                    cost = costs.page_cost(
+                        step.layer,
+                        buffer,
+                        request.context_current_position,
+                        request.context_chunk_size,
+                    )
+                    pages = cost.fetch_pages if step.direction is FETCH else cost.writeback_pages
+                    if pages:
+                        segments.append(
+                            (request.request_id, buffer, pages, pages * cost.page_bytes)
+                        )
+            if segments:
+                expected.append((plan.owner_of_layer[step.layer], compute, segments))
+        actual = [
+            (t.owner, t.compute, [(s.request_id, s.buffer, s.pages, s.nbytes) for s in t.segments])
+            for t in step.transfers
+        ]
+        assert actual == expected
         for transfer in step.transfers:
             assert (transfer.direction, transfer.layer) == (step.direction, step.layer)
-            assert transfer.owner == plan.owner_of_layer[transfer.layer]
-            assert transfer.segments
-            ids = {segment.request_id for segment in transfer.segments}
-            assert ids <= real_ids.get(transfer.compute, set())
-            keys = [(segment.request_id, segment.kind) for segment in transfer.segments]
-            assert keys == sorted(keys)
-            layer_kinds = set(kinds_of_layer(plan.layer_types[transfer.layer]))
-            for segment in transfer.segments:
-                assert segment.kind in layer_kinds
-                assert DEADLINE_OF_KIND[segment.kind] is transfer.deadline
-                request = by_id[segment.request_id]
-                cost = costs.page_cost(
-                    transfer.layer,
-                    segment.kind,
-                    request.context_current_position,
-                    request.context_chunk_size,
-                )
-                pages = cost.fetch_pages if step.direction is FETCH else cost.writeback_pages
-                assert pages > 0
-                assert (segment.pages, segment.nbytes) == (pages, pages * cost.page_bytes)
 
 
-# Layer types and the global step order
-
-
-def test_layer_types_follow_the_compression_ratios() -> None:
-    assert layer_types_from_compress_ratios([0, 1, 4, 128, 64]) == (
-        SWA_ONLY,
-        SWA_ONLY,
-        CSA,
-        HCA,
-        HCA,
-    )
-    assert Counter(_V4_43) == {SWA_ONLY: 2, CSA: 21, HCA: 20}
-    assert _V4_43[:4] == (SWA_ONLY, SWA_ONLY, CSA, HCA)
-    assert Counter(_MODELS["v4_61_layers"]) == {SWA_ONLY: 2, CSA: 30, HCA: 29}
-
-
-def test_kinds_and_deadline_classes_of_the_layer_types() -> None:
-    assert set(DEADLINE_OF_KIND) == set(StagingKind)
-    assert plan_lib.deadline_classes_of_layer(SWA_ONLY) == (DeadlineClass.ATTENTION_KV,)
-    assert plan_lib.deadline_classes_of_layer(HCA) == (
-        DeadlineClass.STATE,
-        DeadlineClass.ATTENTION_KV,
-    )
-    assert plan_lib.deadline_classes_of_layer(CSA) == (
-        DeadlineClass.STATE,
-        DeadlineClass.INDEXER,
-        DeadlineClass.ATTENTION_KV,
-    )
-    for layer_type in LayerType:
-        kinds = kinds_of_layer(layer_type)
-        assert list(kinds) == sorted(set(kinds))
-        assert StagingKind.SWA in kinds
-        # A layer holds the state of its own compressor and indexer, and of no other.
-        assert (StagingKind.STATE_CSA in kinds) == (layer_type is CSA)
-        assert (StagingKind.STATE_HCA in kinds) == (layer_type is HCA)
-        assert (StagingKind.STATE_INDEXER in kinds) == (layer_type is CSA)
-        assert (StagingKind.INDEXER_COMPRESS in kinds) == (layer_type is CSA)
+# The global step order
 
 
 @pytest.mark.parametrize(
@@ -404,43 +370,67 @@ def test_a_step_order_needs_layers_and_a_ring(num_layers: int, ring_depth: int) 
 
 def test_a_plan_has_the_messages_the_cost_model_implies() -> None:
     """Sizes computed by hand for one request with 300 history tokens and a chunk of 100 tokens on
-    rank 1, whose layers are all owned by rank 0."""
+    rank 1, whose layers are all owned by rank 0. A step is one message that lists the buffers of
+    the layer in the cost model's order."""
     batch = [PlanRequest(7, 1, 300, 100), PlanRequest(8, 0, 999, 5, is_dummy=True)]
     plan = _plan(batch, (0, 0, 0), (SWA_ONLY, CSA, HCA), group_size=2)
 
     def table(direction: Direction, layer: int) -> list:
         return [
             (
-                t.deadline.name,
                 t.owner,
                 t.compute,
-                [(s.kind.name, s.pages, s.nbytes) for s in t.segments],
+                [(s.request_id, s.buffer, s.pages, s.nbytes) for s in t.segments],
                 t.pages,
                 t.nbytes,
             )
             for t in plan.transfers(direction, layer)
         ]
 
-    assert table(FETCH, 0) == [("ATTENTION_KV", 0, 1, [("SWA", 2, 131072)], 2, 131072)]
-    assert table(WRITEBACK, 0) == [("ATTENTION_KV", 0, 1, [("SWA", 2, 131072)], 2, 131072)]
-    indexer_fetch = [("INDEXER_COMPRESS", 3, 12288), ("STATE_INDEXER", 2, 32768)]
-    assert table(FETCH, 1) == [
-        ("STATE", 0, 1, [("STATE_CSA", 2, 131072)], 2, 131072),
-        ("INDEXER", 0, 1, indexer_fetch, 5, 45056),
-        ("ATTENTION_KV", 0, 1, [("SWA", 2, 131072), ("COMPRESS_R4", 3, 49152)], 5, 180224),
+    swa = (7, "swa", 2, 131072)
+    assert table(FETCH, 0) == [(0, 1, [swa], 2, 131072)]
+    assert table(WRITEBACK, 0) == [(0, 1, [swa], 2, 131072)]
+    csa_fetch = [
+        swa,
+        (7, "compress_r4", 3, 49152),
+        (7, "indexer_compress", 3, 12288),
+        (7, "state_csa", 2, 131072),
+        (7, "state_indexer", 2, 32768),
     ]
-    indexer_writeback = [("INDEXER_COMPRESS", 2, 8192), ("STATE_INDEXER", 13, 212992)]
-    assert table(WRITEBACK, 1) == [
-        ("STATE", 0, 1, [("STATE_CSA", 13, 851968)], 13, 851968),
-        ("INDEXER", 0, 1, indexer_writeback, 15, 221184),
-        ("ATTENTION_KV", 0, 1, [("SWA", 2, 131072), ("COMPRESS_R4", 2, 32768)], 4, 163840),
+    assert table(FETCH, 1) == [(0, 1, csa_fetch, 12, 356352)]
+    csa_writeback = [
+        swa,
+        (7, "compress_r4", 2, 32768),
+        (7, "indexer_compress", 2, 8192),
+        (7, "state_csa", 13, 851968),
+        (7, "state_indexer", 13, 212992),
     ]
-    assert table(FETCH, 2) == [
-        ("STATE", 0, 1, [("STATE_HCA", 2, 524288)], 2, 524288),
-        ("ATTENTION_KV", 0, 1, [("SWA", 2, 131072), ("COMPRESS_R128", 2, 4096)], 4, 135168),
-    ]
-    assert plan.transfers(WRITEBACK, 2, DeadlineClass.STATE)[0].nbytes == 524288
-    assert plan.transfers(WRITEBACK, 2, DeadlineClass.INDEXER) == ()
+    assert table(WRITEBACK, 1) == [(0, 1, csa_writeback, 32, 1236992)]
+    hca_fetch = [swa, (7, "compress_r128", 2, 4096), (7, "state_hca", 2, 524288)]
+    assert table(FETCH, 2) == [(0, 1, hca_fetch, 6, 659456)]
+    hca_writeback = [swa, (7, "compress_r128", 1, 2048), (7, "state_hca", 2, 524288)]
+    assert table(WRITEBACK, 2) == [(0, 1, hca_writeback, 5, 657408)]
+
+
+def test_a_message_lists_the_buffers_of_a_request_together_in_the_cost_model_order() -> None:
+    batch = [PlanRequest(9, 1, 400, 10), PlanRequest(3, 1, 400, 10)]
+    plan = _plan(batch, (0,), (CSA,), group_size=2)
+    (transfer,) = plan.transfers(FETCH, 0)
+    expected = [(3, buffer) for buffer in CSA] + [(9, buffer) for buffer in CSA]
+    assert [(s.request_id, s.buffer) for s in transfer.segments] == expected
+    # The plan follows whatever order the cost model gives, sorted or not.
+    reordered = _plan(batch, (0,), (tuple(sorted(CSA)),), group_size=2)
+    (transfer,) = reordered.transfers(FETCH, 0)
+    assert [s.buffer for s in transfer.segments] == 2 * sorted(CSA)
+
+
+def test_a_layer_without_buffers_moves_nothing() -> None:
+    """A layer that keeps no KV, such as a layer without attention, still has its steps."""
+    batch = [PlanRequest(1, 0, 300, 70), PlanRequest(2, 1, 500, 90)]
+    plan = _plan(batch, (1, 0, 1), (CSA, (), HCA), group_size=2)
+    assert not plan.transfers(FETCH, 1) and not plan.transfers(WRITEBACK, 1)
+    assert all(plan.transfers(direction, layer) for direction in Direction for layer in (0, 2))
+    assert simulate(plan).ok
 
 
 def test_the_same_input_gives_equal_plans() -> None:
@@ -455,7 +445,7 @@ def test_the_same_input_gives_equal_plans() -> None:
 
 def test_the_plan_does_not_depend_on_the_order_of_the_requests() -> None:
     owners = (0, 1, 2, 2, 1)
-    layer_types = (CSA, HCA, SWA_ONLY, CSA, HCA)
+    layers = (CSA, HCA, SWA_ONLY, CSA, HCA)
     batch = [
         PlanRequest(5, 2, 1200, 300),
         PlanRequest(2, 0, 0, 512),
@@ -463,9 +453,9 @@ def test_the_plan_does_not_depend_on_the_order_of_the_requests() -> None:
         PlanRequest(3, 1, 130, 1000),
         PlanRequest(7, 0, 33, 2, is_dummy=True),
     ]
-    reference = _plan(batch, owners, layer_types, group_size=3)
+    reference = _plan(batch, owners, layers, group_size=3)
     for permutation in itertools.permutations(batch):
-        plan = _plan(permutation, owners, layer_types, group_size=3)
+        plan = _plan(permutation, owners, layers, group_size=3)
         assert plan == reference
         assert plan_fingerprint(plan) == plan_fingerprint(reference)
 
@@ -529,13 +519,13 @@ def test_dummy_requests_add_nothing(group_size: int) -> None:
 def test_dummy_requests_are_never_costed() -> None:
     asked: list[tuple[int, int]] = []
 
-    class Spy(_V4Costs):
-        def page_cost(self, layer, kind, history, chunk):
+    class Spy(_FakeCosts):
+        def page_cost(self, layer, buffer, history, chunk):
             asked.append((history, chunk))
-            return super().page_cost(layer, kind, history, chunk)
+            return super().page_cost(layer, buffer, history, chunk)
 
     batch = [PlanRequest(1, 0, 100, 10), PlanRequest(2, 1, 54_321, 77, is_dummy=True)]
-    build_dkv_plan(batch, (1, 1), (CSA, HCA), Spy(), group_size=2, ring_depth=2)
+    build_dkv_plan(batch, (1, 1), Spy((CSA, HCA)), group_size=2, ring_depth=2)
     assert asked and set(asked) == {(100, 10)}
 
 
@@ -560,12 +550,12 @@ def test_nothing_that_moves_no_byte_is_a_message() -> None:
 @pytest.mark.parametrize("scale_by_layer", [False, True])
 @pytest.mark.parametrize("placement", _PLACEMENTS)
 def test_byte_totals_match_the_cost_model(placement: str, scale_by_layer: bool) -> None:
-    costs = _V4Costs(scale_by_layer=scale_by_layer)
+    costs = _FakeCosts(_V4_43, scale_by_layer=scale_by_layer)
     batch = _batch(placement, 4)
     plan = _plan(batch, compute_ownership(43, 4), _V4_43, group_size=4, costs=costs)
     _check_plan_invariants(plan, batch, costs)
     for direction in Direction:
-        expected = _expected_bytes(batch, _V4_43, costs, direction)
+        expected = _expected_bytes(batch, costs, direction)
         moved = [
             sum(t.nbytes for t in plan.transfers(direction, layer)) for layer in range(len(_V4_43))
         ]
@@ -691,16 +681,14 @@ def _build(**change):
     arguments = {
         "requests": [PlanRequest(1, 0, 100, 10), PlanRequest(2, 1, 50, 10)],
         "owner_of_layer": (0, 1),
-        "layer_types": (CSA, HCA),
-        "costs": _V4Costs(),
+        "costs": _FakeCosts((CSA, HCA)),
         "group_size": 2,
         "ring_depth": 2,
     } | change
     requests = arguments.pop("requests")
     owners = arguments.pop("owner_of_layer")
-    layer_types = arguments.pop("layer_types")
     costs = arguments.pop("costs")
-    return build_dkv_plan(requests, owners, layer_types, costs, **arguments)
+    return build_dkv_plan(requests, owners, costs, **arguments)
 
 
 @pytest.mark.parametrize(
@@ -709,7 +697,6 @@ def _build(**change):
         ({"group_size": 0}, "must be positive"),
         ({"ring_depth": 0}, "must be positive"),
         ({"owner_of_layer": ()}, "no layer"),
-        ({"layer_types": (CSA,)}, "has 2 layers, the layer types 1"),
         ({"owner_of_layer": (0, 2)}, r"ranks \[2\] own layers but the group has 2 ranks"),
         ({"owner_of_layer": (0, -1)}, r"ranks \[-1\] own layers"),
         ({"requests": [PlanRequest(1, 2, 0, 1)]}, "request 1 is computed on rank 2"),
@@ -732,14 +719,35 @@ def test_an_inconsistent_batch_or_geometry_is_rejected(change: dict, message: st
 )
 def test_a_cost_model_with_a_bad_page_size_or_count_is_rejected(cost) -> None:
     class Bad:
-        def page_cost(self, layer, kind, history, chunk):
+        def buffers_of(self, layer):
+            return ("kv",)
+
+        def page_cost(self, layer, buffer, history, chunk):
             return cost
 
     with pytest.raises(ValueError, match="the cost model returned"):
         _build(costs=Bad())
 
 
+@pytest.mark.parametrize("buffers", [("kv", "kv"), ("kv", 3), (None,)])
+def test_a_cost_model_whose_buffers_are_not_distinct_names_is_rejected(buffers: tuple) -> None:
+    """Two segments of a request with the same name, or a name that does not print the same in
+    every process, would leave the layout of a message ambiguous."""
+
+    class Unnamed:
+        def buffers_of(self, layer):
+            return buffers
+
+        def page_cost(self, layer, buffer, history, chunk):
+            return PageCost(4096, 1, 1)
+
+    with pytest.raises(ValueError, match="must be distinct strings"):
+        _build(costs=Unnamed())
+
+
 # The fingerprint
+
+_FINGERPRINT_LAYERS = (CSA, HCA, SWA_ONLY, CSA)
 
 
 def _fingerprint_of(**change) -> str:
@@ -750,7 +758,7 @@ def _fingerprint_of(**change) -> str:
             PlanRequest(3, 1, 0, 9, is_dummy=True),
         ],
         "owner_of_layer": (0, 1, 1, 0),
-        "layer_types": (CSA, HCA, SWA_ONLY, CSA),
+        "costs": _FakeCosts(_FINGERPRINT_LAYERS),
     }
     return plan_fingerprint(_build(**(base | change)))
 
@@ -760,8 +768,10 @@ def _fingerprint_of(**change) -> str:
     [
         {"ring_depth": 3},
         {"owner_of_layer": (0, 1, 0, 0)},
-        {"layer_types": (CSA, HCA, SWA_ONLY, HCA)},
-        {"costs": _V4Costs(scale_by_layer=True)},
+        {"costs": _FakeCosts((CSA, HCA, SWA_ONLY, HCA))},
+        {"costs": _FakeCosts(_FINGERPRINT_LAYERS, scale_by_layer=True)},
+        # The order of the buffers is the layout of every message.
+        {"costs": _FakeCosts((tuple(reversed(CSA)), HCA, SWA_ONLY, CSA))},
         {"requests": [PlanRequest(1, 0, 4001, 300), PlanRequest(2, 1, 100, 60)]},
         {"requests": [PlanRequest(1, 0, 4000, 301), PlanRequest(2, 1, 100, 60)]},
         {"requests": [PlanRequest(1, 1, 4000, 300), PlanRequest(2, 1, 100, 60)]},
@@ -803,24 +813,30 @@ plan_lib = importlib.import_module("_dkv_plan_pkg.dkv_plan")
 
 
 class Costs:
-    def page_cost(self, layer, kind, history, chunk):
-        return plan_lib.PageCost(512 * (1 + int(kind)), history // 100 % 5, chunk // 50 % 4)
+    def __init__(self, layers):
+        self.layers = layers
+
+    def buffers_of(self, layer):
+        return self.layers[layer]
+
+    def page_cost(self, layer, buffer, history, chunk):
+        page_bytes = 512 * (1 + self.layers[layer].index(buffer))
+        return plan_lib.PageCost(page_bytes, history // 100 % 5, chunk // 50 % 4)
 
 
 requests = [plan_lib.PlanRequest(i + 1, i % 4, 137 * i, 61 * i + 5, i % 5 == 4) for i in range(12)]
 random.Random(int(sys.argv[1])).shuffle(requests)
-layer_types = plan_lib.layer_types_from_compress_ratios([1, 1] + [4, 128] * 6)
+layers = [("kv",), ("kv",)] + [("kv", "compressed", "indexer", "state"), ("kv", "state")] * 6
 owners = [layer * 4 // 14 for layer in range(14)]
-plan = plan_lib.build_dkv_plan(
-    requests, owners, layer_types, Costs(), group_size=4, ring_depth=3
-)
+plan = plan_lib.build_dkv_plan(requests, owners, Costs(layers), group_size=4, ring_depth=3)
 print(plan_lib.plan_fingerprint(plan))
 """
 
 
 def test_processes_with_other_hash_seeds_and_request_orders_build_the_same_plan() -> None:
     """The plan of ranks that are separate processes cannot depend on the hash seed of a process,
-    which orders the sets and mappings of strings and enums, nor on the order of the requests."""
+    which orders the sets and mappings of strings such as the buffer names, nor on the order of the
+    requests."""
     program = _FINGERPRINT_PROGRAM.format(path=str(Path(plan_lib.__file__).parent))
     fingerprints = set()
     for hash_seed, shuffle_seed in ((0, 1), (1, 2), (2, 3), (4242, 4), (31337, 5)):
@@ -847,14 +863,10 @@ def test_a_plan_prints_briefly() -> None:
 @pytest.mark.parametrize(
     ("module", "allowed"),
     [
-        (
-            plan_lib,
-            {"collections", "dataclasses", "enum", "hashlib", "types", "typing", ".dkv_types"},
-        ),
+        (plan_lib, {"collections", "dataclasses", "enum", "hashlib", "typing"}),
         (simulator_lib, {"collections", "dataclasses", "enum", ".dkv_plan"}),
-        (sys.modules[StagingKind.__module__], {"enum", "typing"}),
     ],
-    ids=["dkv_plan", "dkv_plan_simulator", "dkv_types"],
+    ids=["dkv_plan", "dkv_plan_simulator"],
 )
 def test_the_modules_import_nothing_but_the_standard_library(
     module: types.ModuleType, allowed: set
@@ -883,13 +895,11 @@ def test_the_modules_import_nothing_but_the_standard_library(
 def test_plans_of_the_ownership_tables_of_compute_ownership_are_deadlock_free(
     group_size: int, model: str, ring_depth: int, placement: str
 ) -> None:
-    layer_types = _MODELS[model]
-    owners = compute_ownership(len(layer_types), group_size)
+    layers = _MODELS[model]
+    owners = compute_ownership(len(layers), group_size)
     batch = _batch(placement, group_size)
-    costs = _V4Costs(scale_by_layer=True)
-    plan = _plan(
-        batch, owners, layer_types, group_size=group_size, ring_depth=ring_depth, costs=costs
-    )
+    costs = _FakeCosts(layers, scale_by_layer=True)
+    plan = _plan(batch, owners, layers, group_size=group_size, ring_depth=ring_depth, costs=costs)
     _check_plan_invariants(plan, batch, costs)
     report = simulate(plan)
     assert report.ok, str(report)
@@ -909,14 +919,14 @@ def test_every_ownership_table_of_a_small_model_is_deadlock_free(
     group_size: int, num_layers: int, ring_depth: int
 ) -> None:
     """The argument does not depend on the table, so it holds for all of them, contiguous or not."""
-    layer_types = (CSA, SWA_ONLY, HCA, CSA, HCA, SWA_ONLY)[:num_layers]
+    layers = (CSA, SWA_ONLY, HCA, CSA, HCA, SWA_ONLY)[:num_layers]
     batches = [
         _batch(placement, group_size)
         for placement in ("every_rank", "mixed_with_dummy_only_ranks", "last_rank")
     ]
     for owners in itertools.product(range(group_size), repeat=num_layers):
         for batch in batches:
-            plan = _plan(batch, owners, layer_types, group_size=group_size, ring_depth=ring_depth)
+            plan = _plan(batch, owners, layers, group_size=group_size, ring_depth=ring_depth)
             for grouped in (False, True):
                 report = simulate(plan, grouped=grouped)
                 assert report.ok, f"owners {owners}, grouped {grouped}: {report}"
@@ -927,10 +937,10 @@ def test_random_ownership_tables_and_batches_of_a_larger_model_are_deadlock_free
     ring_depth: int,
 ) -> None:
     chooser = random.Random(20261005 + ring_depth)
-    layer_types = _V4_43[:17]
+    layers = _V4_43[:17]
     for group_size in (3, 5, 8):
         for _ in range(6):
-            owners = [chooser.randrange(group_size) for _ in layer_types]
+            owners = [chooser.randrange(group_size) for _ in layers]
             batch = [
                 PlanRequest(
                     index + 1,
@@ -941,7 +951,7 @@ def test_random_ownership_tables_and_batches_of_a_larger_model_are_deadlock_free
                 )
                 for index in range(2 * group_size)
             ]
-            plan = _plan(batch, owners, layer_types, group_size=group_size, ring_depth=ring_depth)
+            plan = _plan(batch, owners, layers, group_size=group_size, ring_depth=ring_depth)
             for grouped in (False, True):
                 report = simulate(plan, grouped=grouped)
                 assert report.ok, f"owners {owners}, grouped {grouped}: {report}"
@@ -958,13 +968,13 @@ def test_every_wait_of_a_plan_raises_the_potential_of_the_deadlock_argument(
     4l, the MoE exchange of layer l 4l + 1, the MoE 4l + 2, the writeback of layer l 4l + 3 and the
     fetch of layer m, which is enqueued at the top of layer m - D + 1, is 4(m - D + 1) - 1/2. A
     wait between two operations of the same step is the order of one data stream, in which the
-    messages of a step are sorted by compute rank and deadline class; a group of messages has the
+    messages of a step are sorted by compute rank; a group of messages has the
     potential of its step and waits only for its members."""
-    layer_types = _MODELS["v4_43_layers"]
+    layers = _MODELS["v4_43_layers"]
     plan = _plan(
         _batch(placement, group_size),
         compute_ownership(43, group_size),
-        layer_types,
+        layers,
         group_size=group_size,
         ring_depth=ring_depth,
     )
@@ -999,8 +1009,9 @@ def test_every_wait_of_a_plan_raises_the_potential_of_the_deadlock_argument(
             assert before < after or (
                 before == after and reason[0] in ("stream", "group member")
             ), f"{graph.keys[prerequisite]} -> {graph.keys[node]} ({reason[0]})"
-    # A step sends an owner's messages of several deadline classes and peers together.
-    assert (groups > 0) == grouped
+    # A step sends the messages of an owner to all its peers together. A rank has one message per
+    # peer in a step, so only a group of three ranks or more has a step with two of them.
+    assert (groups > 0) == (grouped and group_size > 2)
 
 
 def test_a_report_counts_what_it_checked() -> None:
@@ -1243,7 +1254,10 @@ class _FetchingLayers:
     def __init__(self, layers: set[int]) -> None:
         self.layers = layers
 
-    def page_cost(self, layer: int, kind: StagingKind, history: int, chunk: int) -> PageCost:
+    def buffers_of(self, layer: int) -> tuple[str, ...]:
+        return ("kv",)
+
+    def page_cost(self, layer: int, buffer: str, history: int, chunk: int) -> PageCost:
         return PageCost(4096, int(layer in self.layers and history > 0), 0)
 
 
@@ -1252,14 +1266,7 @@ def test_a_layer_that_fetches_nothing_still_runs_after_the_layer_before() -> Non
     The fetch of layer 2 waits for the end of layer 1, which waits for layer 0 and so for the
     fetch of layer 0 behind it on the data stream."""
     batch = [PlanRequest(1, 0, 100, 70), PlanRequest(2, 1, 100, 70)]
-    plan = build_dkv_plan(
-        batch,
-        (0, 0, 1),
-        (SWA_ONLY,) * 3,
-        _FetchingLayers({0, 2}),
-        group_size=2,
-        ring_depth=1,
-    )
+    plan = build_dkv_plan(batch, (0, 0, 1), _FetchingLayers({0, 2}), group_size=2, ring_depth=1)
     assert not plan.transfers(FETCH, 1)
     programs = expand_plan(plan)
     assert simulate(plan, programs).ok
@@ -1435,7 +1442,7 @@ def test_the_simulator_agrees_with_an_operational_model_on_good_and_mutated_prog
     chooser = random.Random(7 * ring_depth)
     hangs = completes = 0
     for group_size, num_layers in ((2, 3), (2, 4), (3, 4)):
-        layer_types = (CSA, SWA_ONLY, HCA, CSA)[:num_layers]
+        layers = (CSA, SWA_ONLY, HCA, CSA)[:num_layers]
         for _ in range(12):
             owners = [chooser.randrange(group_size) for _ in range(num_layers)]
             batch = [
@@ -1448,7 +1455,7 @@ def test_the_simulator_agrees_with_an_operational_model_on_good_and_mutated_prog
                 )
                 for rank in range(group_size)
             ]
-            plan = _plan(batch, owners, layer_types, group_size=group_size, ring_depth=ring_depth)
+            plan = _plan(batch, owners, layers, group_size=group_size, ring_depth=ring_depth)
             programs = expand_plan(plan)
             assert _completes(plan, programs) and simulate(plan, programs).ok
             if not any(programs):

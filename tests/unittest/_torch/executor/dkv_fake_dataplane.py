@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CUDA streams, events, the page copy kernel and the interconnect of the DKV data plane on threads.
+"""CUDA streams, events, the page copy kernel, the interconnect and the cache managers of the DKV
+data plane on threads and host memory.
 
 ``DkvStreamer`` orders the work of two streams with events and exchanges messages with its peers.
 These stand-ins run that logic on host memory, one thread per stream, so the order of the work, the
@@ -30,12 +31,22 @@ import queue
 import random
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from tensorrt_llm._torch.pyexecutor.dkv_staging import BAD_PAGE_INDEX, StagingLayout, expand_runs
+from tensorrt_llm._torch.pyexecutor.dkv_staging import expand_runs
+from tensorrt_llm._torch.pyexecutor.dkv_types import LifecycleKey
+from tensorrt_llm._torch.pyexecutor.dkv_working import staged_blocks
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    AttentionLayerConfig,
+    BufferConfig,
+    PageIndexMode,
+)
 
 
 class FakeEvent:
@@ -185,33 +196,13 @@ class FakeTransport:
     sends and receives one message at a time.
     """
 
-    def __init__(
-        self, network: FakeNetwork, rank: int, *, grouped: bool = True, native: bool = False
-    ) -> None:
-        """``native`` offers ``native_data_plane``, the stand-in of the C++ executor."""
+    def __init__(self, network: FakeNetwork, rank: int, *, grouped: bool = True) -> None:
         self._network = network
         self._rank = rank
         # Hook for fault injection: called with the bytes of a message before it is delivered.
         self.corrupt: Callable[[int, int, bytearray], None] | None = None
         if not grouped:
             self.group_send_recv = None
-        if not native:
-            self.native_data_plane = None
-
-    def native_data_plane(self, num_layers: int, data_stream: FakeStream) -> "FakeNativeDataPlane":
-        return FakeNativeDataPlane(self, num_layers, data_stream)
-
-    def group_send_recv_raw(
-        self,
-        sends: Sequence[tuple[int, int, int]],
-        recvs: Sequence[tuple[int, int, int]],
-        stream: FakeStream,
-    ) -> None:
-        """``group_send_recv`` on host memory given as ``(address, bytes, peer)``."""
-        for address, nbytes, peer in sends:
-            self.send(_host_bytes(address, nbytes), peer, stream)
-        for address, nbytes, peer in recvs:
-            self.recv(_host_bytes(address, nbytes), peer, stream)
 
     def group_send_recv(
         self,
@@ -262,185 +253,12 @@ class FakeTransport:
         stream.enqueue(work)
 
 
-def _host_bytes(address: int, nbytes: int) -> torch.Tensor:
-    """The ``nbytes`` bytes of host memory at ``address`` as a tensor, without a copy."""
-    return torch.frombuffer((ctypes.c_uint8 * nbytes).from_address(address), dtype=torch.uint8)
-
-
-class FakeNativeDataPlane:
-    """``trtllm.DkvDataPlane`` on host memory: the tables, the address arithmetic, the checks and the
-    order of the work of the C++ executor, with the streams, events, copies and messages of these
-    stand-ins. See ``cpp/tensorrt_llm/thop/dkvDataPlaneOp.h`` for the tables."""
-
-    def __init__(self, transport: FakeTransport, num_layers: int, data_stream: FakeStream) -> None:
-        self._transport = transport
-        self._num_layers = num_layers
-        self._data = data_stream
-        self._copier = FakeCopier()
-        self._compute_events = [FakeEvent() for _ in range(num_layers + 2)]
-        self._fetch_events = [FakeEvent() for _ in range(num_layers)]
-        self._fetch_recorded = [False] * num_layers
-        self._waits: list[tuple[FakeEvent, FakeEvent]] = []
-        self._components: list[list[int]] | None = None
-        self._steps_at: dict[int, list[int]] = {}
-
-    def set_static(
-        self,
-        components: torch.Tensor,
-        pool_affine: torch.Tensor,
-        staging_pointers: torch.Tensor,
-        slot_offsets: torch.Tensor,
-    ) -> None:
-        assert pool_affine.shape[0] == staging_pointers.shape[0] == self._num_layers
-        self._components = components.tolist()
-        self._pool_affine = pool_affine.tolist()
-        self._staging = staging_pointers.tolist()
-        self._slot_offsets = slot_offsets.tolist()
-        self._kinds = slot_offsets.shape[1]
-
-    def set_iteration(
-        self,
-        requests: torch.Tensor,
-        templates: torch.Tensor,
-        runs: torch.Tensor,
-        steps: torch.Tensor,
-        ops: torch.Tensor,
-        send_arena: int,
-        recv_arena: int,
-    ) -> None:
-        if self._components is None:
-            raise RuntimeError("set_static must come before the first iteration")
-        self._groups = (requests.shape[1] - 1 - 3 * self._kinds) // 2
-        self._requests = requests.tolist()
-        self._templates = templates.tolist()
-        self._runs = runs.tolist()
-        self._steps = steps.tolist()
-        self._ops = ops.tolist()
-        self._send_arena, self._recv_arena = send_arena, recv_arena
-        self._steps_at = {}
-        previous = -1
-        for index, step in enumerate(self._steps):
-            if step[0] < previous:
-                raise RuntimeError("the steps must be in issue order")
-            previous = step[0]
-            self._steps_at.setdefault(step[0], []).append(index)
-        self._fetch_recorded = [False] * self._num_layers
-
-    def run(self, issue_point: int, compute_stream: int, time_fetch_waits: bool) -> None:
-        compute = FakeStream.of_handle(compute_stream)
-        if issue_point != 0:
-            self._data.wait_event(compute.record_event(self._compute_events[issue_point + 1]))
-        for index in self._steps_at.get(issue_point, ()):
-            self._issue(index)
-        if 0 <= issue_point < self._num_layers and self._fetch_recorded[issue_point]:
-            fetched = self._fetch_events[issue_point]
-            if time_fetch_waits:
-                start, end = FakeEvent(enable_timing=True), FakeEvent(enable_timing=True)
-                compute.record_event(start)
-                compute.wait_event(fetched)
-                compute.record_event(end)
-                self._waits.append((start, end))
-            else:
-                compute.wait_event(fetched)
-
-    def fetch_wait_ms(self) -> float:
-        total = 0.0
-        for start, end in self._waits:
-            end.synchronize()
-            total += start.elapsed_time(end)
-        self._waits.clear()
-        return total
-
-    def _issue(self, index: int) -> None:
-        _, direction, layer, record_fetch, first, count = self._steps[index]
-        fetch = direction == 0
-        ops = self._ops[first : first + count]
-        local: list[int] = []
-        for action, template, _, _, _ in ops:
-            if action == 2:
-                for run in self._runs_of(template):
-                    pool, staging = self._pool_side(layer, run), self._staging_side(layer, run)
-                    local += self._copy_run(
-                        run, staging if fetch else pool, pool if fetch else staging
-                    )
-        self._copier.copy_runs(local, self._data.cuda_stream)
-        packs: list[int] = []
-        sends = []
-        for action, template, peer, offset, nbytes in ops:
-            if action == 0:
-                base = self._send_arena + offset
-                for run in self._runs_of(template):
-                    pages = self._pool_side(layer, run) if fetch else self._staging_side(layer, run)
-                    packs += self._copy_run(run, self._message_side(base, run), pages)
-                sends.append((base, nbytes, peer))
-        self._copier.copy_runs(packs, self._data.cuda_stream)
-        if sends:
-            self._transport.group_send_recv_raw(sends, [], self._data)
-        receives = [
-            (self._recv_arena + offset, nbytes, peer)
-            for action, _, peer, offset, nbytes in ops
-            if action == 1
-        ]
-        if receives:
-            self._transport.group_send_recv_raw([], receives, self._data)
-            unpacks: list[int] = []
-            for action, template, _, offset, _ in ops:
-                if action == 1:
-                    base = self._recv_arena + offset
-                    for run in self._runs_of(template):
-                        pages = (
-                            self._staging_side(layer, run) if fetch else self._pool_side(layer, run)
-                        )
-                        unpacks += self._copy_run(run, pages, self._message_side(base, run))
-            self._copier.copy_runs(unpacks, self._data.cuda_stream)
-        if record_fetch:
-            self._data.record_event(self._fetch_events[layer])
-            self._fetch_recorded[layer] = True
-
-    def _runs_of(self, template: int) -> list[list[int]]:
-        return self._runs[self._templates[template] : self._templates[template + 1]]
-
-    def _pool_side(self, layer: int, run: list[int]) -> tuple[int, int, int]:
-        component = self._components[run[0]]
-        group, step, origin = self._pool_affine[layer][component[1]]
-        if not 0 <= group < self._groups:
-            raise RuntimeError(f"layer {layer} is not in the cache manager of this rank")
-        request = self._requests[run[1]]
-        address, length = request[1 + 2 * group], request[2 + 2 * group]
-        if address == 0 or run[2] + run[3] > length:
-            raise RuntimeError(
-                f"the cache manager has no page for block {max(length, run[2])} of request "
-                f"{request[0]} in layer {layer}"
-            )
-        return origin, step, address + 4 * run[2]
-
-    def _staging_side(self, layer: int, run: list[int]) -> tuple[int, int, int]:
-        kind, _, page_bytes = self._components[run[0]]
-        request = self._requests[run[1]]
-        first_block, page_offset, num_pages = request[
-            1 + 2 * self._groups + 3 * kind : 4 + 2 * self._groups + 3 * kind
-        ]
-        if num_pages < 0:
-            raise RuntimeError(f"request {request[0]} is not in the staged batch")
-        if not first_block <= run[2] or run[2] + run[3] > first_block + num_pages:
-            raise RuntimeError(f"blocks of request {request[0]} are outside the staged blocks")
-        pointer = self._staging[layer][run[0]]
-        if pointer == 0:
-            raise RuntimeError(f"layer {layer} has no staging slot for component {run[0]}")
-        entry = self._slot_offsets[layer][kind] + page_offset + run[2] - first_block
-        return pointer + entry * page_bytes, page_bytes, 0
-
-    def _message_side(self, base: int, run: list[int]) -> tuple[int, int, int]:
-        return base + run[4], self._components[run[0]][2], 0
-
-    def _copy_run(
-        self, run: list[int], destination: tuple[int, int, int], source: tuple[int, int, int]
-    ) -> list[int]:
-        return [self._components[run[0]][2], run[3], *destination, *source]
-
-
 class FakeCopier:
-    """``DkvPageCopier`` on host memory: the copies run on the stream they are enqueued on."""
+    """``DkvPageCopier`` on host memory: the copies run on the stream they are enqueued on.
+
+    The page index tables of the runs are read when the copy is enqueued, as the real copier
+    reads them.
+    """
 
     def copy(self, pairs: Sequence[tuple[int, int]], num_bytes: int, stream: int) -> None:
         if num_bytes <= 0 or num_bytes % 16:
@@ -496,88 +314,179 @@ class HostDataPlaneDebug:
         return records
 
 
-class FakeKvManager:
-    """The pages of the layers one rank owns, in host memory, in the shape the streamer reads.
+@dataclass(frozen=True)
+class FakeBuffer:
+    """A buffer of a model layer: its data role, the bytes of one block, a multiple of 16, and the
+    tokens its life cycle keeps behind the newest one (0: the whole history)."""
 
-    Every owned (layer, cache role) has a buffer of pages and every request a list of page indices
-    into it, drawn in random order from the free pages so that indices and addresses are unrelated
-    to the position of a block. ``prepare`` is what the cache manager does for a request before an
-    iteration: it gives the request the pages its new tokens need and frees the pages of blocks
-    that left the window of a sliding-window kind.
+    role: str
+    page_bytes: int
+    window: int = 0
+
+    def lifecycle(self) -> LifecycleKey:
+        return LifecycleKey(False, self.window, 0, False)
+
+
+class _FakeRequestCache:
+    """The base page index of every block of one request in every layer group, as a V2 request
+    cache keeps them. A lifecycle operation replaces a table, so an earlier view goes stale."""
+
+    def __init__(self, num_groups: int) -> None:
+        self.tables = [np.zeros(0, dtype=np.int32) for _ in range(num_groups)]
+
+    def get_base_page_indices(self, group: int) -> np.ndarray:
+        return self.tables[group]
+
+
+class _FakeImpl:
+    """The address arithmetic the V2 storage publishes for a buffer."""
+
+    def __init__(self, cache: "FakeV2Cache") -> None:
+        self._cache = cache
+
+    def get_page_index_converter(self, layer_id: int, role: str) -> SimpleNamespace:
+        group, page_bytes, _ = self._cache._placement[layer_id, role]
+        members = len(self._cache._pool_members[group, page_bytes])
+        return SimpleNamespace(expansion=1, scale=members)
+
+    def get_page_stride(self, layer_id: int, role: str) -> int:
+        return self._cache._placement[layer_id, role][1]
+
+    def get_mem_pool_base_address(self, layer_id: int, role: str, mode) -> int:
+        if mode != PageIndexMode.SHARED:
+            raise NotImplementedError("the fake publishes base addresses for shared indices only")
+        group, page_bytes, position = self._cache._placement[layer_id, role]
+        return self._cache._pools[group, page_bytes].data_ptr() + position * page_bytes
+
+
+class FakeV2Cache:
+    """The pages of the layers one cache manager holds, in host memory, in the shape of the V2
+    cache manager that the data plane reads.
+
+    Every model layer is one V2 layer per window of its buffers. A window is a life cycle and a
+    layer group: every request has one base page index per block and group, drawn in random order
+    from the free slots so that indices are unrelated to the position of a block. The buffers of a
+    group with the same page size share a pool whose slot holds one page of each, as V2 coalesces
+    them, so a page lies at the pool base, plus the offset of its buffer in the slot, plus the base
+    page index times the size of the slot.
+
+    ``prepare`` is what the cache manager of an owner does for a request before an iteration: it
+    gives the request the pages its life cycles keep up to the end of the chunk and frees those of
+    blocks that left a window. ``open`` and ``close`` are what the working cache does around one
+    iteration: a request gets fresh pages, which hold ``poison``, and gives them all back.
     """
 
     def __init__(
         self,
-        layout: StagingLayout,
-        owned_layers: Sequence[int],
-        pages: int,
-        seed: int = 0,
+        layers: Sequence[Sequence[FakeBuffer]],
+        held_layers: Iterable[int],
         *,
-        affine: bool = True,
+        tokens_per_block: int,
+        slots: int,
+        seed: int = 0,
+        poison: int = 0,
     ) -> None:
-        """``affine`` offers the page tables the way the DeepSeek-V4 manager does, as base page
-        indices per layer group with an affine map per buffer; without it the streamer asks for
-        the page indices of every (request, layer, buffer)."""
-        self.layout = layout
-        self.kv_cache_map: dict[int, object] = {}
         self._random = random.Random(seed)
-        self._buffers: dict[tuple[int, object], torch.Tensor] = {}
-        self._free: dict[tuple[int, object], list[int]] = {}
-        self._indices: dict[tuple[int, int, object], list[int]] = {}
-        for component in layout.components:
-            for layer in layout.layers_of(component.kind):
-                if layer in owned_layers:
-                    key = (layer, component.attention_type)
-                    self._buffers[key] = torch.zeros(
-                        pages, layout.page_bytes(component), dtype=torch.uint8
+        self._tokens_per_block = tokens_per_block
+        self._poison = poison
+        self.impl = _FakeImpl(self)
+        self.kv_cache_map: dict[int, _FakeRequestCache] = {}
+        self.layer_to_pool_mapping_dict: dict[int, int] = {}
+        self.held_layers = tuple(sorted(set(held_layers)))
+        self._windows: list[int] = []
+        self._model_layer: dict[int, int] = {}
+        self._layer_id: dict[tuple[int, str], int] = {}
+        # (layer id, role) -> (group, page bytes, position of the buffer in the pool's slot)
+        self._placement: dict[tuple[int, str], tuple[int, int, int]] = {}
+        self._pool_members: dict[tuple[int, int], list[tuple[int, str]]] = {}
+        configs = []
+        for layer in self.held_layers:
+            by_window: dict[int, list[FakeBuffer]] = {}
+            for buffer in layers[layer]:
+                by_window.setdefault(buffer.window, []).append(buffer)
+            for window, buffers in by_window.items():
+                layer_id = len(configs)
+                configs.append(
+                    AttentionLayerConfig(
+                        layer_id=layer_id,
+                        buffers=[BufferConfig(role=b.role, size=b.page_bytes) for b in buffers],
+                        sliding_window_size=window or None,
                     )
-                    free = list(range(pages))
-                    self._random.shuffle(free)
-                    self._free[key] = free
-        # Every buffer is a layer group of its own: the fake has no pool shared between layers.
-        self._group_keys = list(self._buffers)
-        self._groups = {key: group for group, key in enumerate(self._group_keys)}
-        if not affine:
-            self.get_cache_index_affine = None
-            self.get_base_page_indices = None
-
-    def get_buffers(self, layer: int, attention_type) -> torch.Tensor:
-        return self._buffers[layer, attention_type]
-
-    def get_cache_indices(self, request_id: int, layer: int, attention_type) -> list[int]:
-        return list(self._indices[request_id, layer, attention_type])
-
-    def get_cache_index_affine(self, layer: int, attention_type) -> tuple[int, int, int]:
-        return self._groups[layer, attention_type], 1, 0
-
-    def get_base_page_indices(self, request_id: int, group: int) -> np.ndarray:
-        layer, attention_type = self._group_keys[group]
-        return np.asarray(
-            self._indices.get((request_id, layer, attention_type), []), dtype=np.int32
+                )
+                if window not in self._windows:
+                    self._windows.append(window)
+                group = self._windows.index(window)
+                self.layer_to_pool_mapping_dict[layer_id] = group
+                self._model_layer[layer_id] = layer
+                for buffer in buffers:
+                    members = self._pool_members.setdefault((group, buffer.page_bytes), [])
+                    self._placement[layer_id, buffer.role] = (
+                        group,
+                        buffer.page_bytes,
+                        len(members),
+                    )
+                    members.append((layer_id, buffer.role))
+                    self._layer_id[layer, buffer.role] = layer_id
+        self._pools = {
+            (group, page_bytes): torch.full(
+                (slots, page_bytes * len(members)), poison, dtype=torch.uint8
+            )
+            for (group, page_bytes), members in self._pool_members.items()
+        }
+        self._free = [list(range(slots)) for _ in self._windows]
+        for free in self._free:
+            self._random.shuffle(free)
+        self.kv_cache_manager_py_config = SimpleNamespace(
+            layers=configs,
+            tokens_per_block=tokens_per_block,
+            lifecycle_slot_counts=[[slots] * len(self._windows)],
         )
 
+    def get_disagg_ignored_roles(self) -> tuple:
+        return ()
+
+    def dkv_model_layer_of(self, layer_id: int, role: str) -> int:
+        return self._model_layer[layer_id]
+
+    def page(self, request_id: int, layer: int, role: str, block: int) -> torch.Tensor | None:
+        """The page of a block of a request, or None when the block has no page."""
+        layer_id = self._layer_id[layer, role]
+        group, page_bytes, position = self._placement[layer_id, role]
+        table = self.kv_cache_map[request_id].tables[group]
+        if block >= len(table) or table[block] == BAD_PAGE_INDEX:
+            return None
+        start = position * page_bytes
+        return self._pools[group, page_bytes][int(table[block]), start : start + page_bytes]
+
     def prepare(self, request_id: int, history: int, chunk: int) -> None:
-        self.kv_cache_map[request_id] = object()
-        layout = self.layout
-        for component in layout.components:
-            for layer in layout.layers_of(component.kind):
-                key = (layer, component.attention_type)
-                if key not in self._buffers:
-                    continue
-                first, pages = layout.block_range(component.kind, history, chunk)
-                indices = self._indices.setdefault((request_id, *key), [])
-                free = self._free[key]
-                while len(indices) < first + pages:
-                    indices.append(free.pop())
-                for block in range(first):
-                    if indices[block] != BAD_PAGE_INDEX:
-                        free.insert(self._random.randrange(len(free) + 1), indices[block])
-                        indices[block] = BAD_PAGE_INDEX
+        cache = self.kv_cache_map.setdefault(request_id, _FakeRequestCache(len(self._windows)))
+        for group, window in enumerate(self._windows):
+            key = LifecycleKey(False, window, 0, False)
+            first, count = staged_blocks(key, history, chunk, self._tokens_per_block)
+            free = self._free[group]
+            table = cache.tables[group].tolist()
+            while len(table) < first + count:
+                table.append(free.pop() if len(table) >= first else BAD_PAGE_INDEX)
+            for block in range(first):
+                if table[block] != BAD_PAGE_INDEX:
+                    free.insert(self._random.randrange(len(free) + 1), table[block])
+                    table[block] = BAD_PAGE_INDEX
+            cache.tables[group] = np.array(table, dtype=np.int32)
+
+    def open(self, request_id: int, history: int, chunk: int) -> None:
+        if request_id in self.kv_cache_map:
+            raise RuntimeError(f"request {request_id} is already open")
+        self.prepare(request_id, history, chunk)
+        for (group, page_bytes), pool in self._pools.items():
+            for slot in self.kv_cache_map[request_id].tables[group]:
+                if slot != BAD_PAGE_INDEX:
+                    pool[int(slot)].fill_(self._poison)
 
     def release(self, request_id: int) -> None:
-        self.kv_cache_map.pop(request_id, None)
-        for key in [key for key in self._indices if key[0] == request_id]:
-            _, layer, attention_type = key
-            for index in self._indices.pop(key):
-                if index != BAD_PAGE_INDEX:
-                    self._free[layer, attention_type].append(index)
+        cache = self.kv_cache_map.pop(request_id, None)
+        if cache is None:
+            return
+        for group, table in enumerate(cache.tables):
+            self._free[group].extend(int(slot) for slot in table if slot != BAD_PAGE_INDEX)
+
+    close = release
