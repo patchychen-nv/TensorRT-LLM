@@ -1735,6 +1735,52 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
+    def test_get_buffers_reuses_the_tensor_of_a_pool_until_the_pool_moves(self):
+        """The attention asks for the buffers of every layer in every forward pass, so a buffer's
+        tensor is built once for each place of its pool."""
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[1, 4, 128],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+        impl = cache_manager.impl
+
+        class MovedPools:
+            """The manager's storage with every pool 4 KiB further on."""
+
+            def __getattr__(self, name):
+                return getattr(impl, name)
+
+            def get_mem_pool_base_address(self, *args):
+                return impl.get_mem_pool_base_address(*args) + 4096
+
+        try:
+            keys = list(cache_manager._layer_attn_to_layer_id)
+            first = {key: cache_manager.get_buffers(*key) for key in keys}
+            assert all(cache_manager.get_buffers(*key) is first[key] for key in keys)
+            # A tensor built in inference mode could not be updated outside of it.
+            with torch.inference_mode():
+                inference = cache_manager.get_buffers(*keys[0])
+                assert inference.is_inference()
+                assert cache_manager.get_buffers(*keys[0]) is inference
+            assert not first[keys[0]].is_inference()
+            assert cache_manager.get_buffers(*keys[0]) is first[keys[0]]
+            cache_manager.impl = MovedPools()
+            try:
+                for key in keys:
+                    moved = cache_manager.get_buffers(*key)
+                    assert moved is not first[key]
+                    assert moved.data_ptr() == first[key].data_ptr() + 4096
+                    assert (moved.shape, moved.dtype) == (first[key].shape, first[key].dtype)
+                    assert cache_manager.get_buffers(*key) is moved
+            finally:
+                cache_manager.impl = impl
+        finally:
+            cache_manager.shutdown()
+
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
     @pytest.mark.parametrize(
         "dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT), (DataType.FP8, DataType.FLOAT)]

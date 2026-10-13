@@ -349,6 +349,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 "and validated fetch addressing, scratch lifetime, and transfer ordering."
             )
 
+        # The tensors ``get_buffers`` returned, by (layer, attention type, inference mode), with the
+        # base address and page bound of the pool they were built for.
+        self._buffer_tensors: dict[
+            tuple[int, DeepseekV4AttentionType, bool], tuple[tuple[int, int], torch.Tensor]
+        ] = {}
+
         # DeepSeek-V4 specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4 only supports SELFKONLY"
         assert num_kv_heads == 1, "DeepSeek-V4 only supports num_kv_heads == 1"
@@ -553,6 +559,20 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         data_role = attn_type.role
         page_index_mode = _get_index_mode(attn_type)
         addr = self.impl.get_mem_pool_base_address(layer_id, data_role, page_index_mode)
+        page_index_upper_bound = self.impl.get_page_index_upper_bound(layer_id, data_role)
+        if page_index_mode == PageIndexMode.PER_LAYER:
+            converter = self.impl.get_page_index_converter(layer_id, data_role)
+            if converter.layer_offset is not None:
+                page_index_upper_bound += converter.layer_offset * converter.expansion
+        # The attention asks for the buffers of every layer in every forward pass, and building the
+        # tensor costs more than the rest of this call: it is reused while the pool stays put. A
+        # tensor built in inference mode can only be updated in inference mode, so each mode has
+        # its own.
+        pool = (addr, page_index_upper_bound)
+        key = (layer_idx, attn_type, torch.is_inference_mode_enabled())
+        cached = self._buffer_tensors.get(key)
+        if cached is not None and cached[0] == pool:
+            return cached[1]
 
         block_size = self.tokens_per_block
         if attn_type in [
@@ -581,12 +601,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         else:
             dim_per_token = attn_dim
 
-        page_index_upper_bound = self.impl.get_page_index_upper_bound(layer_id, data_role)
-        if page_index_mode == PageIndexMode.PER_LAYER:
-            converter = self.impl.get_page_index_converter(layer_id, data_role)
-            if converter.layer_offset is not None:
-                page_index_upper_bound += converter.layer_offset * converter.expansion
-
         shape = (page_index_upper_bound, block_size, dim_per_token)
 
         dtype = self.dtype
@@ -605,7 +619,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         ):
             dtype = DataType.UINT8
 
-        return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
+        tensor = convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
+        self._buffer_tensors[key] = (pool, tensor)
+        return tensor
 
     def get_compress_scale_buffers(self, layer_idx: int) -> torch.Tensor:
         """Return E4M3 per-16 scales for an NVFP4 COMPRESS layer."""
