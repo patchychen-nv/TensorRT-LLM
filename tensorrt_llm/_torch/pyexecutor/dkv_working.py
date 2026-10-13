@@ -195,6 +195,10 @@ class BufferCostModel:
             for layer_buffers in self._by_layer.values()
             for buffer in layer_buffers
         }
+        self._classes = {
+            layer: tuple((buffer.role, buffer.key, buffer.page_bytes) for buffer in layer_buffers)
+            for layer, layer_buffers in self._by_layer.items()
+        }
         self.tokens_per_block = tokens_per_block
 
     def buffers_of(self, layer: int) -> tuple[str, ...]:
@@ -202,6 +206,10 @@ class BufferCostModel:
 
     def buffer(self, layer: int, role: str) -> DkvBuffer:
         return self._buffers[layer, role]
+
+    def layer_class(self, layer: int) -> tuple[tuple[str, LifecycleKey, int], ...]:
+        """The buffers of ``layer`` with their life cycles and page sizes: what its costs depend on."""
+        return self._classes.get(layer, ())
 
     def page_cost(self, layer: int, buffer: str, history: int, chunk: int) -> PageCost:
         spec = self._buffers[layer, buffer]

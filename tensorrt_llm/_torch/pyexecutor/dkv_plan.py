@@ -71,7 +71,7 @@ Usage::
 """
 
 import hashlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import NamedTuple, Protocol
@@ -150,6 +150,15 @@ class StagingCostModel(Protocol):
         them.
 
         Must give the same answer on every rank.
+        """
+        ...
+
+    def layer_class(self, layer: int) -> Hashable:
+        """A value that two layers share only if they have the same buffers with the same costs for
+        every request.
+
+        The plan asks for the costs of a request once per class of layers, so a layer may always
+        be a class of its own.
         """
         ...
 
@@ -562,15 +571,23 @@ def build_dkv_plan(
 
     fetches: list[tuple[Transfer, ...]] = []
     writebacks: list[tuple[Transfer, ...]] = []
+    # The segments of the requests of a compute rank, by class of layers and compute rank: every
+    # layer of a class moves the same ones.
+    segments_of: dict[tuple[Hashable, int], tuple[list[Segment], list[Segment]]] = {}
     for layer, owner in enumerate(owners):
         buffers = tuple(costs.buffers_of(layer))
         _check_buffers(layer, buffers)
+        layer_class = costs.layer_class(layer)
         layer_fetches: list[Transfer] = []
         layer_writebacks: list[Transfer] = []
         for compute, real in enumerate(real_by_rank):
             if not real:
                 continue
-            fetch_segments, writeback_segments = _segments(costs, layer, buffers, real)
+            segments = segments_of.get((layer_class, compute))
+            if segments is None:
+                segments = _segments(costs, layer, buffers, real)
+                segments_of[layer_class, compute] = segments
+            fetch_segments, writeback_segments = segments
             if fetch_segments:
                 layer_fetches.append(
                     Transfer(Direction.FETCH, layer, owner, compute, tuple(fetch_segments))

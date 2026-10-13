@@ -181,6 +181,9 @@ class _PageCosts:
     def buffers_of(self, layer: int) -> tuple[str, ...]:
         return self._BUFFERS[layer % len(self._BUFFERS)]
 
+    def layer_class(self, layer: int) -> int:
+        return layer % len(self._BUFFERS)
+
     def page_cost(self, layer: int, buffer: str, history: int, chunk: int) -> PageCost:
         return PageCost(512, history // 4 % 3, 1 + chunk // 4)
 

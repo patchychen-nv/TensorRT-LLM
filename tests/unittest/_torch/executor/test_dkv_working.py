@@ -223,6 +223,27 @@ def test_the_cost_model_gives_the_pages_of_the_block_rules() -> None:
     assert (cost.page_bytes, cost.fetch_pages, cost.writeback_pages) == (32, 6, 3)
 
 
+def test_layers_share_a_class_when_their_buffers_have_the_same_life_cycles_and_pages() -> None:
+    """The plan asks for the costs of a request once per class of layers."""
+
+    def layer(index: int, window=_ONE_BLOCK_WINDOW, page_bytes: int = 512) -> list[DkvBuffer]:
+        return [
+            DkvBuffer(index, "swa", window, page_bytes),
+            DkvBuffer(index, "compressed", _FULL_HISTORY, 32),
+        ]
+
+    costs = BufferCostModel(
+        layer(0) + layer(1) + layer(2, window=_FULL_HISTORY) + layer(3, page_bytes=1024), _BLOCK
+    )
+    assert costs.layer_class(0) == costs.layer_class(1)
+    assert len({costs.layer_class(index) for index in (0, 2, 3)}) == 3
+    for history, chunk in ((0, 300), (700, 300), (5000, 1)):
+        for role in costs.buffers_of(0):
+            assert costs.page_cost(0, role, history, chunk) == costs.page_cost(
+                1, role, history, chunk
+            )
+
+
 # Where a page is
 
 

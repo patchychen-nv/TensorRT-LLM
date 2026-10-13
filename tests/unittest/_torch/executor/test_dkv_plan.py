@@ -144,6 +144,9 @@ class _FakeCosts:
     def buffers_of(self, layer: int) -> tuple[str, ...]:
         return self.layers[layer]
 
+    def layer_class(self, layer: int) -> tuple:
+        return self.layers[layer], (1 + layer % 3 if self.scale_by_layer else 1)
+
     def page_cost(self, layer: int, buffer: str, history: int, chunk: int) -> PageCost:
         assert buffer in self.layers[layer], f"layer {layer} has no buffer {buffer}"
         geometry = _GEOMETRY[buffer]
@@ -529,6 +532,29 @@ def test_dummy_requests_are_never_costed() -> None:
     assert asked and set(asked) == {(100, 10)}
 
 
+def test_the_costs_of_a_request_are_asked_once_per_class_of_layers() -> None:
+    """Layers of one class move the same segments: the plan asks for the costs of the first layer
+    of each class only and equals the plan of a model whose every layer is a class of its own."""
+    asked: Counter = Counter()
+
+    class Shared(_FakeCosts):
+        def page_cost(self, layer, buffer, history, chunk):
+            asked[layer] += 1
+            return super().page_cost(layer, buffer, history, chunk)
+
+    class Separate(_FakeCosts):
+        def layer_class(self, layer):
+            return layer
+
+    batch = _batch("every_rank", 4)
+    owners = compute_ownership(43, 4)
+    shared = build_dkv_plan(batch, owners, Shared(_V4_43), group_size=4, ring_depth=2)
+    assert shared == build_dkv_plan(batch, owners, Separate(_V4_43), group_size=4, ring_depth=2)
+    # The first layer without compression, the first CSA and the first HCA layer, for the 8 real
+    # requests of the batch and every buffer of the layer.
+    assert asked == {0: 8 * len(SWA_ONLY), 2: 8 * len(CSA), 3: 8 * len(HCA)}
+
+
 def test_a_batch_of_only_dummies_has_steps_but_no_transfer() -> None:
     plan = _plan(_batch("dummy_only", 4), compute_ownership(43, 4), _V4_43, group_size=4)
     assert len(plan.steps) == 2 * 43
@@ -722,6 +748,9 @@ def test_a_cost_model_with_a_bad_page_size_or_count_is_rejected(cost) -> None:
         def buffers_of(self, layer):
             return ("kv",)
 
+        def layer_class(self, layer):
+            return layer
+
         def page_cost(self, layer, buffer, history, chunk):
             return cost
 
@@ -737,6 +766,9 @@ def test_a_cost_model_whose_buffers_are_not_distinct_names_is_rejected(buffers: 
     class Unnamed:
         def buffers_of(self, layer):
             return buffers
+
+        def layer_class(self, layer):
+            return layer
 
         def page_cost(self, layer, buffer, history, chunk):
             return PageCost(4096, 1, 1)
@@ -817,6 +849,9 @@ class Costs:
         self.layers = layers
 
     def buffers_of(self, layer):
+        return self.layers[layer]
+
+    def layer_class(self, layer):
         return self.layers[layer]
 
     def page_cost(self, layer, buffer, history, chunk):
@@ -1256,6 +1291,9 @@ class _FetchingLayers:
 
     def buffers_of(self, layer: int) -> tuple[str, ...]:
         return ("kv",)
+
+    def layer_class(self, layer: int) -> bool:
+        return layer in self.layers
 
     def page_cost(self, layer: int, buffer: str, history: int, chunk: int) -> PageCost:
         return PageCost(4096, int(layer in self.layers and history > 0), 0)
