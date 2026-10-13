@@ -3125,7 +3125,8 @@ def _dkv_working_cache_config(kv_cache_config: KvCacheConfig) -> KvCacheConfig:
 
     GPU pages only: every request of an iteration gets a cache with exactly the blocks it reads and
     writes, so there is no block reuse, no host or disk tier to spill to, no event to publish and no
-    sliding-window scratch reuse.
+    sliding-window scratch reuse. Its page counts are fixed per life cycle, so no typical workload
+    (``avg_seq_len``, ``pool_ratio``) sizes its pools.
     """
     return kv_cache_config.model_copy(
         update={
@@ -3135,6 +3136,8 @@ def _dkv_working_cache_config(kv_cache_config: KvCacheConfig) -> KvCacheConfig:
             "event_buffer_max_size": 0,
             "host_cache_size": 0,
             "disk_cache_size": None,
+            "avg_seq_len": None,
+            "pool_ratio": None,
         })
 
 

@@ -382,6 +382,22 @@ def test_a_working_cache_has_one_tier_and_no_recurrent_state() -> None:
         working_slot_counts(config, max_batch_size=1, max_num_tokens=8, staging_tokens=128)
 
 
+def test_the_working_cache_leaves_out_the_typical_workload_of_the_cache_of_the_model() -> None:
+    """Its page counts are fixed per life cycle, so ``avg_seq_len`` does not size it.
+
+    While the KV cache size is estimated, ``avg_seq_len`` is the ``max_seq_len`` of the model, and
+    a small estimation pool lowers the ``max_seq_len`` that the working cache gets below it.
+    """
+    from tensorrt_llm._torch.pyexecutor._util import _dkv_working_cache_config
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    config = KvCacheConfig(avg_seq_len=512, enable_block_reuse=True, host_cache_size=1 << 30)
+    working = _dkv_working_cache_config(config)
+    assert working.avg_seq_len is None and working.pool_ratio is None
+    assert not working.enable_block_reuse and working.host_cache_size == 0
+    assert config.avg_seq_len == 512 and config.enable_block_reuse
+
+
 # The caches of one iteration
 
 
